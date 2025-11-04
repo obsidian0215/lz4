@@ -126,8 +126,7 @@ gpu_roundtrip_test: $(TARGET)
 run_ab: $(TARGET)
 	@echo "Running run_ab.sh (AB harness)..."
 	@if [ -f run_ab.sh ]; then \
-		chmod +x run_ab.sh 2>/dev/null || true; \
-		./run_ab.sh || echo "run_ab.sh exited with non-zero status"; \
+		sh run_ab.sh || echo "run_ab.sh exited with non-zero status"; \
 	else \
 		echo "Error: run_ab.sh not found"; exit 1; \
 	fi
