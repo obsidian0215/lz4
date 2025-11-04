@@ -62,3 +62,6 @@ cmake_install_test/
 # generated Windows resource files
 lib/*.rc
 programs/*.rc
+
+lz4_gpu/backup
+.github/copilot-instructions.md
