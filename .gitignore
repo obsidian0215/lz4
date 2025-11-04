@@ -65,3 +65,5 @@ programs/*.rc
 
 lz4_gpu/backup
 .github/copilot-instructions.md
+lz4_gpu/ab_results
+lz4_gpu/samples
