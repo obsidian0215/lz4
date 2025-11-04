@@ -126,7 +126,12 @@ gpu_roundtrip_test: $(TARGET)
 run_ab: $(TARGET)
 	@echo "Running run_ab.sh (AB harness)..."
 	@if [ -f run_ab.sh ]; then \
-		sh run_ab.sh || echo "run_ab.sh exited with non-zero status"; \
+		if command -v bash >/dev/null 2>&1; then \
+			bash run_ab.sh || echo "run_ab.sh exited with non-zero status"; \
+		else \
+			echo "Warning: bash not found, falling back to sh (script may require bash)"; \
+			sh run_ab.sh || echo "run_ab.sh exited with non-zero status"; \
+		fi; \
 	else \
 		echo "Error: run_ab.sh not found"; exit 1; \
 	fi
