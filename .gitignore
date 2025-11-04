@@ -68,3 +68,12 @@ lz4_gpu/backup
 lz4_gpu/ab_results
 lz4_gpu/samples
 lz4_gpu/*.clbin
+lz4_gpu/build_clbin
+lz4_gpu/*.csv
+lz4_gpu/*.txt
+lz4_gpu/*.log
+lz4_gpu/*.lz4
+lz4_gpu/output
+lz4_gpu/lz4_gpu
+lz4_gpu/lz4_gpu_debug
+lz4_gpu/gpu_roundtrip_test

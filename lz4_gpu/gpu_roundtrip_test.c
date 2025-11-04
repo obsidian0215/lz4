@@ -47,11 +47,32 @@ static void die(const char* msg) { perror(msg); exit(1); }
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        printf("Usage: %s <input-file>\n", argv[0]);
+        printf("Usage: %s <input-file> [clbin_path] [acceleration]\n", argv[0]);
+        printf("  clbin_path : optional path to precompiled OpenCL binary (default: lz4_gpu.clbin)\n");
+        printf("  acceleration: optional integer passed to compression kernel (default: 1)\n");
         return 1;
     }
 
     const char* src_path = argv[1];
+    const char* bin_path = "lz4_gpu.clbin"; /* default precompiled binary */
+    int acceleration = 1; /* default acceleration */
+    if (argc >= 3) {
+        /* If argv[2] looks like a number, treat it as acceleration; otherwise treat as bin path */
+        char* endptr = NULL;
+        long v = strtol(argv[2], &endptr, 10);
+        if (endptr != argv[2] && *endptr == '\0' && v > 0) {
+            acceleration = (int)v;
+        } else {
+            bin_path = argv[2];
+        }
+    }
+    if (argc >= 4) {
+        char* endptr = NULL;
+        long v = strtol(argv[3], &endptr, 10);
+        if (endptr != argv[3] && *endptr == '\0' && v > 0) {
+            acceleration = (int)v;
+        }
+    }
     size_t src_len = 0;
     FILE* f = fopen(src_path, "rb");
     if (!f) die("fopen");
@@ -111,8 +132,9 @@ int main(int argc, char** argv) {
     if (err != CL_SUCCESS) die("clCreateCommandQueue");
 
     // Try to load precompiled binary first
-    const char* bin_path = "lz4_gpu.clbin";
-    if (argc >= 3) bin_path = argv[2];
+    if (argc >= 3) {
+        /* bin_path may have been set above when argv[2] was non-numeric */
+    }
     FILE* fb = fopen(bin_path, "rb");
     cl_program program = NULL;
     if (fb) {
@@ -205,7 +227,7 @@ int main(int argc, char** argv) {
     err |= clSetKernelArg(k_compress, 6, sizeof(int), &inputSize_i);
     int tableType = 1;
     err |= clSetKernelArg(k_compress, 7, sizeof(int), &tableType);
-    int acceleration = 1;
+    /* pass configured acceleration into kernel */
     err |= clSetKernelArg(k_compress, 8, sizeof(int), &acceleration);
     if (err != CL_SUCCESS) die("clSetKernelArg compress");
 
