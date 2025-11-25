@@ -66,11 +66,19 @@ int main(int argc, char** argv) {
             bin_path = argv[2];
         }
     }
+    int local_override = 0; /* optional fourth parameter: local work-group size */
     if (argc >= 4) {
         char* endptr = NULL;
         long v = strtol(argv[3], &endptr, 10);
         if (endptr != argv[3] && *endptr == '\0' && v > 0) {
             acceleration = (int)v;
+        }
+    }
+    if (argc >= 5) {
+        char* endptr = NULL;
+        long v = strtol(argv[4], &endptr, 10);
+        if (endptr != argv[4] && *endptr == '\0' && v > 0) {
+            local_override = (int)v;
         }
     }
     size_t src_len = 0;
@@ -99,12 +107,33 @@ int main(int argc, char** argv) {
         blockOffsets[i*2 + 0] = start;
         blockOffsets[i*2 + 1] = sz;
         uint32_t dstCap = (uint32_t)EST_DST_CAPACITY(sz);
-        initialOutputOffsets[i] = (uint32_t)(i * ((BLOCK_SIZE/2) + 256 + 1)); // conservative stride
+        /* Store per-block max output sizes for the compress kernel to use */
+        // (max compressed size allocation for each block)
+        // Create array on host to pass to kernel as __global maxOutputSizes
+
         outputOffsets[i] = initialOutputOffsets[i];
         max_compressed_buffer += dstCap;
+
+        /* lazily allocate per-block maxOutputSizes array and fill values */
+        /* We'll allocate after loop once total size known */
     }
 
     printf("Allocating device buffers: compressed buffer approx %zu bytes\n", max_compressed_buffer);
+
+    /* per-block maximum output size array for compression kernel */
+    uint32_t* maxOutputSizes = calloc(totalBlocks, sizeof(uint32_t));
+    for (size_t i = 0; i < totalBlocks; ++i) {
+        uint32_t sz = blockOffsets[i*2 + 1];
+        maxOutputSizes[i] = (uint32_t)EST_DST_CAPACITY(sz);
+    }
+
+    /* Assign initial output offsets non-overlapping using per-block max sizes */
+    uint32_t offset_cursor = 0;
+    for (size_t i = 0; i < totalBlocks; ++i) {
+        initialOutputOffsets[i] = offset_cursor;
+        outputOffsets[i] = initialOutputOffsets[i];
+        offset_cursor += maxOutputSizes[i];
+    }
 
     // Setup OpenCL
     cl_int err;
@@ -214,6 +243,7 @@ int main(int argc, char** argv) {
     cl_mem d_blockOffsets = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(uint32_t)*totalBlocks*2, blockOffsets, &err); if (err!=CL_SUCCESS) die("clCreateBuffer blockOffsets");
     cl_mem d_outputOffsets = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(uint32_t)*totalBlocks, outputOffsets, &err); if (err!=CL_SUCCESS) die("clCreateBuffer outputOffsets");
     cl_mem d_blockSizes = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(uint32_t)*totalBlocks, NULL, &err); if (err!=CL_SUCCESS) die("clCreateBuffer blockSizes");
+    cl_mem d_maxOutputSizes = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(uint32_t)*totalBlocks, maxOutputSizes, &err); if (err!=CL_SUCCESS) die("clCreateBuffer maxOutputSizes");
 
     // set args for compress kernel
     err  = clSetKernelArg(k_compress, 0, sizeof(cl_mem), &d_input);
@@ -221,18 +251,28 @@ int main(int argc, char** argv) {
     err |= clSetKernelArg(k_compress, 2, sizeof(cl_mem), &d_blockSizes);
     err |= clSetKernelArg(k_compress, 3, sizeof(cl_mem), &d_blockOffsets);
     err |= clSetKernelArg(k_compress, 4, sizeof(cl_mem), &d_outputOffsets);
+    /* Provide maxOutputSizes buffer expected by kernel at arg index 5 */
+    err |= clSetKernelArg(k_compress, 5, sizeof(cl_mem), &d_maxOutputSizes);
     int totalBlocks_i = (int)totalBlocks;
-    err |= clSetKernelArg(k_compress, 5, sizeof(int), &totalBlocks_i);
+    err |= clSetKernelArg(k_compress, 6, sizeof(int), &totalBlocks_i);
     int inputSize_i = (int)src_len;
-    err |= clSetKernelArg(k_compress, 6, sizeof(int), &inputSize_i);
+    err |= clSetKernelArg(k_compress, 7, sizeof(int), &inputSize_i);
     int tableType = 1;
-    err |= clSetKernelArg(k_compress, 7, sizeof(int), &tableType);
+    err |= clSetKernelArg(k_compress, 8, sizeof(int), &tableType);
     /* pass configured acceleration into kernel */
-    err |= clSetKernelArg(k_compress, 8, sizeof(int), &acceleration);
+    err |= clSetKernelArg(k_compress, 9, sizeof(int), &acceleration);
+    /* Provide local hash table buffer per work-group (size must match kernel's LZ4_HASHLOG) */
+    int local_table_bytes = (1<<14) * sizeof(uint32_t); /* 16384 entries * 4 bytes = 65536 bytes */
+    err |= clSetKernelArg(k_compress, 10, local_table_bytes, NULL);
     if (err != CL_SUCCESS) die("clSetKernelArg compress");
 
     size_t global = totalBlocks;
-    size_t local = 1; /* force single work-item per work-group to avoid __local hash table races */
+    size_t local = 1; /* default to single work-item per work-group */
+    if (local_override > 0) {
+        /* allow optional override of local size via 4th CLI arg */
+        if ((size_t)local_override <= global) local = (size_t)local_override;
+        else local = global;
+    }
     cl_event ev_comp;
     err = clEnqueueNDRangeKernel(queue, k_compress, 1, NULL, &global, &local, 0, NULL, &ev_comp); if (err!=CL_SUCCESS) die("clEnqueueNDRangeKernel compress");
     clFinish(queue);
@@ -382,6 +422,7 @@ int main(int argc, char** argv) {
     // cleanup
     clReleaseMemObject(d_input); clReleaseMemObject(d_compressed); clReleaseMemObject(d_blockOffsets);
     clReleaseMemObject(d_outputOffsets); clReleaseMemObject(d_blockSizes);
+    clReleaseMemObject(d_maxOutputSizes);
     clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_out_offsets);
     clReleaseMemObject(d_max_out_sizes); clReleaseMemObject(d_decompressed); clReleaseMemObject(d_sizes_out);
     clReleaseKernel(k_compress); clReleaseKernel(k_decompress); clReleaseProgram(program); clReleaseCommandQueue(queue); clReleaseContext(context);

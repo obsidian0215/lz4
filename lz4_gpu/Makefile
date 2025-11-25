@@ -61,9 +61,11 @@ $(DEBUG_TARGET): $(SOURCES) $(HEADERS)
 # Clean build artifacts
 clean:
 	@echo "Cleaning build artifacts..."
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(DEBUG_TARGET)
 	rm -f *.o
 	rm -f *.log
+	rm -f *.clbin
+	rm -f build_clbin
 
 # Test build and basic functionality
 test: $(TARGET)
@@ -167,8 +169,11 @@ check_opencl:
 	fi
 
 # Precompile OpenCL kernels into .clbin (release and debug)
+# Always rebuild to ensure kernel changes are picked up
 precompile_clbins:
 	@echo "Prebuilding OpenCL binaries (clbin)..."
+	@# Remove old clbin files to force rebuild
+	@rm -f *.clbin
 	@# Run detection/compile and generation in a single shell so BUILD_BIN persists
 	@BUILD_BIN=""; \
 	if [ -x ./build_clbin ]; then \
@@ -186,8 +191,8 @@ precompile_clbins:
 		echo "Using $$BUILD_BIN to generate clbins"; \
 		$$BUILD_BIN -o lz4_gpu.clbin "" || true; \
 		$$BUILD_BIN -o lz4_gpu_debug.clbin "-DLZ4_GPU_KERNEL_DEBUG" || true; \
-		$$BUILD_BIN -o lz4_gpu_vec.clbin "-DLZ4_GPU_VECTOR_IO=1" || true; \
-		$$BUILD_BIN -o lz4_gpu_debug_vec.clbin "-DLZ4_GPU_VECTOR_IO=1 -DLZ4_GPU_KERNEL_DEBUG" || true; \
+		$$BUILD_BIN -o lz4_gpu_vec.clbin.old "-DLZ4_GPU_VECTOR_IO=1" || true; \
+		$$BUILD_BIN -o lz4_gpu_debug_vec.clbin.old "-DLZ4_GPU_VECTOR_IO=1 -DLZ4_GPU_KERNEL_DEBUG" || true; \
 	else \
 		echo "No build_clbin available; skipping clbin prebuild"; \
 	fi
@@ -221,7 +226,7 @@ help:
 
 # Phony targets
 .PHONY: all clean test benchmark test_all check_opencl check_dependencies gpu_roundtrip_test run_ab
-.PHONY: create_test_data debug help
+.PHONY: create_test_data debug help precompile_clbins release
 
 # Default to help if no target specified
 .DEFAULT_GOAL := help

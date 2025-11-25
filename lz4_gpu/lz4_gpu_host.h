@@ -42,6 +42,22 @@ typedef enum {
     LZ4_GPU_NOT_INITIALIZED
 } LZ4GPUErrorCode;
 
+// Performance timing structure
+typedef struct {
+    double total_ms;        // Total operation time
+    double alloc_ms;        // Buffer allocation time
+    double h2d_ms;          // Host to Device transfer time
+    double kernel_ms;       // Kernel execution time (host-observed wall time)
+    double kernel_ms_device; // Kernel execution time reported by device profiling event (if available)
+    double d2h_ms;          // Device to Host transfer time
+    double frame_ms;        // Frame assembly time (CPU)
+    double setup_ms;        // Kernel argument setup / enqueue time
+    double event_profile_ms; // Sum of profiled event durations (if profiling enabled)
+    size_t input_bytes;     // Input size in bytes
+    size_t output_bytes;    // Output size in bytes
+    int num_blocks;         // Number of blocks processed
+} LZ4GPUTiming;
+
 #ifndef CL_TARGET_OPENCL_VERSION
 #define CL_TARGET_OPENCL_VERSION 120
 #endif
@@ -117,6 +133,14 @@ struct LZ4GPUCompressor {
     char precompiled_path[256];/* optional path to a precompiled clbin to load */
     int enable_profiling;      /* if 1, create command queue with profiling enabled and collect timings */
 
+    /* Runtime kernel hashlog chosen at build time based on device local memory.
+     * This is set by lz4_gpu_build_program_with_options() so host can allocate
+     * the correct per-work-group local memory size when launching kernels. */
+    int kernel_hashlog;
+
+    // Performance timing (last operation)
+    LZ4GPUTiming last_timing;
+
     // Error state
     LZ4GPUErrorCode last_error;
     char error_message[256];
@@ -171,6 +195,10 @@ size_t lz4_gpu_decompress_block(LZ4GPUCompressor* compressor,
 // Runtime/build option setters
 void lz4_gpu_set_vector_io(LZ4GPUCompressor* compressor, int enabled);
 void lz4_gpu_set_kernel_debug(LZ4GPUCompressor* compressor, int enabled);
+/* Enable or disable host-side debug printing at runtime (overrides env var/cached value)
+ * Call before lz4_gpu_initialize() if you want debug prints during init.
+ */
+void lz4_gpu_set_host_debug(LZ4GPUCompressor* compressor, int enabled);
 int lz4_gpu_rebuild_program(LZ4GPUCompressor* compressor);
 void lz4_gpu_use_precompiled(LZ4GPUCompressor* compressor, int enabled);
 void lz4_gpu_set_precompiled_binary(LZ4GPUCompressor* compressor, const char* path);
@@ -179,6 +207,13 @@ void lz4_gpu_set_precompiled_binary(LZ4GPUCompressor* compressor, const char* pa
 // If the compressor is initialized, fills out_compute_units and out_max_work_group_size when non-NULL and returns 1 on success.
 // Returns 0 on failure (e.g. compressor NULL or not initialized).
 int lz4_gpu_query_device_capabilities(LZ4GPUCompressor* compressor, cl_uint* out_compute_units, size_t* out_max_work_group_size);
+
+// Get timing information from the last operation
+// Returns 1 on success, 0 if no timing data available
+int lz4_gpu_get_last_timing(LZ4GPUCompressor* compressor, LZ4GPUTiming* timing);
+
+// Print timing information in human-readable format
+void lz4_gpu_print_timing(const LZ4GPUTiming* timing);
 
 // Error handling
 LZ4GPUErrorCode lz4_gpu_get_last_error(LZ4GPUCompressor* compressor);

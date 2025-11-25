@@ -25,6 +25,7 @@ lz4
 cmakebuild/
 builddir/
 cachedObjs/
+build/
 
 # IDE / editors files
 .clang_complete
