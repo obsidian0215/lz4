@@ -64,47 +64,8 @@ inline U16 LZ4_readLE16(const __global BYTE* ptr) { return LZ4_read16(ptr); }
 
 // --- Memory Copy ---
 inline void LZ4_memcpy(__global BYTE* dst, const __global BYTE* src, int size) {
-    /* Conservative scalar memcpy for safety over overlapping/unaligned memory */
+    /* Conservative scalar memcpy for safety across all situations; vector path must be guarded above when safe. */
     for (int i = 0; i < size; ++i) dst[i] = src[i];
-}
-
-// --- Literal-copy helpers (input -> output) ---
-// These are safe to use for literal copying because source (ip) is the input
-// buffer and does not overlap with destination; use 8-byte chunks for speed.
-inline void LZ4_lit_memcpy(__global BYTE* dst, const __global BYTE* src, int size) {
-    int i = 0;
-    int end64 = size & ~7;
-    for (; i < end64; i += 8) {
-        U32 lo = LZ4_read32(src + i);
-        U32 hi = LZ4_read32(src + i + 4);
-        LZ4_write32(dst + i, lo);
-        LZ4_write32(dst + i + 4, hi);
-    }
-    for (; i < size; ++i) dst[i] = src[i];
-}
-
-// --- Match-copy helpers (用于 match -> dst 的拷贝)
-// Forward-copy semantics are required for match-copy (src < dst)
-inline void LZ4_match_memcpy(__global BYTE* dst, const __global BYTE* src, int size) {
-    int i = 0;
-    int end64 = size & ~7;
-    for (; i < end64; i += 8) {
-        U32 lo = LZ4_read32(src + i);
-        U32 hi = LZ4_read32(src + i + 4);
-        LZ4_write32(dst + i, lo);
-        LZ4_write32(dst + i + 4, hi);
-    }
-    for (; i < size; ++i) dst[i] = src[i];
-}
-
-inline void LZ4_match_wildCopy8(__global BYTE* dst, const __global BYTE* src, __global BYTE* dstEnd) {
-    while (dst < dstEnd) {
-        U32 a = LZ4_read32(src);
-        U32 b = LZ4_read32(src + 4);
-        LZ4_write32(dst, a);
-        LZ4_write32(dst + 4, b);
-        dst += 8; src += 8;
-    }
 }
 
 inline void LZ4_memmove(__global BYTE* dst, const __global BYTE* src, int size) {
@@ -117,22 +78,53 @@ inline void LZ4_memmove(__global BYTE* dst, const __global BYTE* src, int size) 
 
 inline void LZ4_wildCopy8(__global BYTE* dst, const __global BYTE* src, __global BYTE* dstEnd) {
     do {
-        LZ4_memcpy(dst, src, 8);
+        uchar8 v8 = vload8(0, (const __global uchar*)src);
+        vstore8(v8, 0, (__global uchar*)dst);
         dst += 8; src += 8;
     } while (dst < dstEnd);
 }
 
-// lit-specific wild copy (safe for input -> output because src is input zone)
-inline void LZ4_lit_wildCopy8(__global BYTE* dst, const __global BYTE* src, __global BYTE* dstEnd) {
+/* (Removed scalar-only helper; use vectorized wild copy or scalar LZ4_memcpy where needed) */
+
+// match-copy variants – vector-friendly forward-copy for decompression
+inline void LZ4_decomp_match_memcpy(__global BYTE* dst, const __global BYTE* src, int size) {
+    int i = 0;
+    for (; i + 16 <= size; i += 16) {
+        uchar16 v = vload16(0, (const __global uchar*)(src + i));
+        vstore16(v, 0, (__global uchar*)(dst + i));
+    }
+    if (i + 8 <= size) {
+        uchar8 v8 = vload8(0, (const __global uchar*)(src + i));
+        vstore8(v8, 0, (__global uchar*)(dst + i));
+        i += 8;
+    }
+    for (; i < size; ++i) dst[i] = src[i];
+}
+
+inline void LZ4_decomp_match_wildCopy8(__global BYTE* dst, const __global BYTE* src, __global BYTE* dstEnd) {
     while (dst < dstEnd) {
-        LZ4_memcpy(dst, src, 8);
+        uchar8 v8 = vload8(0, (const __global uchar*)src);
+        vstore8(v8, 0, (__global uchar*)dst);
         dst += 8; src += 8;
+    }
+}
+
+inline void LZ4_decomp_match_wildCopy32(__global BYTE* dst, const __global BYTE* src, __global BYTE* dstEnd) {
+    while (dst < dstEnd) {
+        uchar16 v0 = vload16(0, (const __global uchar*)src);
+        uchar16 v1 = vload16(0, (const __global uchar*)(src + 16));
+        vstore16(v0, 0, (__global uchar*)dst);
+        vstore16(v1, 0, (__global uchar*)(dst + 16));
+        dst += 32; src += 32;
     }
 }
 
 inline void LZ4_wildCopy32(__global BYTE* dst, const __global BYTE* src, __global BYTE* dstEnd) {
     do {
-        LZ4_memcpy(dst, src, 32);
+        uchar16 v0 = vload16(0, (const __global uchar*)src);
+        uchar16 v1 = vload16(0, (const __global uchar*)(src + 16));
+        vstore16(v0, 0, (__global uchar*)dst);
+        vstore16(v1, 0, (__global uchar*)(dst + 16));
         dst += 32; src += 32;
     } while (dst < dstEnd);
 }
@@ -417,7 +409,7 @@ void lz4_decompress_generic(
 
         // Fast path
         if ((length != RUN_MASK) && (ip < shortiend) && (op <= shortoend)) {
-            LZ4_lit_memcpy(op, ip, 16);
+            LZ4_memcpy(op, ip, 16);
             op += length; ip += length;
 
             length = token & ML_MASK;
@@ -425,10 +417,9 @@ void lz4_decompress_generic(
             match = op - offset;
 
             if ((length != ML_MASK) && (offset >= 8) && (match >= dst)) {
-                /* match-copy fast path using 8-byte chunks */
-                LZ4_match_memcpy(op, match, 8);
-                LZ4_match_memcpy(op + 8, match + 8, 8);
-                LZ4_match_memcpy(op + 16, match + 16, 2);
+                LZ4_decomp_match_memcpy(op, match, 8);
+                LZ4_decomp_match_memcpy(op + 8, match + 8, 8);
+                LZ4_decomp_match_memcpy(op + 16, match + 16, 2);
                 op += length + MINMATCH;
                 continue;
             }
@@ -450,11 +441,11 @@ void lz4_decompress_generic(
         if ((cpy > oend - MFLIMIT) || (ip + length > iend - (2 + 1 + LASTLITERALS))) {
             if (ip + length != iend) goto _output_error;
             if (cpy > oend) goto _output_error;
-            LZ4_lit_memcpy(op, ip, length);
+            LZ4_memcpy(op, ip, length);
             op += length;
             break; // End of block
         }
-        LZ4_lit_wildCopy8(op, ip, cpy);
+        LZ4_wildCopy8(op, ip, cpy);
         ip += length; op = cpy;
 
         // Get offset
@@ -487,21 +478,18 @@ _copy_match:
         } else {
             if (offset < 8) {
                 if (offset == 1) {
-                    /* replicate single byte pattern into 8 bytes */
                     BYTE b = match[0];
                     U32 patt = (U32)b * 0x01010101u;
                     LZ4_write32(op, patt);
                     LZ4_write32(op + 4, patt);
                     match += 1;
                 } else if (offset == 2) {
-                    /* replicate two-byte pattern into 8 bytes */
                     U16 v = LZ4_read16(match);
                     U32 patt = ((U32)v) | ((U32)v << 16);
                     LZ4_write32(op, patt);
                     LZ4_write32(op + 4, patt);
                     match += 2;
                 } else if (offset == 4) {
-                    /* copy four-byte pattern twice */
                     U32 v = LZ4_read32(match);
                     LZ4_write32(op, v);
                     LZ4_write32(op + 4, v);
@@ -533,23 +521,22 @@ _copy_match:
                     LZ4_memcpy(op + 4, match, 4);
                     match -= dec64table[offset];
                 } else {
-                    /* fallback: preserve original semantic for offsets 3,5,6,7 */
                     op[0] = match[0]; op[1] = match[1]; op[2] = match[2]; op[3] = match[3];
                     match += inc32table[offset];
                     LZ4_memcpy(op + 4, match, 4);
                     match -= dec64table[offset];
                 }
             } else {
-                LZ4_match_memcpy(op, match, 8);
+                LZ4_decomp_match_memcpy(op, match, 8);
                 match += 8;
             }
             op += 8;
             if (offset < 8) {
-                /* For small offsets, avoid vectorized match wild copy because src may overlap
-                   with destination and wide loads may read overwritten data. */
-                LZ4_wildCopy8(op, match, cpy);
+                /* Small offsets may overlap; use memmove semantics (scalar) to be safe */
+                LZ4_memmove(op, match, (int)(cpy - op));
             } else {
-                LZ4_match_wildCopy8(op, match, cpy);
+                /* For larger offsets, vectorized forward match wild-copy is safe & fast */
+                LZ4_decomp_match_wildCopy8(op, match, cpy);
             }
         }
         op = cpy;

@@ -13,7 +13,7 @@
 #include <fcntl.h>
 #endif
 
-#define DEFAULT_ACCELERATION 1
+#define DEFAULT_ACCELERATION 8
 
 static int ends_with(const char* str, const char* suf) {
     if (!str || !suf) return 0;
@@ -48,13 +48,30 @@ static void usage(const char* prog) {
     "Usage: %s [-c|-d] [-l level] [-o outfile|-] [--bench] [-v] <input>\n"
         "  -c        compress (default)\n"
         "  -d        decompress\n"
-        "  -l LEVEL  compression acceleration level (higher -> faster, less ratio)\n"
+            "  -l LEVEL  compression acceleration level (higher -> faster, less ratio). Allowed: 1..12\n"
     "  -o FILE   output file (default: input.lz4 for compress, input.out for decompress). Use '-' to write to stdout.\n"
         "  -g|--kernel-debug Enable kernel-side debug prints (build with LZ4_GPU_KERNEL_DEBUG)\n"
-        "  -p|--profile  Enable OpenCL event profiling and print upload/kernel/download CSV\n"
-        "  --bench   print throughput and compression ratio summary\n"
-        "  -v        verbose logging\n",
-        prog);
+    "  -p|--profile  Enable OpenCL event profiling and print upload/kernel/download CSV\n"
+            "  --local N  Optional override for local work-group size (applies to both compression and decompression kernels)\n"
+    "  --bench   print throughput and compression ratio summary\n"
+        "  -v        verbose logging\n"
+        "  --pinned  Use pinned host memory (enabled if supported).\n"
+        "  --no-pinned  Disable pinned host memory.\n\n"
+         "ENVIRONMENT VARIABLES:\n"
+         "  LZ4_GPU_CLBIN : Optional path to precompiled .clbin file (preferred).\n"
+         "  LZ4_GPU_CLSRC : Optional path to kernel source file to use when building from source.\n",
+         prog);
+}
+
+/* parse size string like 16k, 64K, 1m into bytes */
+static size_t parse_size_arg(const char* s) {
+    if (!s) return 0;
+    char* endptr;
+    long long v = strtoll(s, &endptr, 10);
+    if (v <= 0) return 0;
+    if (*endptr == 'k' || *endptr == 'K') v *= 1024LL;
+    else if (*endptr == 'm' || *endptr == 'M') v *= 1024LL * 1024LL;
+    return (size_t)v;
 }
 
 int main(int argc, char** argv) {
@@ -71,17 +88,27 @@ int main(int argc, char** argv) {
     int kernel_debug = 0;
     int host_debug = 0;
     int enable_profile = 0;
+    int cli_pinned = -1;
     const char* infile = NULL;
+    size_t cli_blocksize = 0;
+    int cli_local = 0;
+    const char* env_clbin_path = NULL;
+    const char* env_clsrc_path = NULL;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-c") == 0) { compress = 1; }
         else if (strcmp(argv[i], "-d") == 0) { compress = 0; }
-    else if (strcmp(argv[i], "-v") == 0) { verbose = 1; }
+        else if (strcmp(argv[i], "-v") == 0) { verbose = 1; }
         else if (strcmp(argv[i], "--bench") == 0) { bench = 1; }
-    else if (strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--kernel-debug") == 0) { kernel_debug = 1; }
-    else if (strcmp(argv[i], "-H") == 0 || strcmp(argv[i], "--host-debug") == 0) { host_debug = 1; }
-    else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--profile") == 0) { enable_profile = 1; }
+        else if (strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--kernel-debug") == 0) { kernel_debug = 1; }
+        else if (strcmp(argv[i], "-H") == 0 || strcmp(argv[i], "--host-debug") == 0) { host_debug = 1; }
+        else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--profile") == 0) { enable_profile = 1; }
         else if (strcmp(argv[i], "-l") == 0 && i+1 < argc) { accel = atoi(argv[++i]); }
+        else if ((strcmp(argv[i], "-B") == 0 || strcmp(argv[i], "--blocksize") == 0) && i+1 < argc) { cli_blocksize = parse_size_arg(argv[++i]); }
+        else if (strncmp(argv[i], "--local=", 8) == 0) { cli_local = atoi(argv[i] + 8); }
+        else if (strcmp(argv[i], "--local") == 0 && i+1 < argc) { cli_local = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "--pinned") == 0) { cli_pinned = 1; }
+        else if (strcmp(argv[i], "--no-pinned") == 0) { cli_pinned = 0; }
         else if (strcmp(argv[i], "-o") == 0 && i+1 < argc) { outpath = argv[++i]; }
         else if (argv[i][0] == '-') { fprintf(stderr, "Unknown option: %s\n", argv[i]); usage(argv[0]); return 1; }
         else { infile = argv[i]; }
@@ -125,6 +152,57 @@ int main(int argc, char** argv) {
     if (kernel_debug) lz4_gpu_set_kernel_debug(ctx, 1);
     if (host_debug) lz4_gpu_set_host_debug(ctx, 1);
     if (enable_profile) ctx->enable_profiling = 1;
+    if (cli_pinned >= 0) {
+        lz4_gpu_set_pinned_memory(ctx, cli_pinned);
+    }
+    /* Apply any CLI-specified workgroup or block size override before initialize to influence kernel builds/decisions */
+    if (cli_local > 0) {
+        lz4_gpu_set_workgroup_size(ctx, (size_t)cli_local);
+    }
+    if (cli_blocksize > 0) {
+        /* Clamp and align CLI-specified block size to GPU-friendly bounds */
+        size_t bs = cli_blocksize;
+        const size_t ALIGN = 4 * 1024;
+        const size_t MIN_BLOCK = 16 * 1024;
+        if (bs < MIN_BLOCK) bs = MIN_BLOCK;
+        if (bs > LZ4_GPU_MAX_BLOCK_SIZE) bs = LZ4_GPU_MAX_BLOCK_SIZE;
+        bs = ((bs + ALIGN - 1) / ALIGN) * ALIGN;
+          /* Set both compress and decompress block sizes to the same CLI-specified value.
+              Users typically expect --blocksize (-B) to apply to both directions. */
+          lz4_gpu_set_block_sizes(ctx, bs, bs);
+        if (bs != cli_blocksize && verbose) fprintf(stderr, "Note: blocksize clamped/rounded to %zu\n", bs);
+    }
+    /* Clamp user-specified local sizes to keep kernel launches reasonable */
+    if (cli_local > 0 && cli_local > (int)LZ4_GPU_MAX_LOCAL_SIZE) {
+        if (verbose) fprintf(stderr, "Note: local size clamped to %d\n", (int)LZ4_GPU_MAX_LOCAL_SIZE);
+        cli_local = (int)LZ4_GPU_MAX_LOCAL_SIZE;
+    }
+    if (cli_local > 0) {
+        lz4_gpu_set_workgroup_size(ctx, (size_t)cli_local);
+    }
+    /* If env variable provided, use it.
+       Priority: CLBIN > CLSRC (if both are provided, prefer a precompiled binary). */
+    env_clbin_path = getenv("LZ4_GPU_CLBIN");
+    env_clsrc_path = getenv("LZ4_GPU_CLSRC");
+    if (env_clbin_path && env_clbin_path[0] != '\0') {
+        lz4_gpu_use_precompiled(ctx, 1);
+        lz4_gpu_set_precompiled_binary(ctx, env_clbin_path);
+        if (verbose) fprintf(stderr, "NOTE: Using precompiled OpenCL binary from LZ4_GPU_CLBIN=%s\n", env_clbin_path);
+    } else if (env_clsrc_path && env_clsrc_path[0] != '\0') {
+        lz4_gpu_set_kernel_source(ctx, env_clsrc_path);
+        if (verbose) fprintf(stderr, "NOTE: Using kernel source from LZ4_GPU_CLSRC=%s\n", env_clsrc_path);
+    }
+    /* Also print environment variables section on verbose to make debugging easier */
+    if (verbose) {
+        fprintf(stderr, "ENV: LZ4_GPU_CLBIN=%s\n", env_clbin_path ? env_clbin_path : "<unset>");
+        fprintf(stderr, "ENV: LZ4_GPU_CLSRC=%s\n", env_clsrc_path ? env_clsrc_path : "<unset>");
+    }
+    /* Clamp acceleration to maximum allowed */
+    if (accel < 1) accel = 1;
+    if (accel > LZ4_GPU_MAX_ACCELERATION) {
+        if (verbose) fprintf(stderr, "Note: acceleration clamped to %d\n", LZ4_GPU_MAX_ACCELERATION);
+        accel = LZ4_GPU_MAX_ACCELERATION;
+    }
     if (!lz4_gpu_initialize(ctx)) { fprintf(stderr, "GPU init failed: %s\n", lz4_gpu_get_error_message(ctx)); lz4_gpu_destroy_compressor(ctx); free(input_buf); return 1; }
 
     int rc = 0;
@@ -187,6 +265,8 @@ int main(int argc, char** argv) {
         if (verbose && lz4_gpu_get_last_timing(ctx, &timing)) {
             /* Consolidated Compression Statistics + Timing (includes file write) */
             double total_ms = timing.total_ms + t_write_ms;
+            double denom_ms = total_ms + timing.init_ms; /* include OpenCL init in percentage denominator */
+            if (denom_ms <= 0.0) denom_ms = total_ms;
             if (total_ms <= 0.0) total_ms = timing.total_ms; /* fallback */
 
             double in_mb = (double)input_size / (1024.0*1024.0);
@@ -214,7 +294,7 @@ int main(int argc, char** argv) {
             /* If we don't have device profiling info, estimate kernel time by
                subtracting other known parts from the recorded compressor total. */
             if (kernel_ms_display < 0.0) {
-                double sum_known = timing.alloc_ms + timing.h2d_ms + timing.setup_ms + timing.d2h_ms + timing.frame_ms;
+                double sum_known = timing.init_ms + timing.alloc_ms + timing.h2d_ms + timing.setup_ms + timing.d2h_ms + timing.frame_ms;
                 double approx = timing.total_ms - sum_known; /* approximate kernel within timing.total_ms */
                 if (approx < 0.0) approx = 0.0;
                 /* Accept any non-negative approximation — even small values —
@@ -235,12 +315,13 @@ int main(int argc, char** argv) {
             printf("-------------------------------\n");
             printf("  Total time:      %8.3f ms\n", total_ms);
             printf("  Buffer Alloc:    %8.3f ms\n", timing.alloc_ms);
+            printf("  OpenCL Init:     %8.3f ms\n", timing.init_ms);
             printf("  Host→Device:     %8.3f ms\n", timing.h2d_ms);
             printf("  Setup Args:      %8.3f ms\n", timing.setup_ms);
             if (kernel_ms_display < 0.0) {
                 /* previously tried to set an approximate kernel part; recompute
                    and use it only if it's meaningful (>= 1ms) */
-                double sum_known = timing.alloc_ms + timing.h2d_ms + timing.setup_ms + timing.d2h_ms + timing.frame_ms;
+                double sum_known = timing.init_ms + timing.alloc_ms + timing.h2d_ms + timing.setup_ms + timing.d2h_ms + timing.frame_ms;
                 double approx = timing.total_ms - sum_known;
                 if (approx < 0.0) approx = 0.0;
                 kernel_ms_display = approx;
@@ -254,15 +335,16 @@ int main(int argc, char** argv) {
             printf("  File Write:      %8.3f ms\n", t_write_ms);
             printf("-------------------------------\n");
 
-            printf("=== Percentage Breakdown ===\n");
-            if (kernel_ms_display >= 0.0) printf("Kernel Exec     : %6.2f%%\n", 100.0 * kernel_ms_display / total_ms);
+                 printf("=== Percentage Breakdown ===\n");
+                if (kernel_ms_display >= 0.0) printf("Kernel Exec     : %6.2f%%\n", 100.0 * kernel_ms_display / denom_ms);
             else printf("Kernel Exec     : N/A\n");
             double data_transfer = timing.h2d_ms + timing.d2h_ms;
-            printf("Data Transfer   : %6.2f%% (upload=%4.2f%% + download=%4.2f%%)\n",
-                   100.0 * data_transfer / total_ms, 100.0 * timing.h2d_ms / total_ms, 100.0 * timing.d2h_ms / total_ms);
-            printf("File I/O        : %6.2f%%\n", 100.0 * t_write_ms / total_ms);
-            printf("Buffer Alloc    : %6.2f%%\n", 100.0 * timing.alloc_ms / total_ms);
-            printf("Setup Args      : %6.2f%%\n", 100.0 * timing.setup_ms / total_ms);
+                 printf("OpenCL Init     : %6.2f%%\n", 100.0 * timing.init_ms / denom_ms);
+                 printf("Data Transfer   : %6.2f%% (upload=%4.2f%% + download=%4.2f%%)\n",
+                     100.0 * data_transfer / denom_ms, 100.0 * timing.h2d_ms / denom_ms, 100.0 * timing.d2h_ms / denom_ms);
+                 printf("File I/O        : %6.2f%%\n", 100.0 * t_write_ms / denom_ms);
+                 printf("Buffer Alloc    : %6.2f%%\n", 100.0 * timing.alloc_ms / denom_ms);
+                 printf("Setup Args      : %6.2f%%\n", 100.0 * timing.setup_ms / denom_ms);
             printf("===============================\n");
         }
     } else {
@@ -369,6 +451,8 @@ int main(int argc, char** argv) {
         if (lz4_gpu_get_last_timing(ctx, &timing)) {
             double total_ms = timing.total_ms + t_write_ms;
             if (total_ms <= 0.0) total_ms = timing.total_ms;
+            double denom_ms = total_ms + timing.init_ms; /* include OpenCL init in percentage denominator */
+            if (denom_ms <= 0.0) denom_ms = total_ms;
 
             double out_mb = (double)out_sz / (1024.0*1024.0);
             double total_s = total_ms / 1000.0;
@@ -379,7 +463,7 @@ int main(int argc, char** argv) {
             double kernel_ms_display = timing.kernel_ms;
             int kernel_is_approx = 0;
             if (kernel_ms_display < 0.0) {
-                double sum_known = timing.alloc_ms + timing.h2d_ms + timing.setup_ms + timing.d2h_ms + timing.frame_ms;
+                double sum_known = timing.init_ms + timing.alloc_ms + timing.h2d_ms + timing.setup_ms + timing.d2h_ms + timing.frame_ms;
                 double approx = timing.total_ms - sum_known;
                 if (approx < 0.0) approx = 0.0;
                 kernel_ms_display = approx;
@@ -404,6 +488,7 @@ int main(int argc, char** argv) {
             printf("-------------------------------\n");
             printf("  Total time:      %8.3f ms\n", total_ms);
             printf("  Buffer Alloc:    %8.3f ms\n", timing.alloc_ms);
+            printf("  OpenCL Init:     %8.3f ms\n", timing.init_ms);
             printf("  Host→Device:     %8.3f ms\n", timing.h2d_ms);
             printf("  Setup Args:      %8.3f ms\n", timing.setup_ms);
             if (kernel_ms_display >= 0.0) printf("  Kernel Exec:     %8.3f ms%s\n", kernel_ms_display, kernel_is_approx ? " (approx)" : "");
@@ -414,15 +499,16 @@ int main(int argc, char** argv) {
             printf("  File Write:      %8.3f ms\n", t_write_ms);
             printf("-------------------------------\n");
 
-            printf("=== Percentage Breakdown ===\n");
-            if (kernel_ms_display >= 0.0) printf("Kernel Exec     : %6.2f%%\n", 100.0 * kernel_ms_display / total_ms);
-            else printf("Kernel Exec     : N/A\n");
-            double data_transfer = timing.h2d_ms + timing.d2h_ms;
-            printf("Data Transfer   : %6.2f%% (upload=%4.2f%% + download=%4.2f%%)\n",
-                   100.0 * data_transfer / total_ms, 100.0 * timing.h2d_ms / total_ms, 100.0 * timing.d2h_ms / total_ms);
-            printf("File I/O        : %6.2f%%\n", 100.0 * t_write_ms / total_ms);
-            printf("Buffer Alloc    : %6.2f%%\n", 100.0 * timing.alloc_ms / total_ms);
-            printf("Setup Args      : %6.2f%%\n", 100.0 * timing.setup_ms / total_ms);
+                 printf("=== Percentage Breakdown ===\n");
+                 if (kernel_ms_display >= 0.0) printf("Kernel Exec     : %6.2f%%\n", 100.0 * kernel_ms_display / denom_ms);
+                 else printf("Kernel Exec     : N/A\n");
+                 double data_transfer = timing.h2d_ms + timing.d2h_ms;
+                 printf("OpenCL Init     : %6.2f%%\n", 100.0 * timing.init_ms / denom_ms);
+                 printf("Data Transfer   : %6.2f%% (upload=%4.2f%% + download=%4.2f%%)\n",
+                     100.0 * data_transfer / denom_ms, 100.0 * timing.h2d_ms / denom_ms, 100.0 * timing.d2h_ms / denom_ms);
+                 printf("File I/O        : %6.2f%%\n", 100.0 * t_write_ms / denom_ms);
+                 printf("Buffer Alloc    : %6.2f%%\n", 100.0 * timing.alloc_ms / denom_ms);
+                 printf("Setup Args      : %6.2f%%\n", 100.0 * timing.setup_ms / denom_ms);
             printf("===============================\n");
         }
     }

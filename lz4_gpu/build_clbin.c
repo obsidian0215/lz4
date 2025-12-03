@@ -50,7 +50,8 @@ int main(int argc, char** argv) {
     FILE* f = fopen(out, "wb"); if (!f) { fprintf(stderr,"Cannot open %s for write\n", out); return 9; }
     fwrite(bins[0], 1, bin_sizes[0], f); fclose(f);
     printf("Wrote %s (%zu bytes)\n", out, bin_sizes[0]);
-    for (size_t i=0;i<num_devices;i++) free(bins[i]); free(bins); free(bin_sizes); free(src);
+    for (size_t i=0;i<num_devices;i++) { free(bins[i]); }
+    free(bins); free(bin_sizes); free(src);
     clReleaseProgram(program); clReleaseContext(ctx);
     return 0;
 }

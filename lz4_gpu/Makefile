@@ -88,8 +88,8 @@ test: $(TARGET)
 create_test_data:
 	@echo "Creating test data..."
 	@if command -v python3 >/dev/null 2>&1; then \
-		python3 -c "import sys; data = bytearray(); [data.append((i % 256) ^ ((i >> 8) % 256)) for i in range(64 * 1024 * 1024)]; open('test_data_64MB.dat', 'wb').write(data)"; \
-		echo 'Test data created with Python: test_data_64MB.dat'; \
+		python3 tools/generate-test-data.py 64MB --pattern mixed --output test_data_64MB.dat; \
+		echo 'Test data created with tools/generate-test-data.py: test_data_64MB.dat'; \
 	else \
 		dd if=/dev/zero of=test_data_64MB.dat bs=1M count=64 2>/dev/null && \
 		echo 'Test data created with dd: test_data_64MB.dat (may not compress well)'; \
@@ -191,8 +191,7 @@ precompile_clbins:
 		echo "Using $$BUILD_BIN to generate clbins"; \
 		$$BUILD_BIN -o lz4_gpu.clbin "" || true; \
 		$$BUILD_BIN -o lz4_gpu_debug.clbin "-DLZ4_GPU_KERNEL_DEBUG" || true; \
-		$$BUILD_BIN -o lz4_gpu_vec.clbin.old "-DLZ4_GPU_VECTOR_IO=1" || true; \
-		$$BUILD_BIN -o lz4_gpu_debug_vec.clbin.old "-DLZ4_GPU_VECTOR_IO=1 -DLZ4_GPU_KERNEL_DEBUG" || true; \
+		# vector variants are legacy remnants; do not prebuild vec clbins by default \
 	else \
 		echo "No build_clbin available; skipping clbin prebuild"; \
 	fi
@@ -229,4 +228,4 @@ help:
 .PHONY: create_test_data debug help precompile_clbins release
 
 # Default to help if no target specified
-.DEFAULT_GOAL := help
+.DEFAULT_GOAL := all

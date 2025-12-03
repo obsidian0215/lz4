@@ -66,8 +66,8 @@ programs/*.rc
 
 lz4_gpu/backup
 .github/copilot-instructions.md
-lz4_gpu/ab_results
-lz4_gpu/samples
+ab_results
+lz4_gpu/samples*
 lz4_gpu/*.clbin
 lz4_gpu/build_clbin
 lz4_gpu/*.csv
@@ -78,3 +78,5 @@ lz4_gpu/output
 lz4_gpu/lz4_gpu
 lz4_gpu/lz4_gpu_debug
 lz4_gpu/gpu_roundtrip_test
+sample*
+__pycache__/

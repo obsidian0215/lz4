@@ -13,8 +13,10 @@ extern "C" {
 #endif
 
 // Constants
-#define LZ4_GPU_MAX_BLOCK_SIZE (64 * 1024)  // 64KB
+#define LZ4_GPU_MAX_BLOCK_SIZE (512 * 1024)  // 512KB - tighten default max block size for GPU pipeline
 #define LZ4_GPU_MIN_BLOCK_SIZE (4 * 1024)   // 4KB - used as conservative min when parsing frames
+#define LZ4_GPU_MAX_ACCELERATION 12         // maximum allowed acceleration (clamped)
+#define LZ4_GPU_MAX_LOCAL_SIZE 256          // maximum workgroup local size we allow by API
 #define LZ4_GPU_HASH_TABLE_SIZE (1 << 14)         // 16384 entries (must match LZ4_HASHLOG in kernel)
 #define LZ4F_HEADER_SIZE_MAX 19
 #define LZ4F_ENDMARK_SIZE 4
@@ -46,6 +48,7 @@ typedef enum {
 typedef struct {
     double total_ms;        // Total operation time
     double alloc_ms;        // Buffer allocation time
+    double init_ms;         // OpenCL initialization / program build time
     double h2d_ms;          // Host to Device transfer time
     double kernel_ms;       // Kernel execution time (host-observed wall time)
     double kernel_ms_device; // Kernel execution time reported by device profiling event (if available)
@@ -53,6 +56,7 @@ typedef struct {
     double frame_ms;        // Frame assembly time (CPU)
     double setup_ms;        // Kernel argument setup / enqueue time
     double event_profile_ms; // Sum of profiled event durations (if profiling enabled)
+    double map_ms;          // Memory map/unmap time (when using pinned memory)
     size_t input_bytes;     // Input size in bytes
     size_t output_bytes;    // Output size in bytes
     int num_blocks;         // Number of blocks processed
@@ -111,6 +115,20 @@ struct LZ4GPUCompressor {
     cl_mem input_buffer;
     cl_mem output_buffer;
 
+    /* Persistent per-frame buffers to avoid repeated clCreate/Release
+     * These are allocated on demand and reused across compress/decompress calls. */
+    cl_mem block_offsets_buffer;      /* device buffer for block offsets (u32 pairs) */
+    size_t block_offsets_capacity;    /* bytes allocated in block_offsets_buffer */
+
+    cl_mem compressed_sizes_buffer;   /* device buffer for compressed sizes (u32 per block) */
+    size_t compressed_sizes_capacity;
+
+    cl_mem output_offsets_buffer;     /* device buffer for output offsets (u32 per block) */
+    size_t output_offsets_capacity;
+
+    cl_mem max_output_sizes_buffer;   /* device buffer for max output sizes (u32 per block) */
+    size_t max_output_sizes_capacity;
+
     // Buffer sizes (for dynamic allocation)
     size_t input_buffer_size;
     size_t output_buffer_size;
@@ -121,22 +139,33 @@ struct LZ4GPUCompressor {
 
     // Dynamic block size chosen per-device / per-input
     size_t dynamic_block_size;
+    /* Optimal block sizes for compression and decompression (can be overridden via API) */
+    size_t compress_block_size;       /* block size for compression (default: 32KB) */
+    size_t decompress_block_size;     /* block size for decompression (default: 32KB) */
+    /* Optional source path for kernel building (if set, used instead of default 'lz4_gpu.cl') */
+    char kernel_src_path[256];
+    /* Default work-group sizes (local size) for kernels. Values are suggested defaults
+     * based on tuning and device properties; these can be overridden via API
+     * calls before initialize() or via environment/harness. */
+    size_t default_local;            /* unified local size for compression & decompression kernels */
 
     /* Build/runtime options controlled by host API or CLI. These flags
      * are used by lz4_gpu_build_program_with_options() to select precompiled
      * binaries or to pass -D options to the OpenCL compiler when building
      * from source. They must be part of the public struct so callers that
      * allocate/inspect the compressor can set them prior to initialize(). */
-    int enable_vector_io;      /* if 1, build/load vectorized kernel variant */
     int enable_kernel_debug;   /* if 1, compile kernel with LZ4_GPU_KERNEL_DEBUG */
     int prefer_precompiled;    /* if 1, prefer loading a precompiled .clbin when available */
     char precompiled_path[256];/* optional path to a precompiled clbin to load */
     int enable_profiling;      /* if 1, create command queue with profiling enabled and collect timings */
 
-    /* Runtime kernel hashlog chosen at build time based on device local memory.
-     * This is set by lz4_gpu_build_program_with_options() so host can allocate
-     * the correct per-work-group local memory size when launching kernels. */
     int kernel_hashlog;
+
+    int use_pinned_memory;
+    void* pinned_input_ptr;
+    void* pinned_output_ptr;
+    size_t pinned_input_size;
+    size_t pinned_output_size;
 
     // Performance timing (last operation)
     LZ4GPUTiming last_timing;
@@ -146,8 +175,21 @@ struct LZ4GPUCompressor {
     char error_message[256];
 };
 
+
 // Opaque compressor structure
 typedef struct LZ4GPUCompressor LZ4GPUCompressor;
+
+void lz4_gpu_set_workgroup_size(LZ4GPUCompressor* compressor, size_t local);
+/* Set explicit block sizes for compress/decompress (0 to use dynamic sizing). */
+void lz4_gpu_set_block_sizes(LZ4GPUCompressor* compressor, size_t compress_block_size, size_t decompress_block_size);
+/* Set explicit path to kernel source file (overrides default 'lz4_gpu.cl'). */
+void lz4_gpu_set_kernel_source(LZ4GPUCompressor* compressor, const char* path);
+
+void lz4_gpu_set_pinned_memory(LZ4GPUCompressor* compressor, int enabled);
+
+// ============================================================================
+// API Functions
+// ============================================================================
 
 // API Functions
 
@@ -193,7 +235,6 @@ size_t lz4_gpu_decompress_block(LZ4GPUCompressor* compressor,
                                 void* output, size_t max_output_size);
 
 // Runtime/build option setters
-void lz4_gpu_set_vector_io(LZ4GPUCompressor* compressor, int enabled);
 void lz4_gpu_set_kernel_debug(LZ4GPUCompressor* compressor, int enabled);
 /* Enable or disable host-side debug printing at runtime (overrides env var/cached value)
  * Call before lz4_gpu_initialize() if you want debug prints during init.

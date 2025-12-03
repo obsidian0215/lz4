@@ -70,6 +70,10 @@ OpenCL-based LZ4 frame compression implementation optimized for GPU acceleration
 - **High throughput** suitable for memory snapshots and checkpoints
 - **Automatic block size optimization** (up to 4MB blocks)
 - **Pure C implementation** - no C++ dependencies
+- **Independent optimal defaults for compression and decompression**
+    - Compression: local=256, block=32KB
+    - Decompression: local=1, block=32KB
+    - Can be overridden via API
 
 ## Architecture
 
@@ -86,7 +90,8 @@ OpenCL-based LZ4 frame compression implementation optimized for GPU acceleration
 - SIMD string comparison operations
 - Local memory hash table caching
 - Parallel block processing
-- Zero-copy buffer transfers where possible
+- Pinned memory for host-GPU transfers (default disabled; enable with --pinned)
+- Independent optimal defaults for compression and decompression (see above)
 
 ## Files
 
