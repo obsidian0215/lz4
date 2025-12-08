@@ -13,7 +13,18 @@
 #include <fcntl.h>
 #endif
 
-#define DEFAULT_ACCELERATION 8
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <arpa/inet.h>
+#include <sys/stat.h>
+#include <math.h>
+
+#define DEFAULT_ACCELERATION LZ4_GPU_DEFAULT_ACCELERATION
 
 static int ends_with(const char* str, const char* suf) {
     if (!str || !suf) return 0;
@@ -21,6 +32,377 @@ static int ends_with(const char* str, const char* suf) {
     size_t lsuf = strlen(suf);
     if (lsuf > lstr) return 0;
     return strcmp(str + lstr - lsuf, suf) == 0;
+}
+
+// Helper functions for daemon IPC
+static ssize_t read_all(int fd, void* buf, size_t count) {
+    size_t offset = 0;
+    while (offset < count) {
+        ssize_t r = read(fd, (char*)buf + offset, count - offset);
+        if (r <= 0) return r; // zero or negative indicates EOF or error
+        offset += (size_t)r;
+    }
+    return (ssize_t)offset;
+}
+
+static ssize_t write_all(int fd, const void* buf, size_t count) {
+    size_t offset = 0;
+    while (offset < count) {
+        ssize_t r = write(fd, (const char*)buf + offset, count - offset);
+        if (r <= 0) return r;
+        offset += (size_t)r;
+    }
+    return (ssize_t)offset;
+}
+
+// Run the daemon server loop - this blocks until terminated by signal
+static volatile int daemon_should_stop = 0;
+static void daemon_signal_handler(int sig) {
+    (void)sig;
+    daemon_should_stop = 1;
+}
+
+// Daemon context to manage persistent buffers and statistics
+typedef struct {
+    unsigned char* input_buf;
+    size_t input_capacity;
+    unsigned char* output_buf;
+    size_t output_capacity;
+    uint64_t total_requests;
+    uint64_t total_compress_bytes;
+    uint64_t total_decompress_bytes;
+    double total_compress_time_ms;
+    double total_decompress_time_ms;
+} DaemonContext;
+
+static int run_daemon_server(LZ4GPUCompressor* ctx, const char* socket_path, int enable_pinned) {
+    int listen_fd = -1;
+    struct sockaddr_un addr;
+    if (!socket_path) socket_path = "/tmp/lz4_gpu_daemon.sock";
+
+    // If pinned requested, enable pinned memory before init
+    if (enable_pinned >= 0) {
+        lz4_gpu_set_pinned_memory(ctx, enable_pinned);
+    } else {
+        // Daemon default: prefer pinned memory for performance
+        lz4_gpu_set_pinned_memory(ctx, 1);
+    }
+
+    if (!lz4_gpu_initialize(ctx)) {
+        fprintf(stderr, "Daemon: GPU init failed: %s\n", lz4_gpu_get_error_message(ctx));
+        return 1;
+    }
+
+    // Initialize daemon context with modest initial buffers
+    DaemonContext dctx = {0};
+    dctx.input_capacity = 64 * 1024 * 1024;  // 64MB initial
+    dctx.output_capacity = 128 * 1024 * 1024; // 128MB initial
+    dctx.input_buf = (unsigned char*)malloc(dctx.input_capacity);
+    dctx.output_buf = (unsigned char*)malloc(dctx.output_capacity);
+    if (!dctx.input_buf || !dctx.output_buf) {
+        fprintf(stderr, "Daemon: failed to allocate persistent buffers\n");
+        free(dctx.input_buf);
+        free(dctx.output_buf);
+        return 1;
+    }
+
+    // Optional micro-benchmark to prefer smaller acceleration if similar performance
+    const char* tune_env = getenv("LZ4_GPU_AUTO_TUNE_ACCEL");
+    if (tune_env && tune_env[0] == '1') {
+        // Run a tiny benchmark comparing accel=1 and accel=4 to prefer smaller if within 3%
+        size_t sample_size = 1024 * 1024; // 1MB
+        unsigned char* sbuf = (unsigned char*)malloc(sample_size);
+        unsigned char* outbuf = (unsigned char*)malloc(sample_size + sample_size/10 + 65536);
+        if (sbuf && outbuf) {
+            // Fill with pseudo-random data
+            for (size_t i = 0; i < sample_size; ++i) sbuf[i] = (unsigned char)(i & 0xFF);
+            int reps = 3;
+            double best1 = 0.0, best4 = 0.0;
+            for (int r = 0; r < reps; ++r) {
+                clock_t t0 = clock();
+                size_t sz = lz4_gpu_compress_frame_accelerated(ctx, sbuf, sample_size, outbuf, sample_size + sample_size/10, 1);
+                clock_t t1 = clock();
+                if (sz > 0) best1 += (double)(t1 - t0) / CLOCKS_PER_SEC;
+                t0 = clock();
+                sz = lz4_gpu_compress_frame_accelerated(ctx, sbuf, sample_size, outbuf, sample_size + sample_size/10, 4);
+                t1 = clock();
+                if (sz > 0) best4 += (double)(t1 - t0) / CLOCKS_PER_SEC;
+            }
+            if (best1 > 0 && best4 > 0) {
+                double avg1 = best1 / (double)reps;
+                double avg4 = best4 / (double)reps;
+                double diff = fabs(avg1 - avg4) / ((avg1+avg4) * 0.5);
+                if (diff < 0.03) {
+                    // Similar performance: prefer smaller acceleration
+                    ctx->default_acceleration = 1;
+                    fprintf(stderr, "Daemon: micro-benchmark: accel 1 and 4 similar; preferring smaller accel=1\n");
+                }
+            }
+        }
+        if (sbuf) free(sbuf);
+        if (outbuf) free(outbuf);
+    }
+
+    if ((listen_fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
+        perror("daemon: socket");
+        return 1;
+    }
+
+    memset(&addr, 0, sizeof(struct sockaddr_un));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+
+    // If another socket file exists, try to connect to verify if a daemon is running.
+    if (access(socket_path, F_OK) == 0) {
+        int tmpfd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (tmpfd >= 0) {
+            if (connect(tmpfd, (struct sockaddr*)&addr, sizeof(struct sockaddr_un)) == 0) {
+                fprintf(stderr, "Daemon: socket %s already in use by a running daemon\n", socket_path);
+                close(tmpfd);
+                close(listen_fd);
+                return 1;
+            }
+            close(tmpfd);
+        }
+        unlink(socket_path); // not running: remove stale socket
+    }
+
+    if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(struct sockaddr_un)) < 0) {
+        perror("daemon: bind");
+        close(listen_fd);
+        return 1;
+    }
+    if (listen(listen_fd, 4) < 0) {
+        perror("daemon: listen");
+        close(listen_fd);
+        unlink(socket_path);
+        return 1;
+    }
+    // Set socket perms to allow local users connecting
+    chmod(socket_path, 0666);
+
+    fprintf(stderr, "Daemon: Listening on %s\n", socket_path);
+
+    // Install signal handler for graceful shutdown
+    signal(SIGINT, daemon_signal_handler);
+    signal(SIGTERM, daemon_signal_handler);
+
+    while (!daemon_should_stop) {
+        int client_fd = accept(listen_fd, NULL, NULL);
+        if (client_fd < 0) {
+            if (errno == EINTR) continue; // interrupted by signal, try again
+            perror("daemon: accept");
+            break;
+        }
+        dctx.total_requests++;
+
+        // Protocol: header = 16 bytes: op(1) + accel(1) + local(1) + pinned(1) + input_size(8) + block_size(4)
+        uint8_t header[16];
+        if (read_all(client_fd, header, sizeof(header)) != sizeof(header)) {
+            fprintf(stderr, "Daemon: failed to read header from client\n");
+            close(client_fd);
+            continue;
+        }
+        uint8_t op = header[0];
+        int requested_accel = (int)header[1];
+        int requested_local = (int)header[2];
+        int requested_pinned = (int)header[3];
+        uint64_t input_size = 0;
+        memcpy(&input_size, &header[4], sizeof(uint64_t));
+        uint32_t requested_block_size = 0;
+        memcpy(&requested_block_size, &header[12], sizeof(uint32_t));
+
+        // Expand persistent input buffer if needed
+        if ((size_t)input_size > dctx.input_capacity) {
+            dctx.input_capacity = (size_t)input_size + (size_t)input_size / 5; // 20% headroom
+            unsigned char* new_buf = (unsigned char*)realloc(dctx.input_buf, dctx.input_capacity);
+            if (!new_buf) {
+                fprintf(stderr, "Daemon: failed to expand input buffer to %zu bytes\n", dctx.input_capacity);
+                close(client_fd);
+                continue;
+            }
+            dctx.input_buf = new_buf;
+        }
+
+        // Read input into persistent buffer
+        if (read_all(client_fd, dctx.input_buf, (size_t)input_size) != (ssize_t)input_size) {
+            fprintf(stderr, "Daemon: failed to read input payload\n");
+            close(client_fd);
+            continue;
+        }
+        if (requested_pinned <= 1) lz4_gpu_set_pinned_memory(ctx, requested_pinned);
+        if (requested_local > 0) lz4_gpu_set_workgroup_size(ctx, (size_t)requested_local);
+        if (requested_block_size > 0) lz4_gpu_set_block_sizes(ctx, (size_t)requested_block_size, (size_t)requested_block_size);
+
+        // Estimate output buffer size based on operation
+        size_t needed_size = dctx.output_capacity;
+        if (op == 1) { // compress
+            needed_size = (size_t)input_size + (size_t)input_size/10 + 65536;
+        } else if (op == 2) { // decompress - estimate from frame
+            size_t estimated = lz4_gpu_estimate_decompressed_size(ctx, dctx.input_buf, (size_t)input_size);
+            if (estimated > 0) {
+                needed_size = estimated + 65536;
+            } else {
+                // Fallback: conservative 10x multiplier
+                needed_size = (size_t)input_size * 10 + 65536;
+            }
+        }
+
+        // Expand output buffer if needed with some headroom
+        if (needed_size > dctx.output_capacity) {
+            dctx.output_capacity = needed_size + (size_t)(needed_size * 0.1); // 10% headroom
+            unsigned char* new_buf = (unsigned char*)realloc(dctx.output_buf, dctx.output_capacity);
+            if (!new_buf) {
+                fprintf(stderr, "Daemon: failed to expand output buffer to %zu bytes\n", dctx.output_capacity);
+                close(client_fd);
+                continue;
+            }
+            dctx.output_buf = new_buf;
+        }
+
+        // Clear init_ms from the context's last_timing since daemon init is one-time only.
+        // For each request, we should not include the one-time OpenCL setup time.
+        ctx->last_timing.init_ms = 0.0;
+
+        // Time the operation
+        clock_t t_op_start = clock();
+        size_t out_sz = 0;
+        if (op == 1) { // compress
+            if (requested_accel <= 0) requested_accel = DEFAULT_ACCELERATION;
+            out_sz = lz4_gpu_compress_frame_accelerated(ctx, dctx.input_buf, (size_t)input_size, dctx.output_buf, dctx.output_capacity, requested_accel);
+            if (out_sz > 0) {
+                dctx.total_compress_bytes += input_size;
+            }
+        } else if (op == 2) { // decompress
+            out_sz = lz4_gpu_decompress_frame(ctx, dctx.input_buf, (size_t)input_size, dctx.output_buf, dctx.output_capacity);
+            if (out_sz > 0) {
+                dctx.total_decompress_bytes += out_sz;
+            }
+        } else {
+            fprintf(stderr, "Daemon: unknown op %d\n", op);
+        }
+        clock_t t_op_end = clock();
+        double op_time_ms = (double)(t_op_end - t_op_start) / CLOCKS_PER_SEC * 1000.0;
+        if (op == 1) {
+            dctx.total_compress_time_ms += op_time_ms;
+        } else if (op == 2) {
+            dctx.total_decompress_time_ms += op_time_ms;
+        }
+
+        // Send result
+        if (out_sz == 0) {
+            uint8_t status = 1;
+            write_all(client_fd, &status, 1);
+            const char* err = lz4_gpu_get_error_message(ctx);
+            uint32_t len = (uint32_t)strlen(err);
+            uint32_t len_le = len;
+            write_all(client_fd, &len_le, sizeof(len_le));
+            write_all(client_fd, err, len);
+        } else {
+            uint8_t status = 0;
+            write_all(client_fd, &status, 1);
+            uint64_t sz_le = (uint64_t)out_sz;
+            write_all(client_fd, &sz_le, sizeof(sz_le));
+            write_all(client_fd, dctx.output_buf, out_sz);
+
+            // Send timing data for detailed statistics
+            LZ4GPUTiming timing;
+            memset(&timing, 0, sizeof(timing));
+            if (lz4_gpu_get_last_timing(ctx, &timing)) {
+                write_all(client_fd, &timing, sizeof(timing));
+            } else {
+                // Send empty timing if unavailable
+                write_all(client_fd, &timing, sizeof(timing));
+            }
+        }
+        close(client_fd);
+        // continue accepting new clients
+    }
+
+    // Print daemon statistics on shutdown
+    fprintf(stderr, "Daemon: Shutting down. Statistics:\n");
+    fprintf(stderr, "  Total requests: %llu\n", (unsigned long long)dctx.total_requests);
+    if (dctx.total_compress_time_ms > 0 && dctx.total_compress_bytes > 0) {
+        double comp_mb = (double)dctx.total_compress_bytes / (1024.0 * 1024.0);
+        double comp_sec = dctx.total_compress_time_ms / 1000.0;
+        fprintf(stderr, "  Compress: %.2f MB, %.2f ms, %.2f MB/s\n", comp_mb, dctx.total_compress_time_ms, comp_mb / comp_sec);
+    }
+    if (dctx.total_decompress_time_ms > 0 && dctx.total_decompress_bytes > 0) {
+        double decomp_mb = (double)dctx.total_decompress_bytes / (1024.0 * 1024.0);
+        double decomp_sec = dctx.total_decompress_time_ms / 1000.0;
+        fprintf(stderr, "  Decompress: %.2f MB, %.2f ms, %.2f MB/s\n", decomp_mb, dctx.total_decompress_time_ms, decomp_mb / decomp_sec);
+    }
+    fprintf(stderr, "  Final buffer capacities - input: %zu bytes, output: %zu bytes\n", dctx.input_capacity, dctx.output_capacity);
+
+    close(listen_fd);
+    free(dctx.input_buf);
+    free(dctx.output_buf);
+    unlink(socket_path);
+    return 0;
+}
+
+static int run_daemon_client(const char* socket_path, const unsigned char* input_buf, size_t input_size,
+                             unsigned char** out_buf, size_t* out_size,
+                             int compress, int accel, int local, int pinned, size_t block_size, double* elapsed_ms, LZ4GPUTiming* timing_out) {
+    if (!socket_path) socket_path = "/tmp/lz4_gpu_daemon.sock";
+    clock_t t_start = clock();
+    int sd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sd < 0) { perror("daemon client: socket"); return 1; }
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(struct sockaddr_un));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+    if (connect(sd, (struct sockaddr*)&addr, sizeof(struct sockaddr_un)) < 0) {
+        perror("daemon client: connect");
+        close(sd);
+        return 2; // unable to connect
+    }
+    // Protocol: 16 byte header = op(1) + accel(1) + local(1) + pinned(1) + input_size(8) + block_size(4)
+    uint8_t header[16];
+    header[0] = compress ? 1 : 2; // op
+    header[1] = (uint8_t)(accel & 0xff);
+    header[2] = (uint8_t)(local & 0xff);
+    header[3] = (uint8_t)((pinned >= 0) ? pinned : 255);
+    uint64_t in_sz_le = (uint64_t)input_size;
+    memcpy(&header[4], &in_sz_le, sizeof(in_sz_le));
+    uint32_t block_sz_le = (uint32_t)(block_size & 0xffffffff);
+    memcpy(&header[12], &block_sz_le, sizeof(block_sz_le));
+    if (write_all(sd, header, sizeof(header)) != sizeof(header)) { close(sd); return 3; }
+    if (write_all(sd, input_buf, input_size) != (ssize_t)input_size) { close(sd); return 4; }
+    uint8_t status = 1;
+    if (read_all(sd, &status, 1) != 1) { close(sd); return 5; }
+    if (status != 0) {
+        uint32_t msglen = 0;
+        if (read_all(sd, &msglen, sizeof(msglen)) != sizeof(msglen)) { close(sd); return 6; }
+        char* msg = (char*)malloc((size_t)msglen + 1);
+        if (!msg) { close(sd); return 7; }
+        if (read_all(sd, msg, msglen) != (ssize_t)msglen) { free(msg); close(sd); return 8; }
+        msg[msglen] = '\0';
+        fprintf(stderr, "Daemon error: %s\n", msg);
+        free(msg);
+        close(sd);
+        return 9;
+    }
+    uint64_t out_sz = 0;
+    if (read_all(sd, &out_sz, sizeof(out_sz)) != sizeof(out_sz)) { close(sd); return 10; }
+    unsigned char* out = (unsigned char*)malloc((size_t)out_sz);
+    if (!out) { close(sd); return 11; }
+    if (read_all(sd, out, (size_t)out_sz) != (ssize_t)out_sz) { free(out); close(sd); return 12; }
+    *out_buf = out; *out_size = (size_t)out_sz;
+
+    // Read timing data from daemon
+    LZ4GPUTiming timing;
+    memset(&timing, 0, sizeof(timing));
+    if (read_all(sd, &timing, sizeof(timing)) == sizeof(timing)) {
+        if (timing_out) {
+            memcpy(timing_out, &timing, sizeof(timing));
+        }
+    }
+
+    clock_t t_end = clock();
+    if (elapsed_ms) *elapsed_ms = ((double)(t_end - t_start) * 1000.0) / CLOCKS_PER_SEC;
+    close(sd);
+    return 0;
 }
 
 /* Try to parse LZ4 frame header and extract the original content size if present.
@@ -45,18 +427,22 @@ static int parse_lz4f_content_size(const unsigned char* buf, size_t len, size_t*
 
 static void usage(const char* prog) {
     fprintf(stderr,
-    "Usage: %s [-c|-d] [-l level] [-o outfile|-] [--bench] [-v] <input>\n"
+    "Usage: %s [-c|-d] [-l level] [-B blocksize] [-o outfile|-] [--bench] [-v] <input>\n"
         "  -c        compress (default)\n"
         "  -d        decompress\n"
-            "  -l LEVEL  compression acceleration level (higher -> faster, less ratio). Allowed: 1..12\n"
+        "  -l LEVEL  compression acceleration level (higher -> faster, less ratio). Allowed: 1..12\n"
+        "  -B|--blocksize SIZE  block size for compression (e.g. 16k, 64k, 256k). Default: 64k\n"
     "  -o FILE   output file (default: input.lz4 for compress, input.out for decompress). Use '-' to write to stdout.\n"
         "  -g|--kernel-debug Enable kernel-side debug prints (build with LZ4_GPU_KERNEL_DEBUG)\n"
     "  -p|--profile  Enable OpenCL event profiling and print upload/kernel/download CSV\n"
-            "  --local N  Optional override for local work-group size (applies to both compression and decompression kernels)\n"
+        "  --local N  Optional override for local work-group size (applies to both compression and decompression kernels)\n"
     "  --bench   print throughput and compression ratio summary\n"
         "  -v        verbose logging\n"
         "  --pinned  Use pinned host memory (enabled if supported).\n"
-        "  --no-pinned  Disable pinned host memory.\n\n"
+        "  --no-pinned  Disable pinned host memory.\n"
+        "  --daemon  Run as a persistent lz4_gpu daemon process (accepts IPC requests via unix domain socket)\n"
+        "  --use-daemon  Send a compress/decompress request to a running lz4_gpu daemon if one is available\n"
+        "  --daemon-socket PATH  Unix domain socket path for daemon (default: /tmp/lz4_gpu_daemon.sock)\n"
          "ENVIRONMENT VARIABLES:\n"
          "  LZ4_GPU_CLBIN : Optional path to precompiled .clbin file (preferred).\n"
          "  LZ4_GPU_CLSRC : Optional path to kernel source file to use when building from source.\n",
@@ -94,6 +480,10 @@ int main(int argc, char** argv) {
     int cli_local = 0;
     const char* env_clbin_path = NULL;
     const char* env_clsrc_path = NULL;
+    int daemon_mode = 0;
+    int use_daemon = 0;
+    const char* daemon_socket = NULL;
+    // int daemon_pinned = -1; /* 移除单独的daemon_pinned参数 */
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-c") == 0) { compress = 1; }
@@ -109,22 +499,56 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--local") == 0 && i+1 < argc) { cli_local = atoi(argv[++i]); }
         else if (strcmp(argv[i], "--pinned") == 0) { cli_pinned = 1; }
         else if (strcmp(argv[i], "--no-pinned") == 0) { cli_pinned = 0; }
+        else if (strcmp(argv[i], "--daemon") == 0) { daemon_mode = 1; }
+        else if (strcmp(argv[i], "--use-daemon") == 0) { use_daemon = 1; }
+        // 移除 --daemon-pinned 和 --daemon-no-pinned 参数
+        else if (strcmp(argv[i], "--daemon-socket") == 0 && i+1 < argc) { daemon_socket = argv[++i]; }
         else if (strcmp(argv[i], "-o") == 0 && i+1 < argc) { outpath = argv[++i]; }
         else if (argv[i][0] == '-') { fprintf(stderr, "Unknown option: %s\n", argv[i]); usage(argv[0]); return 1; }
         else { infile = argv[i]; }
     }
 
-    if (!infile) { usage(argv[0]); return 1; }
+    if (!infile && !daemon_mode) { usage(argv[0]); return 1; }
 
-    /* read input file */
+    /* create compressor */
+    LZ4GPUCompressor* ctx = lz4_gpu_create_compressor();
+    if (!ctx) { fprintf(stderr, "Failed to create GPU compressor context\n"); return 1; }
+
+    // If user requested daemon mode, run server loop now and exit.
+    if (daemon_mode) {
+        // 直接用cli_pinned参数
+        if (cli_pinned >= 0) lz4_gpu_set_pinned_memory(ctx, cli_pinned);
+        if (kernel_debug) lz4_gpu_set_kernel_debug(ctx, 1);
+        if (host_debug) lz4_gpu_set_host_debug(ctx, 1);
+        if (enable_profile) ctx->enable_profiling = 1;
+        if (verbose) ctx->verbose = 1;
+        if (cli_local > 0) lz4_gpu_set_workgroup_size(ctx, (size_t)cli_local);
+        if (!daemon_socket) daemon_socket = getenv("LZ4_GPU_DAEMON_SOCKET");
+        // 读取环境变量设置预编译二进制或内核源路径（daemon模式也需要）
+        env_clbin_path = getenv("LZ4_GPU_CLBIN");
+        env_clsrc_path = getenv("LZ4_GPU_CLSRC");
+        if (env_clbin_path && env_clbin_path[0] != '\0') {
+            lz4_gpu_use_precompiled(ctx, 1);
+            lz4_gpu_set_precompiled_binary(ctx, env_clbin_path);
+            if (verbose) fprintf(stderr, "Daemon: Using precompiled OpenCL binary from LZ4_GPU_CLBIN=%s\n", env_clbin_path);
+        } else if (env_clsrc_path && env_clsrc_path[0] != '\0') {
+            lz4_gpu_set_kernel_source(ctx, env_clsrc_path);
+            if (verbose) fprintf(stderr, "Daemon: Using kernel source from LZ4_GPU_CLSRC=%s\n", env_clsrc_path);
+        }
+        int rc = run_daemon_server(ctx, daemon_socket, cli_pinned);
+        lz4_gpu_destroy_compressor(ctx);
+        return rc;
+    }
+
+    /* read input file (needed for both local and daemon modes) */
     FILE* f = fopen(infile, "rb");
-    if (!f) { perror("open input"); return 1; }
+    if (!f) { perror("open input"); lz4_gpu_destroy_compressor(ctx); return 1; }
     fseek(f, 0, SEEK_END);
     long input_size = ftell(f);
     fseek(f, 0, SEEK_SET);
     unsigned char* input_buf = malloc(input_size);
-    if (!input_buf) { fprintf(stderr, "Out of memory\n"); fclose(f); return 1; }
-    if (fread(input_buf, 1, input_size, f) != (size_t)input_size) { perror("read"); free(input_buf); fclose(f); return 1; }
+    if (!input_buf) { fprintf(stderr, "Out of memory\n"); fclose(f); lz4_gpu_destroy_compressor(ctx); return 1; }
+    if (fread(input_buf, 1, input_size, f) != (size_t)input_size) { perror("read"); free(input_buf); fclose(f); lz4_gpu_destroy_compressor(ctx); return 1; }
     fclose(f);
 
     char default_out[1024];
@@ -145,15 +569,118 @@ int main(int argc, char** argv) {
         outpath = default_out;
     }
 
-    /* create compressor */
-    LZ4GPUCompressor* ctx = lz4_gpu_create_compressor();
-    if (!ctx) { fprintf(stderr, "Failed to create GPU compressor context\n"); free(input_buf); return 1; }
     /* honor CLI request for vector IO and kernel debug before initializing/building kernels */
     if (kernel_debug) lz4_gpu_set_kernel_debug(ctx, 1);
     if (host_debug) lz4_gpu_set_host_debug(ctx, 1);
     if (enable_profile) ctx->enable_profiling = 1;
+    if (verbose) ctx->verbose = 1;
     if (cli_pinned >= 0) {
         lz4_gpu_set_pinned_memory(ctx, cli_pinned);
+    }
+
+    // If the user requested to use the daemon, attempt to connect and let the daemon process the request.
+    if (use_daemon) {
+        if (!daemon_socket) daemon_socket = getenv("LZ4_GPU_DAEMON_SOCKET");
+        unsigned char* d_out = NULL; size_t d_out_sz = 0;
+        double daemon_elapsed_ms = 0.0;
+        LZ4GPUTiming daemon_timing;
+        memset(&daemon_timing, 0, sizeof(daemon_timing));
+        // Client determines block size and sends to daemon
+        size_t client_block_size = 0;
+        if (cli_blocksize > 0) {
+            client_block_size = cli_blocksize;
+        } else {
+            // If no explicit block size, use dynamic calculation (same logic as local mode)
+            // For now, use 16KB default for daemon
+            client_block_size = 16 * 1024;
+        }
+        int d_rc = run_daemon_client(daemon_socket, input_buf, (size_t)input_size, &d_out, &d_out_sz, compress, accel, cli_local, cli_pinned, client_block_size, &daemon_elapsed_ms, &daemon_timing);
+        if (d_rc == 0) {
+            // Successful; print statistics in same detailed format as local mode
+            if (verbose) {
+                double in_mb = input_size / (1024.0 * 1024.0);
+                double out_mb = d_out_sz / (1024.0 * 1024.0);
+                double ipc_overhead_ms = daemon_elapsed_ms - daemon_timing.total_ms;
+                if (ipc_overhead_ms < 0) ipc_overhead_ms = 0.0;
+
+                if (compress) {
+                    double ratio = (input_size > 0) ? (double)input_size / (double)d_out_sz : 0.0;
+                    double pct = (input_size > 0) ? (double)d_out_sz / (double)input_size * 100.0 : 0.0;
+                    long long saved = (long long)input_size - (long long)d_out_sz;
+
+                    fprintf(stderr, "\n=== Compression Statistics (Daemon Mode) ===\n");
+                    fprintf(stderr, "Input size       : %zu bytes (%.2f MB)\n", input_size, in_mb);
+                    fprintf(stderr, "Compressed size  : %zu bytes (%.2f MB)\n", d_out_sz, out_mb);
+                    fprintf(stderr, "Compression ratio: %.2f:1 (%.2f%% of original)\n", ratio, pct);
+                    fprintf(stderr, "Space saved      : %lld bytes (%.2f MB, %.2f%%)\n", saved, saved/1024.0/1024.0, 100.0 - pct);
+                    fprintf(stderr, "Block size       : %zu bytes\n", daemon_timing.block_size);
+                    fprintf(stderr, "Number of blocks : %d\n", daemon_timing.num_blocks);
+
+                    double total_s = daemon_timing.total_ms / 1000.0;
+                    double throughput_total = total_s > 0.0 ? in_mb / total_s : 0.0;
+                    double kernel_s = daemon_timing.kernel_ms > 0.0 ? daemon_timing.kernel_ms / 1000.0 : 0.0;
+                    double throughput_kernel = kernel_s > 0.0 ? in_mb / kernel_s : 0.0;
+                    if (kernel_s > 0.0) {
+                        fprintf(stderr, "Throughput       : %.2f MB/s (kernel: %.2f MB/s)\n", throughput_total, throughput_kernel);
+                    } else {
+                        fprintf(stderr, "Throughput       : %.2f MB/s\n", throughput_total);
+                    }
+                    fprintf(stderr, "-------------------------------\n");
+                    fprintf(stderr, "  Total time:        %8.3f ms\n", daemon_timing.total_ms);
+                    fprintf(stderr, "  Buffer Alloc:      %8.3f ms\n", daemon_timing.alloc_ms);
+                    fprintf(stderr, "  OpenCL Init:       %8.3f ms\n", daemon_timing.init_ms);
+                    fprintf(stderr, "  Host→Device:       %8.3f ms\n", daemon_timing.h2d_ms);
+                    fprintf(stderr, "  Setup Args:        %8.3f ms\n", daemon_timing.setup_ms);
+                    fprintf(stderr, "  Kernel:            %8.3f ms\n", daemon_timing.kernel_ms);
+                    fprintf(stderr, "  Device→Host:       %8.3f ms\n", daemon_timing.d2h_ms);
+                    fprintf(stderr, "  Frame Assembly:    %8.3f ms\n", daemon_timing.frame_ms);
+                    if (daemon_timing.map_ms > 0.0) {
+                        fprintf(stderr, "  Map/Unmap:         %8.3f ms\n", daemon_timing.map_ms);
+                    }
+                } else {
+                    fprintf(stderr, "\n=== Decompression Statistics (Daemon Mode) ===\n");
+                    fprintf(stderr, "Compressed size  : %zu bytes (%.2f MB)\n", input_size, in_mb);
+                    fprintf(stderr, "Decompressed size: %zu bytes (%.2f MB)\n", d_out_sz, out_mb);
+                    fprintf(stderr, "Number of blocks : %d\n", daemon_timing.num_blocks);
+
+                    double total_s = daemon_timing.total_ms / 1000.0;
+                    double throughput_total = total_s > 0.0 ? out_mb / total_s : 0.0;
+                    double kernel_s = daemon_timing.kernel_ms > 0.0 ? daemon_timing.kernel_ms / 1000.0 : 0.0;
+                    double throughput_kernel = kernel_s > 0.0 ? out_mb / kernel_s : 0.0;
+                    if (kernel_s > 0.0) {
+                        fprintf(stderr, "Throughput       : %.2f MB/s (kernel: %.2f MB/s)\n", throughput_total, throughput_kernel);
+                    } else {
+                        fprintf(stderr, "Throughput       : %.2f MB/s\n", throughput_total);
+                    }
+                    fprintf(stderr, "-------------------------------\n");
+                    fprintf(stderr, "  Total time:        %8.3f ms\n", daemon_timing.total_ms);
+                    fprintf(stderr, "  Buffer Alloc:      %8.3f ms\n", daemon_timing.alloc_ms);
+                    fprintf(stderr, "  Host→Device:       %8.3f ms\n", daemon_timing.h2d_ms);
+                    fprintf(stderr, "  Kernel:            %8.3f ms\n", daemon_timing.kernel_ms);
+                    fprintf(stderr, "  Device→Host:       %8.3f ms\n", daemon_timing.d2h_ms);
+                    if (daemon_timing.map_ms > 0.0) {
+                        fprintf(stderr, "  Map/Unmap:         %8.3f ms\n", daemon_timing.map_ms);
+                    }
+                }
+            }
+            // write result and exit
+            FILE* fo = NULL;
+            int close_fo = 1;
+            if (outpath[0] == '-' && outpath[1] == '\0') { fo = stdout; close_fo = 0; }
+            else { fo = fopen(outpath, "wb"); if (!fo) { perror("open out"); free(d_out); lz4_gpu_destroy_compressor(ctx); free(input_buf); return 1; } }
+            if (fwrite(d_out, 1, d_out_sz, fo) != d_out_sz) { perror("write out"); if (close_fo) fclose(fo); free(d_out); lz4_gpu_destroy_compressor(ctx); free(input_buf); return 1; }
+            if (close_fo) fclose(fo);
+            free(d_out);
+            lz4_gpu_destroy_compressor(ctx);
+            free(input_buf);
+            return 0;
+        } else if (d_rc == 2) {
+            if (verbose) fprintf(stderr, "Daemon: not available, falling back to local processing\n");
+            // fallthrough to local processing
+        } else {
+            if (verbose) fprintf(stderr, "Daemon: failed to process request (code %d), falling back to local processing\n", d_rc);
+            // fallthrough to local processing
+        }
     }
     /* Apply any CLI-specified workgroup or block size override before initialize to influence kernel builds/decisions */
     if (cli_local > 0) {
@@ -196,6 +723,7 @@ int main(int argc, char** argv) {
     if (verbose) {
         fprintf(stderr, "ENV: LZ4_GPU_CLBIN=%s\n", env_clbin_path ? env_clbin_path : "<unset>");
         fprintf(stderr, "ENV: LZ4_GPU_CLSRC=%s\n", env_clsrc_path ? env_clsrc_path : "<unset>");
+        fprintf(stderr, "DEFAULTS: accel=%d block=%zu local=%zu pinned=%d\n", DEFAULT_ACCELERATION, ctx->dynamic_block_size, ctx->default_local, ctx->use_pinned_memory);
     }
     /* Clamp acceleration to maximum allowed */
     if (accel < 1) accel = 1;

@@ -66,7 +66,7 @@ programs/*.rc
 
 lz4_gpu/backup
 .github/copilot-instructions.md
-ab_results
+ab_results*
 lz4_gpu/samples*
 lz4_gpu/*.clbin
 lz4_gpu/build_clbin

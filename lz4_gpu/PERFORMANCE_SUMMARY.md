@@ -34,7 +34,7 @@
 4. 主机行为：请通过环境变量 `LZ4_GPU_CLBIN`/`LZ4_GPU_CLSRC` 指定 precompiled `.clbin` 或内核源；优先加载 precompiled `.clbin`，并在需要时使用子进程编译源代码（`compile_source_subproc`）。
 5. 工具链：增加 `tools/tune_block_local_global.sh` 等脚本以进行 block/local size sweeps 并收集 CSV 供分析。
 
-  新的测试数据生成脚本：`tools/generate-test-data.py`（替代早期非通用脚本），提供 `--suite` 批量生成多种模式（zero/random/repeat/structured/mixed）和不同大小的样本。该脚本默认输出 `samples/`，可使用 `--out-dir` 指定输出路径以配合现有调优 harness（例如 `lz4_gpu/tools/tune_block_local_global.sh`）。
+  新的测试数据生成脚本：`tools/generate-test-data.py`（替代早期非通用脚本），提供 `--suite` 批量生成多种模式（zero/random/repeat/structured/mixed）和不同大小的样本。该脚本默认输出 `/root/samples`（可使用 `--out-dir` 或环境变量 `SAMPLES_DIR` 覆盖），请勿在仓库路径下生成样本以避免污染源码树。
 
 
 已创建并使用的内核变体（仓库中存在的 clbins）：
@@ -47,7 +47,7 @@
 
 ## 3 基准方法与典型结论
 
-使用脚本和测试程序进行 repeatable A/B 测试：每个样本执行 5 次重复测量，收集 Host->Device 上传、压缩 kernel时间、Device->Host 读 blockSizes、解压 kernel 时间、Device->Host 读 解压数据 等分段指标。主要样本集合位于 `lz4_gpu/samples_big`（包含 256KB、1MB、4MB、16MB、64MB 的混合数据）。
+使用脚本和测试程序进行 repeatable A/B 测试：每个样本执行 5 次重复测量，收集 Host->Device 上传、压缩 kernel时间、Device->Host 读 blockSizes、解压 kernel 时间、Device->Host 读 解压数据 等分段指标。主要样本集合位于 `/root/samples`（包含 256KB、1MB、4MB、16MB、64MB 的混合数据）。
 
 重要输出目录（本次测试机）: `/tmp/ab_compare`（早先压缩基线对比），以及 `/tmp/ab_decomp_compare`（解压变体对比），每个目录包含 per-run CSV、per-block CSV 与 summary CSV。
 
@@ -106,8 +106,8 @@ test_64MB_mixed.dat |315.9936 |224.3906 |91.6030 | 28.99% faster
 - ✅ **已实现** 复用 device buffers：`input_buffer` 与 `output_buffer` 在多次调用间持久化复用，自动扩容并预留 20% 容量。
 - 使用 host-side watchdog（timeout）以在内核挂起/卡死时重置 context 并保持系统稳定。
 - ✅ **已实现** 压缩和解压分别采用独立的最优默认配置：
-    - 压缩：local=256，block=32KB
-    - 解压：local=1，block=32KB
+  - 压缩：local=256，block=16KB
+  - 解压：local=1，block=16KB
     - 可通过 API 覆盖（如 `lz4_gpu_set_workgroup_sizes` 和 `compress_block_size`/`decompress_block_size` 字段）
 
 
@@ -238,6 +238,71 @@ test_64MB_mixed.dat |315.9936 |224.3906 |91.6030 | 28.99% faster
 - 主要结论（针对本次 70 个样本的 sweep）：
   - 对压缩 kernel（comp_kernel）而言，`local`=256 是最常见的最优选择（45/70 个样本），其次为 local=32（8 次）与 local=128（7 次）。因此压缩端的默认 local 值建议为 256（若设备支持）。
   - 对解压 kernel（decomp_kernel）而言，`local`=1 在多数样本上最优（63/70），所以解压端的默认 local 值建议设置为 1（以避免多线程产生的额外开销或正确性风险）。
+
+## 推荐默认配置（5-metric 复合最优）
+
+基于对 70 个样本在 5 个指标（comp_total, comp_kernel, dec_total, dec_kernel, ratio）的综合排名分析，得出的经验性最佳配置如下：
+
+- **默认加速（acceleration）**: 8 (`LZ4_GPU_DEFAULT_ACCELERATION`)
+- **默认块大小（dynamic block size）**: 16KB (`LZ4_GPU_DEFAULT_BLOCK_SIZE`)
+- **默认 local/work-group 大小**: 64 (`LZ4_GPU_DEFAULT_LOCAL_SIZE`)
+- **默认 pinned host memory**: Disabled (`LZ4_GPU_DEFAULT_PINNED = 0`)
+
+这些默认值已作为宏常量加入 `lz4_gpu_host.h`，并在 compressor 初始化时被用作默认的运行时参数（除非通过 CLI 或 API 覆盖）。
+
+### 5-metric 综合排名 Top 10（按平均排名）
+
+| 排名 | accel | block | local | pinned | 平均复合排名 | 中位数排名 |
+|------|-------|-------|-------|--------|-------------|-----------|
+| 1 | 8 | 16k | 64 | pinned | 13.92 | 12.6 |
+| 2 | 8 | 16k | 256 | pinned | 13.99 | 12.8 |
+| 3 | 8 | 16k | 1 | pinned | 14.13 | 13.2 |
+| 4 | 8 | 16k | 8 | pinned | 14.34 | 13.4 |
+| 5 | 4 | 16k | 8 | pinned | 15.24 | 14.2 |
+| 6 | 4 | 16k | 256 | pinned | 15.26 | 14.6 |
+| 7 | 4 | 16k | 64 | pinned | 15.29 | 14.6 |
+| 8 | 4 | 16k | 1 | pinned | 15.58 | 14.8 |
+| 9 | 1 | 16k | 256 | pinned | 16.18 | 15.9 |
+| 10 | 1 | 16k | 1 | pinned | 16.19 | 16.0 |
+
+### 单指标 Top 5 最优配置
+
+**压缩吞吐（comp_total）Top 5:**
+1. accel=8, block=32k, local=1, pinned → 682.7 MB/s
+2. accel=8, block=32k, local=256, pinned → 681.9 MB/s
+3. accel=8, block=32k, local=8, pinned → 681.7 MB/s
+4. accel=8, block=32k, local=64, pinned → 681.7 MB/s
+5. accel=8, block=16k, local=8, pinned → 667.8 MB/s
+
+**解压吞吐（dec_total）Top 5:**
+- 解压性能最优配置主要集中在 local=1 和较大 block size（32k-64k）
+
+**压缩率（ratio）最优:**
+- 低加速度（accel=1）+ 大块（256k-1024k）组合提供最佳压缩比
+- 但会牺牲压缩吞吐量
+
+### Daemon 模式（推荐用于高频请求场景）
+
+如果你需要在长运行的进程中处理大量压缩/解压请求，可使用 daemon 模式避免重复 OpenCL 初始化：
+
+- **启动守护进程**: `lz4_gpu --daemon`
+  默认使用 `/tmp/lz4_gpu_daemon.sock`，可通过 `--daemon-socket` 指定自定义 socket
+
+- **使用守护进程客户端**: `lz4_gpu --use-daemon <input>`
+  尝试连接到守护进程并转发压缩/解压请求；如果守护进程不可用，则回退到本地处理
+
+- **Daemon 默认配置**:
+  - Pinned memory: **默认启用**（提高 H2D/D2H 性能）
+  - 可通过 `--daemon-no-pinned` 强制禁用
+  - 支持 `LZ4_GPU_AUTO_TUNE_ACCEL=1` 环境变量在启动时微调 acceleration 选择
+
+**Daemon 优势**:
+- OpenCL 设备初始化仅一次
+- 内核编译/加载仅一次
+- Device buffer 持久化复用
+- 减少每次请求的 overhead（~10-50ms）
+
+使用 `Ctrl+C` 或 `SIGTERM` 可优雅关闭 daemon。
   - 对端到端 round-trip（rt_end）而言，高 local 值（128/256）在多数样本上能覆盖主机传输开销，从而提高 E2E 吞吐；但具体最优值依设备与样本而异，建议通过调优脚本验证。
 
 - 示例（top 10 按 rt_end 改善率排序）：
@@ -287,11 +352,11 @@ sample_132mb_zero_5.txt | 298.20 | 13548.19 | 256 | +4443.32%
 
 - 推荐使用方式（生成样本并运行调优）：
 
-  1. 使用新的数据生成脚本（生成样本到 `lz4_gpu/samples_big`）：
+  1. 使用新的数据生成脚本（生成样本到 `/root/samples`）：
 
     ```bash
     cd /root/lz4
-    python3 tools/generate-test-data.py --suite --out-dir lz4_gpu/samples_big --per-pattern 5 --min-mb 1 --max-mb 512 --seed 1234
+    python3 tools/generate-test-data.py --suite --out-dir /root/samples --per-pattern 5 --min-mb 1 --max-mb 512 --seed 1234
     ```
 
   1. 使用调优脚本运行 sweep（输出到 /tmp/lz4_tune）：

@@ -17,6 +17,10 @@ extern "C" {
 #define LZ4_GPU_MIN_BLOCK_SIZE (4 * 1024)   // 4KB - used as conservative min when parsing frames
 #define LZ4_GPU_MAX_ACCELERATION 12         // maximum allowed acceleration (clamped)
 #define LZ4_GPU_MAX_LOCAL_SIZE 256          // maximum workgroup local size we allow by API
+#define LZ4_GPU_DEFAULT_ACCELERATION 8      // default acceleration level (best composite ranking)
+#define LZ4_GPU_DEFAULT_BLOCK_SIZE (16 * 1024) // default block size: 16KB (best 5-metric)
+#define LZ4_GPU_DEFAULT_LOCAL_SIZE 64       // default local (work-group) size: 64 (best 5-metric)
+#define LZ4_GPU_DEFAULT_PINNED 0            // default: pinned disabled; daemon mode may override
 #define LZ4_GPU_HASH_TABLE_SIZE (1 << 14)         // 16384 entries (must match LZ4_HASHLOG in kernel)
 #define LZ4F_HEADER_SIZE_MAX 19
 #define LZ4F_ENDMARK_SIZE 4
@@ -59,6 +63,7 @@ typedef struct {
     double map_ms;          // Memory map/unmap time (when using pinned memory)
     size_t input_bytes;     // Input size in bytes
     size_t output_bytes;    // Output size in bytes
+    size_t block_size;      // Block size in bytes (actual used block size)
     int num_blocks;         // Number of blocks processed
 } LZ4GPUTiming;
 
@@ -111,9 +116,11 @@ struct LZ4GPUCompressor {
     cl_kernel decompress_kernel;  // Block decompression
     cl_kernel frame_decompress_kernel;  // Frame decompression
 
-    // Memory buffers
+    // Persistent main buffers (reused across compress/decompress calls)
     cl_mem input_buffer;
     cl_mem output_buffer;
+    size_t input_buffer_capacity;   /* bytes allocated in input_buffer */
+    size_t output_buffer_capacity;  /* bytes allocated in output_buffer */
 
     /* Persistent per-frame buffers to avoid repeated clCreate/Release
      * These are allocated on demand and reused across compress/decompress calls. */
@@ -148,6 +155,7 @@ struct LZ4GPUCompressor {
      * based on tuning and device properties; these can be overridden via API
      * calls before initialize() or via environment/harness. */
     size_t default_local;            /* unified local size for compression & decompression kernels */
+        int default_acceleration;        /* default acceleration level to use for compress_frame */
 
     /* Build/runtime options controlled by host API or CLI. These flags
      * are used by lz4_gpu_build_program_with_options() to select precompiled
@@ -158,6 +166,7 @@ struct LZ4GPUCompressor {
     int prefer_precompiled;    /* if 1, prefer loading a precompiled .clbin when available */
     char precompiled_path[256];/* optional path to a precompiled clbin to load */
     int enable_profiling;      /* if 1, create command queue with profiling enabled and collect timings */
+    int verbose;               /* if 1, print informational messages to stderr */
 
     int kernel_hashlog;
 

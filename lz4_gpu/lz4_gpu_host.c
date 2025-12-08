@@ -96,7 +96,9 @@ LZ4GPUCompressor* lz4_gpu_create_compressor(void) {
         compressor->last_timing.num_blocks = 0;
         compressor->compress_block_size = 0; /* 0 -> use dynamic block sizing */
         compressor->decompress_block_size = 0; /* 0 -> use frame's block layout */
-        compressor->default_local = 0;
+        compressor->default_local = LZ4_GPU_DEFAULT_LOCAL_SIZE;
+        compressor->default_acceleration = LZ4_GPU_DEFAULT_ACCELERATION;
+        compressor->use_pinned_memory = LZ4_GPU_DEFAULT_PINNED;
 
     return compressor;
 }
@@ -140,6 +142,59 @@ const char* lz4_gpu_get_error_message(LZ4GPUCompressor* compressor) {
     size_t n = sizeof(LZ4_GPU_ERRORS)/sizeof(LZ4_GPU_ERRORS[0]);
     if ((int)code >= 0 && (size_t)code < n) return LZ4_GPU_ERRORS[code];
     return "Unknown LZ4 GPU error";
+}
+
+/* Helper to ensure persistent input buffer is large enough.
+ * Returns 1 on success, 0 on failure. Buffer is only reallocated if needed.
+ * Uses a growth factor to reduce frequency of reallocations. */
+static int ensure_input_buffer(LZ4GPUCompressor* compressor, size_t needed_size) {
+    if (compressor->input_buffer && compressor->input_buffer_capacity >= needed_size) {
+        return 1; /* Already large enough */
+    }
+    /* Release old buffer if exists */
+    if (compressor->input_buffer) {
+        clReleaseMemObject(compressor->input_buffer);
+        compressor->input_buffer = NULL;
+        compressor->input_buffer_capacity = 0;
+    }
+    /* Allocate with 20% headroom to reduce future reallocations */
+    size_t alloc_size = needed_size + needed_size / 5;
+    cl_int err;
+    compressor->input_buffer = clCreateBuffer(compressor->context, CL_MEM_READ_ONLY,
+                                              alloc_size, NULL, &err);
+    if (err != CL_SUCCESS) {
+        HDEBUG("DEBUG: Failed to allocate input buffer of %zu bytes (err=%d)\n", alloc_size, err);
+        return 0;
+    }
+    compressor->input_buffer_capacity = alloc_size;
+    HDEBUG("DEBUG: Allocated input buffer: %zu bytes (requested %zu)\n", alloc_size, needed_size);
+    return 1;
+}
+
+/* Helper to ensure persistent output buffer is large enough.
+ * Returns 1 on success, 0 on failure. Buffer is only reallocated if needed. */
+static int ensure_output_buffer(LZ4GPUCompressor* compressor, size_t needed_size) {
+    if (compressor->output_buffer && compressor->output_buffer_capacity >= needed_size) {
+        return 1; /* Already large enough */
+    }
+    /* Release old buffer if exists */
+    if (compressor->output_buffer) {
+        clReleaseMemObject(compressor->output_buffer);
+        compressor->output_buffer = NULL;
+        compressor->output_buffer_capacity = 0;
+    }
+    /* Allocate with 20% headroom to reduce future reallocations */
+    size_t alloc_size = needed_size + needed_size / 5;
+    cl_int err;
+    compressor->output_buffer = clCreateBuffer(compressor->context, CL_MEM_READ_WRITE,
+                                               alloc_size, NULL, &err);
+    if (err != CL_SUCCESS) {
+        HDEBUG("DEBUG: Failed to allocate output buffer of %zu bytes (err=%d)\n", alloc_size, err);
+        return 0;
+    }
+    compressor->output_buffer_capacity = alloc_size;
+    HDEBUG("DEBUG: Allocated output buffer: %zu bytes (requested %zu)\n", alloc_size, needed_size);
+    return 1;
 }
 
 static char* load_kernel_source(const char* filename, size_t* size) {
@@ -214,21 +269,21 @@ static int lz4_gpu_build_program_with_options(LZ4GPUCompressor* compressor) {
                                 if (kerr == CL_SUCCESS) clReleaseKernel(ktest);
                                 if (kerr == CL_SUCCESS) {
                                     HDEBUG("DEBUG: Precompiled binary validated successfully\n");
-                                    if (compressor->enable_profiling || compressor->enable_kernel_debug || compressor->prefer_precompiled) {
+                                    if (compressor->verbose || compressor->enable_kernel_debug) {
                                         fprintf(stderr, "NOTE: Using precompiled OpenCL binary '%s'\n", path);
                                     }
                                     free(bdata);
                                     // Proceed to create real kernels later below
                                     goto create_kernels;
                                 } else {
-                                    if (compressor->enable_profiling || compressor->enable_kernel_debug || compressor->prefer_precompiled) {
+                                    if (compressor->verbose || compressor->enable_kernel_debug) {
                                         fprintf(stderr, "NOTE: Precompiled binary '%s' missing required kernels; falling back to source build\n", path);
                                     }
                                     HDEBUG("DEBUG: Precompiled binary missing required kernels; falling back to source build\n");
                                     clReleaseProgram(compressor->program); compressor->program = NULL; err = CL_INVALID_PROGRAM;
                                 }
                             } else {
-                                if (compressor->enable_profiling || compressor->enable_kernel_debug || compressor->prefer_precompiled) {
+                                if (compressor->verbose || compressor->enable_kernel_debug) {
                                     fprintf(stderr, "NOTE: clBuildProgram on precompiled binary '%s' failed (%d); will fall back to source build\n", path, err);
                                 }
                                 HDEBUG("DEBUG: clBuildProgram on binary failed (%d); will fall back to source\n", err);
@@ -241,7 +296,7 @@ static int lz4_gpu_build_program_with_options(LZ4GPUCompressor* compressor) {
                 if (bdata) free(bdata);
                 fclose(bf);
             } else {
-                if (compressor->enable_profiling || compressor->enable_kernel_debug || compressor->prefer_precompiled) {
+                if (compressor->verbose || compressor->enable_kernel_debug) {
                     fprintf(stderr, "NOTE: Could not open precompiled binary at '%s' - will try building from source\n", path);
                 }
                 HDEBUG("DEBUG: Could not open precompiled binary at '%s'\n", path);
@@ -302,7 +357,7 @@ static int lz4_gpu_build_program_with_options(LZ4GPUCompressor* compressor) {
         return 0;
     }
     HDEBUG("DEBUG: Program built successfully\n");
-    if (compressor->enable_profiling || compressor->enable_kernel_debug || compressor->prefer_precompiled) {
+    if (compressor->verbose || compressor->enable_kernel_debug) {
         fprintf(stderr, "NOTE: Built OpenCL program from source successfully\n");
     }
 
@@ -325,7 +380,7 @@ static int lz4_gpu_build_program_with_options(LZ4GPUCompressor* compressor) {
                             size_t written = fwrite(binaries[0], 1, binSizes[0], fbin);
                             fclose(fbin);
                             HDEBUG("DEBUG: Exported OpenCL binary to '%s' (%zu bytes written)\n", fname, written);
-                            if (compressor->enable_profiling || compressor->enable_kernel_debug || compressor->prefer_precompiled) {
+                            if (compressor->verbose || compressor->enable_kernel_debug) {
                                 fprintf(stderr, "NOTE: Exported OpenCL program binary to '%s' (%zu bytes)\n", fname, written);
                             }
                             (void)written;
@@ -402,9 +457,8 @@ int lz4_gpu_initialize(LZ4GPUCompressor* compressor) {
     cl_ulong device_local_mem = 0;
     clGetDeviceInfo(compressor->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(cl_ulong), &device_local_mem, NULL);
     // Set a sane default dynamic block size (can be adjusted per-input).
-    // Tuned default: 32KB provides good throughput across a variety of inputs
-    // and seems to generalize well in parameter sweeps for typical GPU devices.
-    compressor->dynamic_block_size = 32 * 1024; /* 32KB default */
+    // Tuned default for our 5-metric composite ranking: 16KB
+    compressor->dynamic_block_size = LZ4_GPU_DEFAULT_BLOCK_SIZE; /* 16KB default */
     HDEBUG("DEBUG: Device compute units=%u, max_work_group_size=%zu, default_block_size=%zu\n",
            (unsigned int)compressor->device_compute_units, compressor->device_max_work_group_size, compressor->dynamic_block_size);
 
@@ -416,8 +470,11 @@ int lz4_gpu_initialize(LZ4GPUCompressor* compressor) {
     size_t default_decomp_local = 1;
     size_t local_table_bytes = ((size_t)1 << LZ4_GPU_HASH_LOG) * sizeof(cl_uint);
     if (device_local_mem >= (cl_ulong)local_table_bytes && compressor->device_max_work_group_size >= 16) {
-        /* we can support multi-thread per workgroup; pick a reasonable default tuned value */
-        if (compressor->device_max_work_group_size >= 256) default_comp_local = 256;
+        /* If the device can support our preferred default local size, pick it; otherwise
+           fallback to heuristic based on device max work_group size. */
+        if (compressor->device_max_work_group_size >= LZ4_GPU_DEFAULT_LOCAL_SIZE) {
+            default_comp_local = LZ4_GPU_DEFAULT_LOCAL_SIZE;
+        } else if (compressor->device_max_work_group_size >= 256) default_comp_local = 256;
         else if (compressor->device_max_work_group_size >= 128) default_comp_local = 128;
         else if (compressor->device_max_work_group_size >= 64) default_comp_local = 64;
         else default_comp_local = 1; /* conservative fallback */
@@ -615,72 +672,38 @@ static void split_into_blocks(LZ4GPUCompressor* compressor, const void* input, s
     *num_blocks = block_count;
 }
 
-// Compute a dynamic block size based on device capabilities and input size.
-// Goal: create at least a few blocks per compute unit to keep the GPU busy,
-// but keep block sizes between 16KB (optimal per benchmarks) and 4MB (frame spec max).
+// Compute dynamic block size based on input size and device capabilities.
+// Strategy: Default to 16KB (optimal per benchmarks). Only increase block size
+// if it creates too few blocks for effective GPU parallelism.
 static size_t compute_dynamic_block_size(LZ4GPUCompressor* compressor, size_t input_size) {
-    const size_t MIN_BLOCK = 32 * 1024; // 32KB tuned per parameter scan
-    const size_t MAX_BLOCK = LZ4_GPU_MAX_BLOCK_SIZE; // limit to 512KB for GPU-friendly pipeline
+    const size_t DEFAULT_BLOCK = LZ4_GPU_DEFAULT_BLOCK_SIZE; // 16KB - optimal per 5-metric ranking
+    const size_t MAX_BLOCK = LZ4_GPU_MAX_BLOCK_SIZE; // 512KB max
 
-    cl_uint cu = compressor->device_compute_units ? compressor->device_compute_units : 1;
-    // Aim for 4 blocks per compute unit to provide scheduling flexibility
-    size_t target_blocks = (size_t)cu * 4;
-    if (target_blocks == 0) target_blocks = 1;
-
-    size_t block_size = (input_size + target_blocks - 1) / target_blocks;
-
-    // Round up to multiple of MIN_BLOCK for alignment
-    if (block_size < MIN_BLOCK) block_size = MIN_BLOCK;
-    else {
-        block_size = ((block_size + MIN_BLOCK - 1) / MIN_BLOCK) * MIN_BLOCK;
+    // For small inputs, use default
+    if (input_size <= DEFAULT_BLOCK * 4) {
+        return DEFAULT_BLOCK;
     }
 
-    if (block_size > MAX_BLOCK) block_size = MAX_BLOCK;
+    // Calculate how many blocks 16KB would create
+    size_t blocks_at_default = (input_size + DEFAULT_BLOCK - 1) / DEFAULT_BLOCK;
 
-    return block_size;
-}
+    // Only increase block size if we have very few blocks (less than 16)
+    // This ensures good parallelism: even 1MB creates 64 blocks at 16KB
+    const size_t MIN_BLOCKS = 16;
+    if (blocks_at_default >= MIN_BLOCKS) {
+        return DEFAULT_BLOCK;
+    }
 
-// Compute a smaller dynamic block size when acceleration > 1.
-// Strategy: start from base size, then divide by min(acceleration, 8).
-// Keep alignment to LZ4_GPU_MIN_BLOCK_SIZE and within [MIN_BLOCK, MAX_BLOCK].
-static size_t compute_dynamic_block_size_accel(LZ4GPUCompressor* compressor, size_t input_size, int acceleration) {
-    // Start from base sizing tuned for device
-    size_t base = compute_dynamic_block_size(compressor, input_size);
-    if (acceleration <= 1) return base;
+    // For very small inputs creating <16 blocks, compute larger block size
+    size_t block_size = (input_size + MIN_BLOCKS - 1) / MIN_BLOCKS;
 
-    // Gentler downscale: at most 4x smaller, roughly log2-based steps
-    // acc=1 -> x1, acc>=4 -> x2, acc>=8 -> x3, acc>=16 -> x4
-    size_t scale;
-    if (acceleration >= 16) scale = 4;
-    else if (acceleration >= 8) scale = 3;
-    else if (acceleration >= 4) scale = 2;
-    else scale = 1;
-
-    size_t block_size = (scale > 1) ? (base / scale) : base;
-
-    // Compression path minimum block size: 16KB found optimal via parameter scan
-    const size_t MIN_BLOCK = 32 * 1024; // 32KB tuned per benchmark results
-    const size_t MAX_BLOCK = LZ4_GPU_MAX_BLOCK_SIZE; // cap to 512KB for GPU-friendly pipeline
-
-    if (block_size < MIN_BLOCK) block_size = MIN_BLOCK;
-    // round up to multiple of 4KB for alignment and predictable layout
+    // Round up to 4KB alignment
     const size_t ALIGN = 4 * 1024;
     block_size = ((block_size + ALIGN - 1) / ALIGN) * ALIGN;
-    if (block_size > MAX_BLOCK) block_size = MAX_BLOCK;
 
-    // Additionally, avoid creating an excessive number of blocks: cap by compute units
-    if (compressor && compressor->device_compute_units) {
-        size_t cu = compressor->device_compute_units;
-    size_t maxBlocks = cu * 4; // heuristic: up to 4 blocks per CU for higher throughput
-        size_t estBlocks = (input_size + block_size - 1) / block_size;
-        if (estBlocks > maxBlocks && maxBlocks > 0) {
-            block_size = (input_size + maxBlocks - 1) / maxBlocks;
-            // align again
-            block_size = ((block_size + ALIGN - 1) / ALIGN) * ALIGN;
-            if (block_size < MIN_BLOCK) block_size = MIN_BLOCK;
-            if (block_size > MAX_BLOCK) block_size = MAX_BLOCK;
-        }
-    }
+    // Clamp to valid range
+    if (block_size < DEFAULT_BLOCK) block_size = DEFAULT_BLOCK;
+    if (block_size > MAX_BLOCK) block_size = MAX_BLOCK;
 
     return block_size;
 }
@@ -717,7 +740,11 @@ int lz4_gpu_query_device_capabilities(LZ4GPUCompressor* compressor, cl_uint* out
     return 1;
 }
 
-size_t lz4_gpu_compress_frame(LZ4GPUCompressor* compressor, const void* input, size_t input_size, void* output, size_t output_capacity) { return lz4_gpu_compress_frame_accelerated(compressor, input, input_size, output, output_capacity, 1); }
+size_t lz4_gpu_compress_frame(LZ4GPUCompressor* compressor, const void* input, size_t input_size, void* output, size_t output_capacity) {
+    int accel = LZ4_GPU_DEFAULT_ACCELERATION;
+    if (compressor && compressor->default_acceleration > 0) accel = compressor->default_acceleration;
+    return lz4_gpu_compress_frame_accelerated(compressor, input, input_size, output, output_capacity, accel);
+}
 size_t lz4_gpu_compress_frame_accelerated(LZ4GPUCompressor* compressor,
                                     const void* input, size_t input_size,
                                     void* output, size_t output_capacity,
@@ -766,7 +793,7 @@ cl_int err;
 
 // Determine dynamic block size (smaller when acceleration > 1) and split input into blocks
 {
-    size_t computed_block = compute_dynamic_block_size_accel(compressor, input_size, acceleration);
+    size_t computed_block = compute_dynamic_block_size(compressor, input_size);
     /* If caller provided an explicit block size, honor it (clamp/align). */
     if (compressor->compress_block_size > 0) {
         size_t bs = compressor->compress_block_size;
@@ -797,13 +824,14 @@ if (!block_offsets) {
 
 HDEBUG("DEBUG: Split input into %zu blocks for parallel processing\n", num_blocks);
 
-// Create temporary buffers for parallel operation
+// Ensure persistent buffers are large enough (reused across calls)
 /* Allocation phase: start timing */
 t_alloc_start = clock();
-cl_mem input_buffer = clCreateBuffer(compressor->context, CL_MEM_READ_ONLY,
-                                    input_size, NULL, &err);
-if (err != CL_SUCCESS) {
-    lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create input buffer");
+
+/* Use persistent input buffer */
+if (!ensure_input_buffer(compressor, input_size)) {
+    free(block_offsets);
+    lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to ensure input buffer");
     return 0;
 }
 
@@ -820,7 +848,7 @@ if (!compressor->block_offsets_buffer || compressor->block_offsets_capacity < ne
     compressor->block_offsets_buffer = clCreateBuffer(compressor->context, CL_MEM_READ_ONLY,
                                                      needed_block_off_bytes, NULL, &err);
     if (err != CL_SUCCESS) {
-        clReleaseMemObject(input_buffer);
+        free(block_offsets);
         lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create block offsets buffer");
         return 0;
     }
@@ -834,7 +862,7 @@ if (!compressor->output_offsets_buffer || compressor->output_offsets_capacity < 
     compressor->output_offsets_buffer = clCreateBuffer(compressor->context, CL_MEM_READ_ONLY,
                                                        needed_out_off_bytes, NULL, &err);
     if (err != CL_SUCCESS) {
-        clReleaseMemObject(input_buffer);
+        free(block_offsets);
         lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create output offsets buffer");
         return 0;
     }
@@ -843,15 +871,14 @@ if (!compressor->output_offsets_buffer || compressor->output_offsets_capacity < 
 
 // Upload input data
 if (compressor->enable_profiling) {
-    err = clEnqueueWriteBuffer(compressor->queue, input_buffer, CL_FALSE, 0,
+    err = clEnqueueWriteBuffer(compressor->queue, compressor->input_buffer, CL_FALSE, 0,
                                input_size, input, 0, NULL, &upload_ev);
 } else {
-    err = clEnqueueWriteBuffer(compressor->queue, input_buffer, CL_TRUE, 0,
+    err = clEnqueueWriteBuffer(compressor->queue, compressor->input_buffer, CL_TRUE, 0,
                                input_size, input, 0, NULL, NULL);
 }
 if (err != CL_SUCCESS) {
     if (upload_ev) { clReleaseEvent(upload_ev); }
-    clReleaseMemObject(input_buffer);
     lz4_gpu_set_error(compressor, LZ4_GPU_UPLOAD_ERROR, "Failed to upload input data");
     return 0;
 }
@@ -867,17 +894,14 @@ HDEBUG("DEBUG: Required GPU buffer size: %zu bytes, output_capacity: %zu bytes\n
        required_gpu_buffer_size, output_capacity);
 
 if (required_gpu_buffer_size > output_capacity) {
-    clReleaseMemObject(input_buffer);
     lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_TOO_SMALL, "Output buffer too small for GPU processing");
     return 0;
 }
 
-// Create output buffer for compressed data
-cl_mem output_buffer = clCreateBuffer(compressor->context, CL_MEM_READ_WRITE,
-                                      output_capacity, NULL, &err);
-if (err != CL_SUCCESS) {
-    clReleaseMemObject(input_buffer);
-    lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create output buffer");
+/* Use persistent output buffer */
+if (!ensure_output_buffer(compressor, output_capacity)) {
+    free(block_offsets);
+    lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to ensure output buffer");
     return 0;
 }
 
@@ -892,8 +916,7 @@ if (compressor->enable_profiling) {
 if (err != CL_SUCCESS) {
     if (upload_ev) { clReleaseEvent(upload_ev); }
     if (offsets_ev) { clReleaseEvent(offsets_ev); }
-    clReleaseMemObject(input_buffer);
-    clReleaseMemObject(output_buffer);
+    free(block_offsets);
     lz4_gpu_set_error(compressor, LZ4_GPU_UPLOAD_ERROR, "Failed to upload block offsets");
     return 0;
 }
@@ -905,8 +928,7 @@ if (!compressor->compressed_sizes_buffer || compressor->compressed_sizes_capacit
     compressor->compressed_sizes_buffer = clCreateBuffer(compressor->context, CL_MEM_READ_WRITE,
                                                          needed_csizes_bytes, NULL, &err);
     if (err != CL_SUCCESS) {
-        clReleaseMemObject(input_buffer);
-        clReleaseMemObject(output_buffer);
+        free(block_offsets);
         lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create compressed sizes buffer");
         return 0;
     }
@@ -921,6 +943,7 @@ if (!output_offsets || !max_output_sizes) {
     lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to allocate output offsets buffer");
     if (output_offsets) free(output_offsets);
     if (max_output_sizes) free(max_output_sizes);
+    free(block_offsets);
     return 0;
 }
 
@@ -950,8 +973,6 @@ if (err != CL_SUCCESS) {
     if (upload_ev) { clReleaseEvent(upload_ev); }
     if (offsets_ev) { clReleaseEvent(offsets_ev); }
     if (outoffs_ev) { clReleaseEvent(outoffs_ev); }
-    clReleaseMemObject(input_buffer);
-    clReleaseMemObject(output_buffer);
     lz4_gpu_set_error(compressor, LZ4_GPU_UPLOAD_ERROR, "Failed to upload output offsets");
     return 0;
 }
@@ -970,8 +991,6 @@ if (err != CL_SUCCESS) {
             if (upload_ev) { clReleaseEvent(upload_ev); }
             if (offsets_ev) { clReleaseEvent(offsets_ev); }
             if (outoffs_ev) { clReleaseEvent(outoffs_ev); }
-            clReleaseMemObject(input_buffer);
-            clReleaseMemObject(output_buffer);
             free(output_offsets);
             free(max_output_sizes);
             lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create max_output_sizes buffer");
@@ -994,8 +1013,8 @@ if (err != CL_SUCCESS) {
         if (offsets_ev) { clReleaseEvent(offsets_ev); }
         if (outoffs_ev) { clReleaseEvent(outoffs_ev); }
         if (maxouts_ev) { clReleaseEvent(maxouts_ev); }
-        clReleaseMemObject(input_buffer);
-        clReleaseMemObject(output_buffer);
+
+
         free(output_offsets);
         free(max_output_sizes);
         lz4_gpu_set_error(compressor, LZ4_GPU_UPLOAD_ERROR, "Failed to upload max_output_sizes");
@@ -1014,8 +1033,8 @@ HDEBUG("DEBUG: Setting kernel args for accelerated compression: num_blocks=%u, i
 // Measure setup time for kernel args and enqueue
 t_setup_start = clock();
 // Kernel signature: lz4_compress_block_accelerated(input, output, blockSizes, blockOffsets, outputOffsets, totalBlocks, inputSize, tableType, acceleration)
-err = clSetKernelArg(compressor->compress_kernel, 0, sizeof(cl_mem), &input_buffer);              // input
-err |= clSetKernelArg(compressor->compress_kernel, 1, sizeof(cl_mem), &output_buffer);            // output
+err = clSetKernelArg(compressor->compress_kernel, 0, sizeof(cl_mem), &compressor->input_buffer);              // input
+err |= clSetKernelArg(compressor->compress_kernel, 1, sizeof(cl_mem), &compressor->output_buffer);            // output
 err |= clSetKernelArg(compressor->compress_kernel, 2, sizeof(cl_mem), &compressor->compressed_sizes_buffer);  // blockSizes
 err |= clSetKernelArg(compressor->compress_kernel, 3, sizeof(cl_mem), &compressor->block_offsets_buffer);      // blockOffsets
 err |= clSetKernelArg(compressor->compress_kernel, 4, sizeof(cl_mem), &compressor->output_offsets_buffer);     // outputOffsets
@@ -1045,8 +1064,6 @@ if (err != CL_SUCCESS) {
     if (offsets_ev) clReleaseEvent(offsets_ev);
     if (outoffs_ev) clReleaseEvent(outoffs_ev);
     if (maxouts_ev) clReleaseEvent(maxouts_ev);
-    clReleaseMemObject(input_buffer);
-    clReleaseMemObject(output_buffer);
     free(output_offsets);
     free(max_output_sizes);
     lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_ARGS_ERROR, "Failed to set accelerated kernel arguments");
@@ -1095,8 +1112,6 @@ if (err != CL_SUCCESS) {
     if (offsets_ev) clReleaseEvent(offsets_ev);
     if (outoffs_ev) clReleaseEvent(outoffs_ev);
     if (maxouts_ev) clReleaseEvent(maxouts_ev);
-    clReleaseMemObject(input_buffer);
-    clReleaseMemObject(output_buffer);
     free(output_offsets);
     free(max_output_sizes);
     lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_LAUNCH_ERROR, "Failed to launch accelerated compression kernel");
@@ -1121,8 +1136,6 @@ if (compressor->enable_profiling) {
         if (offsets_ev) clReleaseEvent(offsets_ev);
         if (outoffs_ev) clReleaseEvent(outoffs_ev);
         if (maxouts_ev) clReleaseEvent(maxouts_ev);
-        clReleaseMemObject(input_buffer);
-        clReleaseMemObject(output_buffer);
         free(output_offsets);
         free(max_output_sizes);
         lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_LAUNCH_ERROR, "Failed to wait for accelerated kernel completion");
@@ -1174,8 +1187,6 @@ if (err != CL_SUCCESS) {
     if (outoffs_ev) clReleaseEvent(outoffs_ev);
     if (maxouts_ev) clReleaseEvent(maxouts_ev);
     if (kernel_ev) clReleaseEvent(kernel_ev);
-    clReleaseMemObject(input_buffer);
-    clReleaseMemObject(output_buffer);
     free(output_offsets);
     free(max_output_sizes);
     lz4_gpu_set_error(compressor, LZ4_GPU_DOWNLOAD_ERROR, "Failed to download compressed sizes");
@@ -1203,8 +1214,6 @@ HDEBUG("DEBUG: Total compressed size calculation: header=%d, blocks=%d, content_
 
 if (total_compressed_size > output_capacity) {
     printf("DEBUG: Total compressed size %zu exceeds output capacity %zu\n", total_compressed_size, output_capacity);
-    clReleaseMemObject(input_buffer);
-    clReleaseMemObject(output_buffer);
     free(output_offsets);
     free(max_output_sizes);
     lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_TOO_SMALL, "Total compressed data too large for output buffer");
@@ -1216,7 +1225,7 @@ unsigned char* frame_output = (unsigned char*)output;
 size_t frame_pos = 0;
 
 /* Start measuring frame assembly time (exclude D2H block reads, which are measured separately)
- * We'll stop the timer around per-block reads to avoid double counting.
+ * We'll stop the timer around per-block reads to avoid double counting D2H time in frame_ms.
  */
 t_frame_start = clock();
 
@@ -1285,7 +1294,7 @@ HDEBUG("DEBUG: FLG=0x%02x, BD=0x%02x, HC=0x%02x\n", FLG, BD, HC);
             t_frame_end = clock(); frame_ms += (double)(t_frame_end - t_frame_start) / CLOCKS_PER_SEC * 1000.0;
             if (compressor->enable_profiling) {
                 cl_event read_block_ev = NULL;
-                err = clEnqueueReadBuffer(compressor->queue, output_buffer, CL_TRUE,
+                err = clEnqueueReadBuffer(compressor->queue, compressor->output_buffer, CL_TRUE,
                                          (size_t)output_offsets[i], csz, frame_output + frame_pos, 0,
                                          NULL, &read_block_ev);
                 if (read_block_ev) {
@@ -1302,7 +1311,7 @@ HDEBUG("DEBUG: FLG=0x%02x, BD=0x%02x, HC=0x%02x\n", FLG, BD, HC);
                 t_frame_start = clock();
             } else {
                 t_d2h_start = clock();
-                err = clEnqueueReadBuffer(compressor->queue, output_buffer, CL_TRUE,
+                err = clEnqueueReadBuffer(compressor->queue, compressor->output_buffer, CL_TRUE,
                                          (size_t)output_offsets[i], csz, frame_output + frame_pos, 0, NULL, NULL);
                 t_d2h_end = clock(); d2h_ms += (double)(t_d2h_end - t_d2h_start) / CLOCKS_PER_SEC * 1000.0;
                 /* Resume frame assembly timer */
@@ -1315,8 +1324,6 @@ HDEBUG("DEBUG: FLG=0x%02x, BD=0x%02x, HC=0x%02x\n", FLG, BD, HC);
                 if (outoffs_ev) clReleaseEvent(outoffs_ev);
                 if (maxouts_ev) clReleaseEvent(maxouts_ev);
                 if (kernel_ev) clReleaseEvent(kernel_ev);
-                clReleaseMemObject(input_buffer);
-                clReleaseMemObject(output_buffer);
                 free(output_offsets);
                 free(max_output_sizes);
                 lz4_gpu_set_error(compressor, LZ4_GPU_DOWNLOAD_ERROR, "Failed to download compressed block data");
@@ -1428,6 +1435,7 @@ HDEBUG("DEBUG: Final frame size: %zu bytes (acceleration=%d)\n", frame_pos, acce
         compressor->last_timing.map_ms = 0.0;
         compressor->last_timing.input_bytes = input_size;
         compressor->last_timing.output_bytes = frame_pos;
+        compressor->last_timing.block_size = compressor->dynamic_block_size;
         compressor->last_timing.num_blocks = (int)num_blocks;
     } else {
         /* Non-profiling path: fill last_timing from host-measured values */
@@ -1443,6 +1451,10 @@ HDEBUG("DEBUG: Final frame size: %zu bytes (acceleration=%d)\n", frame_pos, acce
         compressor->last_timing.d2h_ms = d2h_ms;
         compressor->last_timing.frame_ms = frame_ms;
         compressor->last_timing.map_ms = 0.0;
+        compressor->last_timing.input_bytes = input_size;
+        compressor->last_timing.output_bytes = frame_pos;
+        compressor->last_timing.block_size = compressor->dynamic_block_size;
+        compressor->last_timing.num_blocks = (int)num_blocks;
     }
 
     // Cleanup
@@ -1451,9 +1463,7 @@ HDEBUG("DEBUG: Final frame size: %zu bytes (acceleration=%d)\n", frame_pos, acce
     if (outoffs_ev) clReleaseEvent(outoffs_ev);
     if (maxouts_ev) clReleaseEvent(maxouts_ev);
     if (kernel_ev) clReleaseEvent(kernel_ev);
-    clReleaseMemObject(input_buffer);
-    clReleaseMemObject(output_buffer);
-    /* persistent device buffers are released when compressor is destroyed */
+    /* persistent device buffers (input_buffer, output_buffer) are released when compressor is destroyed */
 
 // Free dynamically allocated block offsets
 free(block_offsets);
@@ -1555,7 +1565,7 @@ size_t lz4_gpu_decompress_frame(LZ4GPUCompressor* compressor,
      * (e.g. if dynamic_block_size > actual block size used when compressing).
      *
      * Use a conservative minimum block size for parsing (4KB) to compute an
-     * upper bound for number of blocks. This avoids missing blocks while
+     * upper bound for the number of blocks. This avoids missing blocks while
      * keeping memory allocation reasonable.
      */
     const size_t parse_min_block = LZ4_GPU_MIN_BLOCK_SIZE; /* 4KB */
@@ -1730,26 +1740,28 @@ size_t lz4_gpu_decompress_frame(LZ4GPUCompressor* compressor,
     /* Profiling events */
     cl_event upload_ev = NULL, offsets_ev = NULL, sizes_ev = NULL, copy_ev = NULL;
 
-    // Create buffers for GPU processing
+    // Create/reuse buffers for GPU processing
     /* Allocation phase: start timing */
     t_alloc_start = clock();
-    cl_mem input_buffer = clCreateBuffer(compressor->context, CL_MEM_READ_ONLY,
-                                         input_size, NULL, &err);
-    if (err != CL_SUCCESS) { lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create input buffer"); return 0; }
+    if (!ensure_input_buffer(compressor, input_size)) {
+        lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create input buffer");
+        return 0;
+    }
 
-    cl_mem output_buffer = clCreateBuffer(compressor->context, CL_MEM_READ_WRITE,
-                                          output_capacity, NULL, &err);
-    if (err != CL_SUCCESS) { clReleaseMemObject(input_buffer); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create output buffer"); return 0; }
+    if (!ensure_output_buffer(compressor, output_capacity)) {
+        lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create output buffer");
+        return 0;
+    }
 
     // Upload input frame once
     if (compressor->enable_profiling) {
-        err = clEnqueueWriteBuffer(compressor->queue, input_buffer, CL_FALSE, 0, input_size, input, 0, NULL, &upload_ev);
+        err = clEnqueueWriteBuffer(compressor->queue, compressor->input_buffer, CL_FALSE, 0, input_size, input, 0, NULL, &upload_ev);
     } else {
         t_h2d_start = clock();
-        err = clEnqueueWriteBuffer(compressor->queue, input_buffer, CL_TRUE, 0, input_size, input, 0, NULL, NULL);
+        err = clEnqueueWriteBuffer(compressor->queue, compressor->input_buffer, CL_TRUE, 0, input_size, input, 0, NULL, NULL);
         t_h2d_end = clock(); h2d_ms += (double)(t_h2d_end - t_h2d_start) / CLOCKS_PER_SEC * 1000.0;
     }
-    if (err != CL_SUCCESS) { clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer); lz4_gpu_set_error(compressor, LZ4_GPU_UPLOAD_ERROR, "Failed to upload input data"); return 0; }
+    if (err != CL_SUCCESS) { lz4_gpu_set_error(compressor, LZ4_GPU_UPLOAD_ERROR, "Failed to upload input data"); return 0; }
 
     // Prepare arrays for compressed blocks
     size_t ncb = num_compressed_blocks;
@@ -1758,7 +1770,6 @@ size_t lz4_gpu_decompress_frame(LZ4GPUCompressor* compressor,
     cl_uint*  h_sizes_out    = (cl_uint*)malloc(ncb * sizeof(cl_uint));
     size_t*   h_comp_block_index = (size_t*)malloc(ncb * sizeof(size_t)); // map compressed idx -> global block idx
     if (!h_comp_offsets || !h_comp_sizes || !h_sizes_out || !h_comp_block_index) {
-        clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer);
         if (h_comp_offsets) free(h_comp_offsets);
         if (h_comp_sizes) free(h_comp_sizes);
         if (h_sizes_out) free(h_sizes_out);
@@ -1787,11 +1798,11 @@ size_t lz4_gpu_decompress_frame(LZ4GPUCompressor* compressor,
 
     // Device buffers for pass 1
     cl_mem d_comp_offsets = clCreateBuffer(compressor->context, CL_MEM_READ_ONLY, ncb * sizeof(cl_ulong), NULL, &err);
-    if (err != CL_SUCCESS) { clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create comp_offsets buffer"); return 0; }
+    if (err != CL_SUCCESS) { lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create comp_offsets buffer"); return 0; }
     cl_mem d_comp_sizes   = clCreateBuffer(compressor->context, CL_MEM_READ_ONLY, ncb * sizeof(cl_ulong), NULL, &err);
-    if (err != CL_SUCCESS) { clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer); clReleaseMemObject(d_comp_offsets); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create comp_sizes buffer"); return 0; }
+    if (err != CL_SUCCESS) { clReleaseMemObject(d_comp_offsets); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create comp_sizes buffer"); return 0; }
     cl_mem d_sizes_out    = clCreateBuffer(compressor->context, CL_MEM_READ_WRITE, ncb * sizeof(cl_uint), NULL, &err);
-    if (err != CL_SUCCESS) { clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create sizes_out buffer"); return 0; }
+    if (err != CL_SUCCESS) { clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create sizes_out buffer"); return 0; }
 
     /* Allocation phase: end timing */
     t_alloc_end = clock(); alloc_ms += (double)(t_alloc_end - t_alloc_start) / CLOCKS_PER_SEC * 1000.0;
@@ -1806,24 +1817,24 @@ size_t lz4_gpu_decompress_frame(LZ4GPUCompressor* compressor,
         err |= clEnqueueWriteBuffer(compressor->queue, d_comp_sizes,   CL_TRUE, 0, ncb * sizeof(cl_ulong), h_comp_sizes,   0, NULL, NULL);
         t_h2d_end = clock(); h2d_ms += (double)(t_h2d_end - t_h2d_start) / CLOCKS_PER_SEC * 1000.0;
     }
-    if (err != CL_SUCCESS) { clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_UPLOAD_ERROR, "Failed to upload comp arrays"); return 0; }
+    if (err != CL_SUCCESS) { clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_UPLOAD_ERROR, "Failed to upload comp arrays"); return 0; }
 
     // Create and run size-only kernel
     cl_event k_size_ev = NULL;
     cl_event read_sizes_ev = NULL;
     cl_kernel k_size = clCreateKernel(compressor->program, "lz4_decompress_blocks_sizeonly", &err);
-    if (err != CL_SUCCESS) { clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_ERROR, "Failed to create size-only kernel"); return 0; }
+    if (err != CL_SUCCESS) { clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_ERROR, "Failed to create size-only kernel"); return 0; }
 
     cl_uint ncb_u32 = (cl_uint)ncb;
     /* Measure setup time for size-only kernel args and enqueue */
     t_setup_start = clock();
-    err  = clSetKernelArg(k_size, 0, sizeof(cl_mem), &input_buffer);
+    err  = clSetKernelArg(k_size, 0, sizeof(cl_mem), &compressor->input_buffer);
     err |= clSetKernelArg(k_size, 1, sizeof(cl_mem), &d_comp_offsets);
     err |= clSetKernelArg(k_size, 2, sizeof(cl_mem), &d_comp_sizes);
     err |= clSetKernelArg(k_size, 3, sizeof(cl_ulong), &max_block_out_size);
     err |= clSetKernelArg(k_size, 4, sizeof(cl_mem), &d_sizes_out);
     err |= clSetKernelArg(k_size, 5, sizeof(cl_uint), &ncb_u32);
-    if (err != CL_SUCCESS) { clReleaseKernel(k_size); clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_ARGS_ERROR, "Failed to set size-only kernel args"); return 0; }
+    if (err != CL_SUCCESS) { clReleaseKernel(k_size); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_ARGS_ERROR, "Failed to set size-only kernel args"); return 0; }
 
     size_t gws = ncb;
     size_t lws = compressor->default_local;
@@ -1844,7 +1855,7 @@ size_t lz4_gpu_decompress_frame(LZ4GPUCompressor* compressor,
         }
     }
     t_setup_end = clock(); setup_ms += (double)(t_setup_end - t_setup_start) / CLOCKS_PER_SEC * 1000.0;
-    if (err != CL_SUCCESS) { clReleaseKernel(k_size); clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_LAUNCH_ERROR, "Failed to launch size-only kernel"); return 0; }
+    if (err != CL_SUCCESS) { clReleaseKernel(k_size); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_LAUNCH_ERROR, "Failed to launch size-only kernel"); return 0; }
 
     // Read back sizes
     if (compressor->enable_profiling && k_size_ev) {
@@ -1857,13 +1868,13 @@ size_t lz4_gpu_decompress_frame(LZ4GPUCompressor* compressor,
         t_kernel_host_end = clock();
         kernel_ms_host += (double)(t_kernel_host_end - t_kernel_host_start) / CLOCKS_PER_SEC * 1000.0;
     }
-    if (err != CL_SUCCESS) { clReleaseKernel(k_size); clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_DOWNLOAD_ERROR, "Failed to read sizes_out"); return 0; }
+    if (err != CL_SUCCESS) { clReleaseKernel(k_size); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_DOWNLOAD_ERROR, "Failed to read sizes_out"); return 0; }
 
     clReleaseKernel(k_size);
 
     // Compute prefix sum across all blocks to get output offsets
     size_t* h_output_offsets = (size_t*)malloc(num_blocks * sizeof(size_t));
-    if (!h_output_offsets) { clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to allocate output_offsets array"); return 0; }
+    if (!h_output_offsets) { clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to allocate output_offsets array"); return 0; }
 
     size_t stream_offset = 0; ci = 0;
     for (size_t i = 0; i < num_blocks; ++i) {
@@ -1876,8 +1887,7 @@ size_t lz4_gpu_decompress_frame(LZ4GPUCompressor* compressor,
                 fprintf(stderr, "DEBUG: size-only kernel reported error for global block %zu (comp_idx=%zu), comp_offset=%llu comp_size=%llu\n",
                         i, failed_ci,
                         (unsigned long long)h_comp_offsets[failed_ci], (unsigned long long)h_comp_sizes[failed_ci]);
-                clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out);
-                free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets);
+                clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out);
                 lz4_gpu_set_error(compressor, LZ4_GPU_DECOMPRESS_ERROR, "GPU reported decompression error in size-only pass");
                 return 0;
             }
@@ -1886,7 +1896,7 @@ size_t lz4_gpu_decompress_frame(LZ4GPUCompressor* compressor,
             bsize = blocks[i].compressed_size; // raw block
         }
         if (stream_offset + bsize > output_capacity) {
-            clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out);
+            clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out);
             free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets);
             lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_TOO_SMALL, "Output buffer too small for decompressed stream");
             return 0;
@@ -1898,7 +1908,7 @@ size_t lz4_gpu_decompress_frame(LZ4GPUCompressor* compressor,
     cl_ulong* h_out_offsets  = (cl_ulong*)malloc(ncb * sizeof(cl_ulong));
     cl_ulong* h_max_outsizes = (cl_ulong*)malloc(ncb * sizeof(cl_ulong));
     if (!h_out_offsets || !h_max_outsizes) {
-        clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out);
+        clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out);
         free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets);
         if (h_out_offsets) free(h_out_offsets);
         if (h_max_outsizes) free(h_max_outsizes);
@@ -1918,16 +1928,16 @@ size_t lz4_gpu_decompress_frame(LZ4GPUCompressor* compressor,
     // Pass 2: copy raw blocks device->device, and launch parallel decompression for compressed blocks
     // Device buffers for pass 2
     cl_mem d_out_offsets   = clCreateBuffer(compressor->context, CL_MEM_READ_ONLY,  ncb * sizeof(cl_ulong), NULL, &err);
-    if (err != CL_SUCCESS) { clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets); free(h_out_offsets); free(h_max_outsizes); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create out_offsets buffer"); return 0; }
+    if (err != CL_SUCCESS) { clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets); free(h_out_offsets); free(h_max_outsizes); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create out_offsets buffer"); return 0; }
     cl_mem d_max_outsizes  = clCreateBuffer(compressor->context, CL_MEM_READ_ONLY,  ncb * sizeof(cl_ulong), NULL, &err);
-    if (err != CL_SUCCESS) { clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); clReleaseMemObject(d_out_offsets); free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets); free(h_out_offsets); free(h_max_outsizes); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create max_outsizes buffer"); return 0; }
+    if (err != CL_SUCCESS) { clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); clReleaseMemObject(d_out_offsets); free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets); free(h_out_offsets); free(h_max_outsizes); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create max_outsizes buffer"); return 0; }
     cl_mem d_sizes_out2    = clCreateBuffer(compressor->context, CL_MEM_READ_WRITE, ncb * sizeof(cl_uint),  NULL, &err);
-    if (err != CL_SUCCESS) { clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); clReleaseMemObject(d_out_offsets); clReleaseMemObject(d_max_outsizes); free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets); free(h_out_offsets); free(h_max_outsizes); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create sizes_out2 buffer"); return 0; }
+    if (err != CL_SUCCESS) { clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); clReleaseMemObject(d_out_offsets); clReleaseMemObject(d_max_outsizes); free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets); free(h_out_offsets); free(h_max_outsizes); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create sizes_out2 buffer"); return 0; }
 
     // Upload per-block outputs
     err  = clEnqueueWriteBuffer(compressor->queue, d_out_offsets,  CL_TRUE, 0, ncb * sizeof(cl_ulong), h_out_offsets,  0, NULL, NULL);
     err |= clEnqueueWriteBuffer(compressor->queue, d_max_outsizes, CL_TRUE, 0, ncb * sizeof(cl_ulong), h_max_outsizes, 0, NULL, NULL);
-    if (err != CL_SUCCESS) { clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); clReleaseMemObject(d_out_offsets); clReleaseMemObject(d_max_outsizes); clReleaseMemObject(d_sizes_out2); free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets); free(h_out_offsets); free(h_max_outsizes); lz4_gpu_set_error(compressor, LZ4_GPU_UPLOAD_ERROR, "Failed to upload out arrays"); return 0; }
+    if (err != CL_SUCCESS) { clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); clReleaseMemObject(d_out_offsets); clReleaseMemObject(d_max_outsizes); clReleaseMemObject(d_sizes_out2); free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets); free(h_out_offsets); free(h_max_outsizes); lz4_gpu_set_error(compressor, LZ4_GPU_UPLOAD_ERROR, "Failed to upload out arrays"); return 0; }
 
     // Copy raw blocks device->device
     for (size_t i = 0; i < num_blocks; ++i) {
@@ -1936,9 +1946,9 @@ size_t lz4_gpu_decompress_frame(LZ4GPUCompressor* compressor,
             size_t src_off = blocks[i].compressed_offset;
             size_t dst_off = h_output_offsets[i];
             if (sz) {
-                err = clEnqueueCopyBuffer(compressor->queue, input_buffer, output_buffer, src_off, dst_off, sz, 0, NULL, NULL);
+                err = clEnqueueCopyBuffer(compressor->queue, compressor->input_buffer, compressor->output_buffer, src_off, dst_off, sz, 0, NULL, NULL);
                 if (err != CL_SUCCESS) {
-                    clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer);
+
                     clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out);
                     clReleaseMemObject(d_out_offsets); clReleaseMemObject(d_max_outsizes); clReleaseMemObject(d_sizes_out2);
                     free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets); free(h_out_offsets); free(h_max_outsizes);
@@ -1953,19 +1963,19 @@ size_t lz4_gpu_decompress_frame(LZ4GPUCompressor* compressor,
     cl_event k_multi_ev = NULL;
     cl_event read_stream_ev = NULL;
     cl_kernel k_multi = clCreateKernel(compressor->program, "lz4_decompress_blocks", &err);
-    if (err != CL_SUCCESS) { clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); clReleaseMemObject(d_out_offsets); clReleaseMemObject(d_max_outsizes); clReleaseMemObject(d_sizes_out2); free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets); free(h_out_offsets); free(h_max_outsizes); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_ERROR, "Failed to create multi-block kernel"); return 0; }
+    if (err != CL_SUCCESS) { clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); clReleaseMemObject(d_out_offsets); clReleaseMemObject(d_max_outsizes); clReleaseMemObject(d_sizes_out2); free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets); free(h_out_offsets); free(h_max_outsizes); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_ERROR, "Failed to create multi-block kernel"); return 0; }
 
     /* Measure setup time for multi-block kernel args and enqueue */
     t_setup_start = clock();
-    err  = clSetKernelArg(k_multi, 0, sizeof(cl_mem), &input_buffer);
-    err |= clSetKernelArg(k_multi, 1, sizeof(cl_mem), &output_buffer);
+    err  = clSetKernelArg(k_multi, 0, sizeof(cl_mem), &compressor->input_buffer);
+    err |= clSetKernelArg(k_multi, 1, sizeof(cl_mem), &compressor->output_buffer);
     err |= clSetKernelArg(k_multi, 2, sizeof(cl_mem), &d_comp_offsets);
     err |= clSetKernelArg(k_multi, 3, sizeof(cl_mem), &d_comp_sizes);
     err |= clSetKernelArg(k_multi, 4, sizeof(cl_mem), &d_out_offsets);
     err |= clSetKernelArg(k_multi, 5, sizeof(cl_mem), &d_max_outsizes);
     err |= clSetKernelArg(k_multi, 6, sizeof(cl_mem), &d_sizes_out2);
     err |= clSetKernelArg(k_multi, 7, sizeof(cl_uint), &ncb_u32);
-    if (err != CL_SUCCESS) { clReleaseKernel(k_multi); clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); clReleaseMemObject(d_out_offsets); clReleaseMemObject(d_max_outsizes); clReleaseMemObject(d_sizes_out2); free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets); free(h_out_offsets); free(h_max_outsizes); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_ARGS_ERROR, "Failed to set multi-block kernel args"); return 0; }
+    if (err != CL_SUCCESS) { clReleaseKernel(k_multi); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); clReleaseMemObject(d_out_offsets); clReleaseMemObject(d_max_outsizes); clReleaseMemObject(d_sizes_out2); free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets); free(h_out_offsets); free(h_max_outsizes); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_ARGS_ERROR, "Failed to set multi-block kernel args"); return 0; }
 
     gws = ncb;
     lws = compressor->default_local;
@@ -1986,7 +1996,7 @@ size_t lz4_gpu_decompress_frame(LZ4GPUCompressor* compressor,
         }
     }
     t_setup_end = clock(); setup_ms += (double)(t_setup_end - t_setup_start) / CLOCKS_PER_SEC * 1000.0;
-    if (err != CL_SUCCESS) { clReleaseKernel(k_multi); clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); clReleaseMemObject(d_out_offsets); clReleaseMemObject(d_max_outsizes); clReleaseMemObject(d_sizes_out2); free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets); free(h_out_offsets); free(h_max_outsizes); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_LAUNCH_ERROR, "Failed to launch multi-block kernel"); return 0; }
+    if (err != CL_SUCCESS) { clReleaseKernel(k_multi); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); clReleaseMemObject(d_out_offsets); clReleaseMemObject(d_max_outsizes); clReleaseMemObject(d_sizes_out2); free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets); free(h_out_offsets); free(h_max_outsizes); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_LAUNCH_ERROR, "Failed to launch multi-block kernel"); return 0; }
 
     // Wait for completion
     if (compressor->enable_profiling) {
@@ -1997,21 +2007,21 @@ size_t lz4_gpu_decompress_frame(LZ4GPUCompressor* compressor,
         t_kernel_host_end = clock();
         kernel_ms_host += (double)(t_kernel_host_end - t_kernel_host_start) / CLOCKS_PER_SEC * 1000.0;
     }
-    if (err != CL_SUCCESS) { clReleaseKernel(k_multi); clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); clReleaseMemObject(d_out_offsets); clReleaseMemObject(d_max_outsizes); clReleaseMemObject(d_sizes_out2); free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets); free(h_out_offsets); free(h_max_outsizes); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_LAUNCH_ERROR, "Failed to wait for multi-block completion"); return 0; }
+    if (err != CL_SUCCESS) { clReleaseKernel(k_multi); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); clReleaseMemObject(d_out_offsets); clReleaseMemObject(d_max_outsizes); clReleaseMemObject(d_sizes_out2); free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets); free(h_out_offsets); free(h_max_outsizes); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_LAUNCH_ERROR, "Failed to wait for multi-block completion"); return 0; }
 
     clReleaseKernel(k_multi);
 
     // Bulk download the entire decompressed stream
     if (stream_offset > 0) {
         if (compressor->enable_profiling) {
-            err = clEnqueueReadBuffer(compressor->queue, output_buffer, CL_TRUE, 0, stream_offset, (unsigned char*)output, 0, NULL, &read_stream_ev);
+            err = clEnqueueReadBuffer(compressor->queue, compressor->output_buffer, CL_TRUE, 0, stream_offset, (unsigned char*)output, 0, NULL, &read_stream_ev);
         } else {
             t_d2h_start = clock();
-            err = clEnqueueReadBuffer(compressor->queue, output_buffer, CL_TRUE, 0, stream_offset, (unsigned char*)output, 0, NULL, NULL);
+            err = clEnqueueReadBuffer(compressor->queue, compressor->output_buffer, CL_TRUE, 0, stream_offset, (unsigned char*)output, 0, NULL, NULL);
             t_d2h_end = clock(); d2h_ms += (double)(t_d2h_end - t_d2h_start) / CLOCKS_PER_SEC * 1000.0;
         }
         if (err != CL_SUCCESS) {
-            clReleaseMemObject(input_buffer); clReleaseMemObject(output_buffer);
+
             clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out);
             clReleaseMemObject(d_out_offsets); clReleaseMemObject(d_max_outsizes); clReleaseMemObject(d_sizes_out2);
             free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets); free(h_out_offsets); free(h_max_outsizes);
@@ -2021,8 +2031,8 @@ size_t lz4_gpu_decompress_frame(LZ4GPUCompressor* compressor,
     }
 
     // Cleanup
-    clReleaseMemObject(input_buffer);
-    clReleaseMemObject(output_buffer);
+
+
     clReleaseMemObject(d_comp_offsets);
     clReleaseMemObject(d_comp_sizes);
     clReleaseMemObject(d_sizes_out);
@@ -2242,29 +2252,33 @@ size_t lz4_gpu_estimate_decompressed_size(LZ4GPUCompressor* compressor,
 
     // Run size-only kernel to compute per-compressed-block decompressed sizes
     cl_int err;
-    cl_mem input_buffer = clCreateBuffer(compressor->context, CL_MEM_READ_ONLY, input_size, NULL, &err);
-    if (err != CL_SUCCESS) { lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create input buffer"); goto fail; }
+
+    // Use persistent input buffer
+    if (!ensure_input_buffer(compressor, input_size)) {
+        lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create input buffer");
+        goto fail;
+    }
 
     // Upload input
-    err = clEnqueueWriteBuffer(compressor->queue, input_buffer, CL_TRUE, 0, input_size, input, 0, NULL, NULL);
-    if (err != CL_SUCCESS) { clReleaseMemObject(input_buffer); lz4_gpu_set_error(compressor, LZ4_GPU_UPLOAD_ERROR, "Failed to upload input data"); goto fail; }
+    err = clEnqueueWriteBuffer(compressor->queue, compressor->input_buffer, CL_TRUE, 0, input_size, input, 0, NULL, NULL);
+    if (err != CL_SUCCESS) { lz4_gpu_set_error(compressor, LZ4_GPU_UPLOAD_ERROR, "Failed to upload input data"); goto fail; }
 
     size_t ncb = num_compressed_blocks;
     cl_mem d_comp_offsets = clCreateBuffer(compressor->context, CL_MEM_READ_ONLY, ncb * sizeof(cl_ulong), NULL, &err);
-    if (err != CL_SUCCESS) { clReleaseMemObject(input_buffer); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create comp_offsets buffer"); goto fail; }
+    if (err != CL_SUCCESS) { lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create comp_offsets buffer"); goto fail; }
     cl_mem d_comp_sizes   = clCreateBuffer(compressor->context, CL_MEM_READ_ONLY, ncb * sizeof(cl_ulong), NULL, &err);
-    if (err != CL_SUCCESS) { clReleaseMemObject(input_buffer); clReleaseMemObject(d_comp_offsets); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create comp_sizes buffer"); goto fail; }
+    if (err != CL_SUCCESS) { clReleaseMemObject(d_comp_offsets); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create comp_sizes buffer"); goto fail; }
     cl_mem d_sizes_out    = clCreateBuffer(compressor->context, CL_MEM_READ_WRITE, ncb * sizeof(cl_uint), NULL, &err);
-    if (err != CL_SUCCESS) { clReleaseMemObject(input_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create sizes_out buffer"); goto fail; }
+    if (err != CL_SUCCESS) { clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create sizes_out buffer"); goto fail; }
 
     // Upload comp arrays
     err = clEnqueueWriteBuffer(compressor->queue, d_comp_offsets, CL_TRUE, 0, ncb * sizeof(cl_ulong), h_comp_offsets, 0, NULL, NULL);
     err |= clEnqueueWriteBuffer(compressor->queue, d_comp_sizes,   CL_TRUE, 0, ncb * sizeof(cl_ulong), h_comp_sizes,   0, NULL, NULL);
-    if (err != CL_SUCCESS) { clReleaseMemObject(input_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_UPLOAD_ERROR, "Failed to upload comp arrays"); goto fail; }
+    if (err != CL_SUCCESS) { clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_UPLOAD_ERROR, "Failed to upload comp arrays"); goto fail; }
 
     // Create size-only kernel
     cl_kernel k_size = clCreateKernel(compressor->program, "lz4_decompress_blocks_sizeonly", &err);
-    if (err != CL_SUCCESS) { clReleaseMemObject(input_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_ERROR, "Failed to create size-only kernel"); goto fail; }
+    if (err != CL_SUCCESS) { clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_ERROR, "Failed to create size-only kernel"); goto fail; }
 
     // Determine max_block_out_size from BD
     unsigned char blockSizeID = (BD >> 4) & 0x07;
@@ -2274,13 +2288,13 @@ size_t lz4_gpu_estimate_decompressed_size(LZ4GPUCompressor* compressor,
     else if (blockSizeID == 7) max_block_out_size = 4ULL * 1024ULL * 1024ULL;
 
     cl_uint ncb_u32 = (cl_uint)ncb;
-    err  = clSetKernelArg(k_size, 0, sizeof(cl_mem), &input_buffer);
+    err  = clSetKernelArg(k_size, 0, sizeof(cl_mem), &compressor->input_buffer);
     err |= clSetKernelArg(k_size, 1, sizeof(cl_mem), &d_comp_offsets);
     err |= clSetKernelArg(k_size, 2, sizeof(cl_mem), &d_comp_sizes);
     err |= clSetKernelArg(k_size, 3, sizeof(cl_ulong), &max_block_out_size);
     err |= clSetKernelArg(k_size, 4, sizeof(cl_mem), &d_sizes_out);
     err |= clSetKernelArg(k_size, 5, sizeof(cl_uint), &ncb_u32);
-    if (err != CL_SUCCESS) { clReleaseKernel(k_size); clReleaseMemObject(input_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_ARGS_ERROR, "Failed to set size-only kernel args"); goto fail; }
+    if (err != CL_SUCCESS) { clReleaseKernel(k_size); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_ARGS_ERROR, "Failed to set size-only kernel args"); goto fail; }
 
     size_t gws = ncb;
     size_t lws = compressor->default_local;
@@ -2290,13 +2304,13 @@ size_t lz4_gpu_estimate_decompressed_size(LZ4GPUCompressor* compressor,
     size_t gws_rounded = gws;
     if (lws > 0 && (gws % lws) != 0) gws_rounded = ((gws + lws - 1) / lws) * lws;
     err = clEnqueueNDRangeKernel(compressor->queue, k_size, 1, NULL, &gws_rounded, &lws, 0, NULL, NULL);
-    if (err != CL_SUCCESS) { clReleaseKernel(k_size); clReleaseMemObject(input_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_LAUNCH_ERROR, "Failed to launch size-only kernel"); goto fail; }
+    if (err != CL_SUCCESS) { clReleaseKernel(k_size); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_LAUNCH_ERROR, "Failed to launch size-only kernel"); goto fail; }
 
     // Read back sizes
     cl_uint* h_sizes_out = (cl_uint*)malloc(ncb * sizeof(cl_uint));
-    if (!h_sizes_out) { clReleaseKernel(k_size); clReleaseMemObject(input_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to allocate sizes array"); goto fail; }
+    if (!h_sizes_out) { clReleaseKernel(k_size); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to allocate sizes array"); goto fail; }
     err = clEnqueueReadBuffer(compressor->queue, d_sizes_out, CL_TRUE, 0, ncb * sizeof(cl_uint), h_sizes_out, 0, NULL, NULL);
-    if (err != CL_SUCCESS) { free(h_sizes_out); clReleaseKernel(k_size); clReleaseMemObject(input_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_DOWNLOAD_ERROR, "Failed to read sizes_out"); goto fail; }
+    if (err != CL_SUCCESS) { free(h_sizes_out); clReleaseKernel(k_size); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_DOWNLOAD_ERROR, "Failed to read sizes_out"); goto fail; }
 
     clReleaseKernel(k_size);
 
@@ -2320,7 +2334,7 @@ size_t lz4_gpu_estimate_decompressed_size(LZ4GPUCompressor* compressor,
                         i, failed_ci,
                         (unsigned long long)h_comp_offsets[failed_ci], (unsigned long long)h_comp_sizes[failed_ci]);
                 free(h_sizes_out);
-                clReleaseMemObject(input_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out);
+                clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out);
                 lz4_gpu_set_error(compressor, LZ4_GPU_DECOMPRESS_ERROR, "GPU reported decompression error in size-only pass"); goto fail;
             }
             bsize = (size_t)s;
@@ -2333,7 +2347,7 @@ size_t lz4_gpu_estimate_decompressed_size(LZ4GPUCompressor* compressor,
     }
 
     free(h_sizes_out);
-    clReleaseMemObject(input_buffer); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out);
+    clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out);
     if (h_comp_offsets) free(h_comp_offsets);
     if (h_comp_sizes) free(h_comp_sizes);
     return stream_offset;
@@ -2370,9 +2384,8 @@ size_t lz4_gpu_decompress_block(LZ4GPUCompressor* compressor,
         return 0;
     }
 
-    cl_mem output_buffer = clCreateBuffer(compressor->context, CL_MEM_WRITE_ONLY,
-                                         max_output_size, NULL, &err);
-    if (err != CL_SUCCESS) {
+    // Use persistent output buffer
+    if (!ensure_output_buffer(compressor, max_output_size)) {
         clReleaseMemObject(compressed_block_buffer);
         lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create output buffer");
         return 0;
@@ -2382,7 +2395,7 @@ size_t lz4_gpu_decompress_block(LZ4GPUCompressor* compressor,
                                                sizeof(cl_uint), NULL, &err);
     if (err != CL_SUCCESS) {
         clReleaseMemObject(compressed_block_buffer);
-        clReleaseMemObject(output_buffer);
+
         lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create output size buffer");
         return 0;
     }
@@ -2392,7 +2405,7 @@ size_t lz4_gpu_decompress_block(LZ4GPUCompressor* compressor,
                                compressed_size, compressed_block, 0, NULL, NULL);
     if (err != CL_SUCCESS) {
         clReleaseMemObject(compressed_block_buffer);
-        clReleaseMemObject(output_buffer);
+
         clReleaseMemObject(output_sizes_buffer);
         lz4_gpu_set_error(compressor, LZ4_GPU_UPLOAD_ERROR, "Failed to upload compressed block");
         return 0;
@@ -2410,7 +2423,7 @@ size_t lz4_gpu_decompress_block(LZ4GPUCompressor* compressor,
     //      unsigned long output_offset, unsigned long max_output_size,
     //      __global uint* output_sizes, uint block_index)
     err = clSetKernelArg(compressor->decompress_kernel, 0, sizeof(cl_mem), &compressed_block_buffer);  // input
-    err |= clSetKernelArg(compressor->decompress_kernel, 1, sizeof(cl_mem), &output_buffer);            // output
+    err |= clSetKernelArg(compressor->decompress_kernel, 1, sizeof(cl_mem), &compressor->output_buffer);            // output
     err |= clSetKernelArg(compressor->decompress_kernel, 2, sizeof(cl_ulong), &compressed_offset_u64);  // compressed_offset
     err |= clSetKernelArg(compressor->decompress_kernel, 3, sizeof(cl_ulong), &compressed_size_u64);    // compressed_size
     err |= clSetKernelArg(compressor->decompress_kernel, 4, sizeof(cl_ulong), &output_offset_u64);      // output_offset
@@ -2420,7 +2433,7 @@ size_t lz4_gpu_decompress_block(LZ4GPUCompressor* compressor,
 
     if (err != CL_SUCCESS) {
         clReleaseMemObject(compressed_block_buffer);
-        clReleaseMemObject(output_buffer);
+
         clReleaseMemObject(output_sizes_buffer);
         lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_ARGS_ERROR, "Failed to set kernel arguments");
         return 0;
@@ -2438,7 +2451,7 @@ size_t lz4_gpu_decompress_block(LZ4GPUCompressor* compressor,
                                  &global_rounded, &local, 0, NULL, NULL);
     if (err != CL_SUCCESS) {
         clReleaseMemObject(compressed_block_buffer);
-        clReleaseMemObject(output_buffer);
+
         clReleaseMemObject(output_sizes_buffer);
         lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_LAUNCH_ERROR, "Failed to launch decompression kernel");
         return 0;
@@ -2450,7 +2463,7 @@ size_t lz4_gpu_decompress_block(LZ4GPUCompressor* compressor,
                                sizeof(cl_uint), &actual_output_size, 0, NULL, NULL);
     if (err != CL_SUCCESS) {
         clReleaseMemObject(compressed_block_buffer);
-        clReleaseMemObject(output_buffer);
+
         clReleaseMemObject(output_sizes_buffer);
         lz4_gpu_set_error(compressor, LZ4_GPU_DOWNLOAD_ERROR, "Failed to download output size");
         return 0;
@@ -2458,7 +2471,7 @@ size_t lz4_gpu_decompress_block(LZ4GPUCompressor* compressor,
 
     // Download decompressed data
     if (actual_output_size <= max_output_size) {
-        err = clEnqueueReadBuffer(compressor->queue, output_buffer, CL_TRUE, 0,
+        err = clEnqueueReadBuffer(compressor->queue, compressor->output_buffer, CL_TRUE, 0,
                                    actual_output_size, output, 0, NULL, NULL);
         if (err != CL_SUCCESS) {
             actual_output_size = 0;
@@ -2471,7 +2484,7 @@ size_t lz4_gpu_decompress_block(LZ4GPUCompressor* compressor,
 
     // Cleanup
     clReleaseMemObject(compressed_block_buffer);
-    clReleaseMemObject(output_buffer);
+
     clReleaseMemObject(output_sizes_buffer);
 
     return actual_output_size;

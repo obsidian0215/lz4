@@ -71,7 +71,7 @@ OpenCL-based LZ4 frame compression implementation optimized for GPU acceleration
 - **Automatic block size optimization** (up to 4MB blocks)
 - **Pure C implementation** - no C++ dependencies
 - **Independent optimal defaults for compression and decompression**
-    - Compression: local=256, block=32KB
+    - Compression: local=256, block=16KB
     - Decompression: local=1, block=32KB
     - Can be overridden via API
 
@@ -180,6 +180,16 @@ gcc -std=c99 -o lz4_gpu_compress lz4_gpu_example.c lz4_gpu_host.c -lOpenCL
 # The output file will be in standard LZ4 frame format
 # Can be decompressed with standard LZ4 tools: lz4 -d compressed_output.lz4
 ```
+
+## Daemon Mode
+
+You can run the compressor as a persistent daemon to avoid repeated OpenCL initialization and improve throughput for many small requests.
+
+- Start daemon: `lz4_gpu --daemon` (defaults to `/tmp/lz4_gpu_daemon.sock` socket path)
+- Use the daemon client: `lz4_gpu --use-daemon <input>` to send the request to the daemon. If the daemon is not running, the CLI falls back to local processing.
+- Customize daemon socket path with `--daemon-socket PATH` or env var `LZ4_GPU_DAEMON_SOCKET`.
+- Enable pinned host memory for the daemon by default using `--daemon-pinned`.
+
 
 ## Performance Characteristics
 
