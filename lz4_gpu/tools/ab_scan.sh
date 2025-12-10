@@ -6,6 +6,20 @@ set -euo pipefail
 # Usage: ./ab_scan.sh [OUTDIR] [CLBIN]
 # Example: ./ab_scan.sh /root/lz4/lz4_gpu/ab_results /root/lz4/lz4_gpu/lz4_gpu.clbin
 
+# Take optional CLI flags (supporting --profile / --no-profile) and remove them from args
+PROFILE=${PROFILE:-0}
+NEWARGS=()
+for a in "$@"; do
+  case "$a" in
+    --profile)
+      PROFILE=1; ;;
+    --no-profile)
+      PROFILE=0; ;;
+    *) NEWARGS+=("$a"); ;;
+  esac
+done
+set -- "${NEWARGS[@]}"
+
 OUTDIR=${1:-/root/lz4/lz4_gpu/ab_results}
 # Optional 2nd argument remains as a convenience for specifying a clbin path that will
 # be injected into the launched lz4_gpu processes via the environment variable
@@ -18,6 +32,7 @@ ACCELS_OVERRIDE=${ACCELS_OVERRIDE:-}
 BLOCKS_OVERRIDE=${BLOCKS_OVERRIDE:-}
 LOCAL_SIZES_OVERRIDE=${LOCAL_SIZES_OVERRIDE:-}
 PINNED_OPTIONS_OVERRIDE=${PINNED_OPTIONS_OVERRIDE:-}
+IO_OVERLAP_OPTIONS_OVERRIDE=${IO_OVERLAP_OPTIONS_OVERRIDE:-}
 SAMPLES_OVERRIDE=${SAMPLES_OVERRIDE:-}
 # Daemon mode support: if DAEMON_MODE=1, start daemon server and use --use-daemon flag
 DAEMON_MODE=${DAEMON_MODE:-0}
@@ -115,7 +130,7 @@ RESULT_CSV="$OUTDIR/results.csv"
   fi
 
   if [ ! -f "$RESULT_CSV" ]; then
-  echo "sample,input_bytes,accel,block_size,local,pinned,mode,run,compressed_bytes,comp_total_ms,comp_kernel_ms,comp_h2d_ms,comp_d2h_ms,dec_total_ms,dec_kernel_ms,dec_h2d_ms,dec_d2h_ms,compression_ratio,lz4_valid_frame,ok,logfile" > "$RESULT_CSV"
+  echo "sample,input_bytes,accel,block_size,local,pinned,io_overlap,mode,run,compressed_bytes,comp_total_ms,comp_kernel_ms,comp_h2d_ms,comp_d2h_ms,dec_total_ms,dec_kernel_ms,dec_h2d_ms,dec_d2h_ms,compression_ratio,lz4_valid_frame,ok,logfile,comp_alloc_ms,comp_event_profile_ms,comp_frame_ms,dec_alloc_ms,dec_event_profile_ms,dec_frame_ms" > "$RESULT_CSV"
 fi
 
   # Files for monitor/restart and debug tracing
@@ -134,7 +149,7 @@ fi
   } > "$AB_SCAN_CMD_FILE"
   # Record interesting env vars (shell-safe, quoted values)
   {
-    for v in FORCE_RUNS REPS ACCELS_OVERRIDE BLOCKS_OVERRIDE LOCAL_SIZES_OVERRIDE PINNED_OPTIONS_OVERRIDE MODES_OVERRIDE DAEMON_MODE LZ4_GPU_CLBIN LZ4_GPU_BIN CLSRC CREATE_DIRS KEEP_SUCCESS_LOGS; do
+    for v in FORCE_RUNS REPS ACCELS_OVERRIDE BLOCKS_OVERRIDE LOCAL_SIZES_OVERRIDE PINNED_OPTIONS_OVERRIDE IO_OVERLAP_OPTIONS_OVERRIDE MODES_OVERRIDE DAEMON_MODE LZ4_GPU_CLBIN LZ4_GPU_BIN CLSRC CREATE_DIRS KEEP_SUCCESS_LOGS PROFILE; do
       val=${!v:-}
       if [ -n "$val" ]; then
         esc=${val//\"/\\\"}
@@ -180,12 +195,14 @@ ACCELS=(1 2 3 4 5 6 7 8 9 10 11 12)
 BLOCKS=(16k 32k 64k 128k 256k 512k)
 LOCAL_SIZES=(1 2 4 8 16 32 64 128 256)
 PINNED_OPTIONS=("--pinned" "--no-pinned")
+IO_OVERLAP_OPTIONS=("--io-overlap" "--no-io-overlap")
 
 # apply overrides if present (comma-separated or space-separated values)
 if [ -n "$ACCELS_OVERRIDE" ]; then parse_list_to_array ACCELS "$ACCELS_OVERRIDE"; fi
 if [ -n "$BLOCKS_OVERRIDE" ]; then parse_list_to_array BLOCKS "$BLOCKS_OVERRIDE"; fi
 if [ -n "$LOCAL_SIZES_OVERRIDE" ]; then parse_list_to_array LOCAL_SIZES "$LOCAL_SIZES_OVERRIDE"; fi
 if [ -n "$PINNED_OPTIONS_OVERRIDE" ]; then parse_list_to_array PINNED_OPTIONS "$PINNED_OPTIONS_OVERRIDE"; fi
+if [ -n "$IO_OVERLAP_OPTIONS_OVERRIDE" ]; then parse_list_to_array IO_OVERLAP_OPTIONS "$IO_OVERLAP_OPTIONS_OVERRIDE"; fi
 
 BIN_DIR="$(pwd)"
 # Respect externally-set LZ4_GPU_BIN environment variable; default to repo-local lz4_gpu
@@ -215,9 +232,11 @@ SAMPLES_N=${#SAMPLES[@]}
 ACCELS_N=${#ACCELS[@]}
 BLOCKS_N=${#BLOCKS[@]}
 LOCAL_SIZES_N=${#LOCAL_SIZES[@]}
+# Number of pinned / io-overlap variants
 PINNED_N=${#PINNED_OPTIONS[@]}
+IO_OVERLAP_N=${#IO_OVERLAP_OPTIONS[@]}
 # each run uses both compress local and decompress local
-COMBINATIONS=$((SAMPLES_N * ACCELS_N * BLOCKS_N * LOCAL_SIZES_N * PINNED_N * REPS))
+COMBINATIONS=$((SAMPLES_N * ACCELS_N * BLOCKS_N * LOCAL_SIZES_N * PINNED_N * IO_OVERLAP_N * REPS))
 MAX_SAFE_RUNS=5000
 if [ $COMBINATIONS -gt $MAX_SAFE_RUNS ] && [ "$FORCE_RUNS" != "1" ]; then
   echo "WARNING: Computed $COMBINATIONS combinations (>$MAX_SAFE_RUNS). This may take a long time to run."
@@ -358,6 +377,7 @@ for sample in "${SAMPLES[@]}"; do
     for bs in "${BLOCKS[@]}"; do
       for local in "${LOCAL_SIZES[@]}"; do
                         for pinned in "${PINNED_OPTIONS[@]}"; do
+                        for io_overlap in "${IO_OVERLAP_OPTIONS[@]}"; do
                       # Debug: print pinned value and current shell environment to detect parsing issues
                       # echo "DEBUG: (pinned raw) -> [$pinned]"
                       # sanitize pinned label for filenames (none/pinned/no_pinned)
@@ -371,15 +391,17 @@ for sample in "${SAMPLES[@]}"; do
                         pinned_label=$(echo "$pinned" | sed 's/^--//g; s/-/_/g')
                       fi
                       for r in $(seq 1 "$REPS"); do
-            out_lz4="$OUTDIR/tmp/${sample_basename}.acc${accel}.bs${bs}.local${local}.pin${pinned_label}.r${r}.lz4"
-            out_dec="$OUTDIR/tmp/${sample_basename}.acc${accel}.bs${bs}.local${local}.pin${pinned_label}.r${r}.dec"
-            logf="$OUTDIR/logs/${sample_basename}.acc${accel}.bs${bs}.local${local}.pin${pinned_label}.r${r}.log"
+            # sanitize io overlap label for filenames
+            if [ "$io_overlap" = "--io-overlap" ]; then io_overlap_label="io_overlap"; elif [ "$io_overlap" = "--no-io-overlap" ]; then io_overlap_label="no_io_overlap"; else io_overlap_label=$(echo "$io_overlap" | sed 's/^--//g; s/-/_/g'); fi
+            out_lz4="$OUTDIR/tmp/${sample_basename}.acc${accel}.bs${bs}.local${local}.pin${pinned_label}.io${io_overlap_label}.r${r}.lz4"
+            out_dec="$OUTDIR/tmp/${sample_basename}.acc${accel}.bs${bs}.local${local}.pin${pinned_label}.io${io_overlap_label}.r${r}.dec"
+            logf="$OUTDIR/logs/${sample_basename}.acc${accel}.bs${bs}.local${local}.pin${pinned_label}.io${io_overlap_label}.r${r}.log"
 
-            echo "RUN: sample=${sample_basename} accel=${accel} bs=${bs} local=${local} pinned=${pinned_label} r=${r}"
+            echo "RUN: sample=${sample_basename} accel=${accel} bs=${bs} local=${local} pinned=${pinned_label} io_overlap=${io_overlap_label} r=${r}"
 
             # If RESUME is enabled, check for an existing entry in $RESULTS_CSV and skip if present
             if [ "$RESUME" = "1" ] && [ -f "$RESULT_CSV" ]; then
-              found=$(awk -F, -v s="$sample_basename" -v a="$accel" -v b="$bs" -v l="$local" -v p="$pinned_label" -v m="$MODE_LABEL" -v r="$r" 'NR>1 && $1==s && $3==a && $4==b && $5==l && $6==p && $7==m && $8==r {print 1; exit}' "$RESULT_CSV" || true)
+              found=$(awk -F, -v s="$sample_basename" -v a="$accel" -v b="$bs" -v l="$local" -v p="$pinned_label" -v io="$io_overlap_label" -v m="$MODE_LABEL" -v r="$r" 'NR>1 && $1==s && $3==a && $4==b && $5==l && $6==p && $7==io && $8==m && $9==r {print 1; exit}' "$RESULT_CSV" || true)
               if [ "$found" = "1" ]; then
                 echo "SKIP (already present): sample=${sample_basename} accel=${accel} bs=${bs} local=${local} pinned=${pinned_label} r=${r} (results.csv has an entry)"
                 rm -f "$LASTRUN_FILE" 2>/dev/null || true
@@ -389,8 +411,12 @@ for sample in "${SAMPLES[@]}"; do
 
             # compress - build command array to avoid quoting pitfalls
             set +e
-            cmd=("$LZ4_GPU_BIN" -c -p -v "$sample" -o "$out_lz4" --blocksize "$bs" --local "$local" -l "$accel")
+            cmd=("$LZ4_GPU_BIN" -c -v "$sample" -o "$out_lz4" --blocksize "$bs" --local "$local" -l "$accel")
+            if [ "$PROFILE" = "1" ]; then
+              cmd+=("-p")
+            fi
             if [ -n "$pinned" ]; then cmd+=("$pinned"); fi
+            if [ -n "$io_overlap" ]; then cmd+=("$io_overlap"); fi
             if [ "$DAEMON_MODE" = "1" ]; then cmd+=("--use-daemon"); fi
             ( printf 'ENV: LZ4_GPU_CLBIN=%q\n' "$CLBIN"; printf 'CMD: '; printf '%q ' "${cmd[@]}"; echo ) >> "$logf"
             if [ -n "$CLBIN" ] && [ "$DAEMON_MODE" != "1" ]; then
@@ -411,8 +437,12 @@ for sample in "${SAMPLES[@]}"; do
 
             # decompress - build command array
             set +e
-            cmd=("$LZ4_GPU_BIN" -d -p -v "$out_lz4" -o "$out_dec" --local "$local")
+            cmd=("$LZ4_GPU_BIN" -d -v "$out_lz4" -o "$out_dec" --local "$local")
+            if [ "$PROFILE" = "1" ]; then
+              cmd+=("-p")
+            fi
             if [ -n "$pinned" ]; then cmd+=("$pinned"); fi
+            if [ -n "$io_overlap" ]; then cmd+=("$io_overlap"); fi
             if [ "$DAEMON_MODE" = "1" ]; then cmd+=("--use-daemon"); fi
             ( printf 'ENV: LZ4_GPU_CLBIN=%q\n' "$CLBIN"; printf 'CMD: '; printf '%q ' "${cmd[@]}"; echo ) >> "$logf"
             if [ -n "$CLBIN" ] && [ "$DAEMON_MODE" != "1" ]; then LZ4_GPU_CLBIN="$CLBIN" "${cmd[@]}" >> "$logf" 2>&1; else "${cmd[@]}" >> "$logf" 2>&1; fi
@@ -440,6 +470,13 @@ for sample in "${SAMPLES[@]}"; do
               comp_kernel_ms=$(awk 'BEGIN{f=0} /=== Compression Statistics/ {f=1; next} f && /^[[:space:]]*(Kernel Exec|Kernel):/ {for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+(\.[0-9]+)?$/) {print $i; exit}}' "$logf" || true)
               comp_h2d_ms=$(awk 'BEGIN{f=0} /=== Compression Statistics/ {f=1; next} f && /Host[^A-Za-z]*Device/ {for(i=1;i<=NF;i++) if ($i ~ /[0-9]+(\.[0-9]+)?/) {print $i; exit}}' "$logf" || true)
               comp_d2h_ms=$(awk 'BEGIN{f=0} /=== Compression Statistics/ {f=1; next} f && /Device[^A-Za-z]*Host/ {for(i=1;i<=NF;i++) if ($i ~ /[0-9]+(\.[0-9]+)?/) {print $i; exit}}' "$logf" || true)
+              # additional compression profile values
+              comp_alloc_ms=$(awk 'BEGIN{f=0} /=== Compression Statistics/ {f=1; next} f && /Buffer Alloc:/ {match($0, /[0-9]+(\.[0-9]+)?/); if(RSTART) print substr($0, RSTART, RLENGTH); exit }' "$logf" || true)
+              comp_event_profile_ms=$(awk 'BEGIN{f=0} /=== Compression Statistics/ {f=1; next} f && /event profiling/ {match($0, /[0-9]+(\.[0-9]+)?/); if(RSTART) print substr($0, RSTART, RLENGTH); exit }' "$logf" || true)
+              comp_frame_ms=$(awk 'BEGIN{f=0} /=== Compression Statistics/ {f=1; next} f && /^[[:space:]]*Frame assembly:/ {match($0, /[0-9]+(\.[0-9]+)?/); if(RSTART) print substr($0, RSTART, RLENGTH); exit }' "$logf" || true)
+              comp_alloc_ms=${comp_alloc_ms:-NA}
+              comp_event_profile_ms=${comp_event_profile_ms:-NA}
+              comp_frame_ms=${comp_frame_ms:-NA}
               # Extract decompression timings by scanning the Decompression section
               # Handle both the normal and daemon-mode variants for the header
               dec_total_ms=$(awk 'BEGIN{f=0} /=== Decompression Statistics/ {f=1; next} f && /Total time/ {match($0, /[0-9]+(\.[0-9]+)?/); if(RSTART) print substr($0, RSTART, RLENGTH); exit}' "$logf" || true)
@@ -447,6 +484,13 @@ for sample in "${SAMPLES[@]}"; do
               dec_kernel_ms=$(awk 'BEGIN{f=0} /=== Decompression Statistics/ {f=1; next} f && /^[[:space:]]*(Kernel Exec|Kernel):/ {for(i=1;i<=NF;i++){ if($i ~ /^[0-9]+(\.[0-9]+)?$/){print $i; exit}} }' "$logf" || true)
               dec_h2d_ms=$(awk 'BEGIN{f=0} /=== Decompression Statistics/ {f=1; next} f && /Host[^A-Za-z]*Device/ {for(i=1;i<=NF;i++){ if($i ~ /[0-9]+(\.[0-9]+)?/){print $i; exit}} }' "$logf" || true)
               dec_d2h_ms=$(awk 'BEGIN{f=0} /=== Decompression Statistics/ {f=1; next} f && /Device[^A-Za-z]*Host/ {for(i=1;i<=NF;i++){ if($i ~ /[0-9]+(\.[0-9]+)?/){print $i; exit}} }' "$logf" || true)
+              # additional decompression profile values
+              dec_alloc_ms=$(awk 'BEGIN{f=0} /=== Decompression Statistics/ {f=1; next} f && /Buffer Alloc:/ {match($0, /[0-9]+(\.[0-9]+)?/); if(RSTART) print substr($0, RSTART, RLENGTH); exit }' "$logf" || true)
+              dec_event_profile_ms=$(awk 'BEGIN{f=0} /=== Decompression Statistics/ {f=1; next} f && /event profiling/ {match($0, /[0-9]+(\.[0-9]+)?/); if(RSTART) print substr($0, RSTART, RLENGTH); exit }' "$logf" || true)
+              dec_frame_ms=$(awk 'BEGIN{f=0} /=== Decompression Statistics/ {f=1; next} f && /^[[:space:]]*Frame assembly:/ {match($0, /[0-9]+(\.[0-9]+)?/); if(RSTART) print substr($0, RSTART, RLENGTH); exit }' "$logf" || true)
+              dec_alloc_ms=${dec_alloc_ms:-NA}
+              dec_event_profile_ms=${dec_event_profile_ms:-NA}
+              dec_frame_ms=${dec_frame_ms:-NA}
               dec_total_ms=${dec_total_ms:-NA}
               dec_kernel_ms=${dec_kernel_ms:-NA}
               compressed_bytes=$(stat -c%s "$out_lz4" || echo NA)
@@ -463,7 +507,7 @@ for sample in "${SAMPLES[@]}"; do
               comp_d2h_ms=${comp_d2h_ms:-NA}
               if [ "$compressed_bytes" = "NA" ]; then compression_ratio=NA; else compression_ratio=$(awk -v i="$input_bytes" -v o="$compressed_bytes" 'BEGIN{printf "%.3f", (i>0)?(i/o):0}'); fi
 
-              echo "${sample_basename},${input_bytes},${accel},${bs},${local},${pinned_label},${MODE_LABEL},${r},${compressed_bytes},${comp_total_ms},${comp_kernel_ms},${comp_h2d_ms},${comp_d2h_ms},${dec_total_ms},${dec_kernel_ms},${dec_h2d_ms},${dec_d2h_ms},${compression_ratio},${lz4_valid},${ok},${logf}" >> "$RESULT_CSV"
+              echo "${sample_basename},${input_bytes},${accel},${bs},${local},${pinned_label},${io_overlap_label},${MODE_LABEL},${r},${compressed_bytes},${comp_total_ms},${comp_kernel_ms},${comp_h2d_ms},${comp_d2h_ms},${dec_total_ms},${dec_kernel_ms},${dec_h2d_ms},${dec_d2h_ms},${compression_ratio},${lz4_valid},${ok},${logf},${comp_alloc_ms},${comp_event_profile_ms},${comp_frame_ms},${dec_alloc_ms},${dec_event_profile_ms},${dec_frame_ms}" >> "$RESULT_CSV"
 
               # cleanup successful artifacts (optionally keep the log via KEEP_SUCCESS_LOGS)
               rm -f "$out_lz4" "$out_dec"
@@ -480,6 +524,7 @@ for sample in "${SAMPLES[@]}"; do
 
             done
           done
+          done
         done
       done
     done
@@ -494,30 +539,36 @@ echo "Generating aggregated averages -> $RESULTS_AGG_CSV"
 awk -F"," -v OUT="$RESULTS_AGG_CSV" '
 NR==1 { next }
 {
-  # Header: sample,input_bytes,accel,block_size,local,pinned,mode,run,compressed_bytes,...
-  # Key includes mode ($7) as part of the grouping
-  key=$1","$3","$4","$5","$6","$7
+  # Header: sample,input_bytes,accel,block_size,local,pinned,io_overlap,mode,run,compressed_bytes,...
+  # Key includes mode and io_overlap ($7,$8) as part of the grouping
+  key=$1","$3","$4","$5","$6","$7","$8
   runs[key]++
-  if ($20 == "OK") {
+  if ($21 == "OK") {
     success[key]++
-    if ($9 ~ /^[0-9]+$/) { sum_comp[key]+= $9; cnt_comp[key]++ }
-    if ($10 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_total[key]+= $10; cnt_total[key]++ }
-    if ($11 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_kernel[key]+= $11; cnt_kernel[key]++ }
-    if ($12 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_h2d[key]+= $12; cnt_h2d[key]++ }
-    if ($13 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_d2h[key]+= $13; cnt_d2h[key]++ }
-    if ($14 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_dec_total[key]+= $14; cnt_dec_total[key]++ }
-    if ($15 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_dec_kernel[key]+= $15; cnt_dec_kernel[key]++ }
-    if ($16 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_dec_h2d[key]+= $16; cnt_dec_h2d[key]++ }
-    if ($17 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_dec_d2h[key]+= $17; cnt_dec_d2h[key]++ }
-    if ($18 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_ratio[key]+= $18; cnt_ratio[key]++ }
-    if (lz4_map[key] == "") lz4_map[key] = $19; else if (lz4_map[key] != $19) lz4_map[key] = "MIXED"
+    if ($10 ~ /^[0-9]+$/) { sum_comp[key]+= $10; cnt_comp[key]++ }
+    if ($11 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_total[key]+= $11; cnt_total[key]++ }
+    if ($12 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_kernel[key]+= $12; cnt_kernel[key]++ }
+    if ($13 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_h2d[key]+= $13; cnt_h2d[key]++ }
+    if ($14 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_d2h[key]+= $14; cnt_d2h[key]++ }
+    if ($15 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_dec_total[key]+= $15; cnt_dec_total[key]++ }
+    if ($16 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_dec_kernel[key]+= $16; cnt_dec_kernel[key]++ }
+    if ($17 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_dec_h2d[key]+= $17; cnt_dec_h2d[key]++ }
+    if ($18 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_dec_d2h[key]+= $18; cnt_dec_d2h[key]++ }
+    if ($19 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_ratio[key]+= $19; cnt_ratio[key]++ }
+    if ($23 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_comp_alloc[key] += $23; cnt_comp_alloc[key]++ }
+    if ($24 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_comp_event_profile[key] += $24; cnt_comp_event_profile[key]++ }
+    if ($25 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_comp_frame[key] += $25; cnt_comp_frame[key]++ }
+    if ($26 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_dec_alloc[key] += $26; cnt_dec_alloc[key]++ }
+    if ($27 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_dec_event_profile[key] += $27; cnt_dec_event_profile[key]++ }
+    if ($28 ~ /^[0-9]+(\.[0-9]+)?$/) { sum_dec_frame[key] += $28; cnt_dec_frame[key]++ }
+    if (lz4_map[key] == "") lz4_map[key] = $20; else if (lz4_map[key] != $20) lz4_map[key] = "MIXED"
   }
 }
 END {
-  print "sample,accel,block_size,local,pinned,mode,runs,successes,avg_compressed_bytes,avg_comp_total_ms,avg_comp_kernel_ms,avg_comp_h2d_ms,avg_comp_d2h_ms,avg_decomp_total_ms,avg_decomp_kernel_ms,avg_decomp_h2d_ms,avg_decomp_d2h_ms,avg_compression_ratio,lz4_valid_frame,success_rate" > OUT
+  print "sample,accel,block_size,local,pinned,io_overlap,mode,runs,successes,avg_compressed_bytes,avg_comp_total_ms,avg_comp_kernel_ms,avg_comp_h2d_ms,avg_comp_d2h_ms,avg_decomp_total_ms,avg_decomp_kernel_ms,avg_decomp_h2d_ms,avg_decomp_d2h_ms,avg_compression_ratio,lz4_valid_frame,success_rate,avg_comp_alloc_ms,avg_comp_event_profile_ms,avg_comp_frame_ms,avg_dec_alloc_ms,avg_dec_event_profile_ms,avg_dec_frame_ms" > OUT
   for (k in runs) {
     split(k, parts, ",")
-    sample = parts[1]; accel = parts[2]; bs = parts[3]; local = parts[4]; pinned = parts[5]; mode = parts[6]
+    sample = parts[1]; accel = parts[2]; bs = parts[3]; local = parts[4]; pinned = parts[5]; io = parts[6]; mode = parts[7]
     r = runs[k] + 0; s = success[k] + 0
     avg_comp = (cnt_comp[k] ? sum_comp[k]/cnt_comp[k] : "NA")
     avg_total = (cnt_total[k] ? sprintf("%.3f", sum_total[k]/cnt_total[k]) : "NA")
@@ -529,9 +580,15 @@ END {
     avg_dec_h2d = (cnt_dec_h2d[k] ? sprintf("%.3f", sum_dec_h2d[k]/cnt_dec_h2d[k]) : "NA")
     avg_dec_d2h = (cnt_dec_d2h[k] ? sprintf("%.3f", sum_dec_d2h[k]/cnt_dec_d2h[k]) : "NA")
     avg_ratio = (cnt_ratio[k] ? sprintf("%.3f", sum_ratio[k]/cnt_ratio[k]) : "NA")
+    avg_comp_alloc = (cnt_comp_alloc[k] ? sprintf("%.3f", sum_comp_alloc[k]/cnt_comp_alloc[k]) : "NA")
+    avg_comp_event_profile = (cnt_comp_event_profile[k] ? sprintf("%.3f", sum_comp_event_profile[k]/cnt_comp_event_profile[k]) : "NA")
+    avg_comp_frame = (cnt_comp_frame[k] ? sprintf("%.3f", sum_comp_frame[k]/cnt_comp_frame[k]) : "NA")
+    avg_dec_alloc = (cnt_dec_alloc[k] ? sprintf("%.3f", sum_dec_alloc[k]/cnt_dec_alloc[k]) : "NA")
+    avg_dec_event_profile = (cnt_dec_event_profile[k] ? sprintf("%.3f", sum_dec_event_profile[k]/cnt_dec_event_profile[k]) : "NA")
+    avg_dec_frame = (cnt_dec_frame[k] ? sprintf("%.3f", sum_dec_frame[k]/cnt_dec_frame[k]) : "NA")
     lv = (lz4_map[k] ? lz4_map[k] : "NA")
     success_rate = (r > 0 ? s / r : 0)
-    printf "%s,%s,%s,%s,%s,%s,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%.3f\n", sample, accel, bs, local, pinned, mode, r, s, avg_comp, avg_total, avg_kernel, avg_h2d, avg_d2h, avg_dec_total, avg_dec_kernel, avg_dec_h2d, avg_dec_d2h, avg_ratio, lv, success_rate >> OUT
+    printf "%s,%s,%s,%s,%s,%s,%s,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%.3f,%s,%s,%s,%s,%s,%s\n", sample, accel, bs, local, pinned, io, mode, r, s, avg_comp, avg_total, avg_kernel, avg_h2d, avg_d2h, avg_dec_total, avg_dec_kernel, avg_dec_h2d, avg_dec_d2h, avg_ratio, lv, success_rate, avg_comp_alloc, avg_comp_event_profile, avg_comp_frame, avg_dec_alloc, avg_dec_event_profile, avg_dec_frame >> OUT
   }
 }' "$RESULT_CSV"
 

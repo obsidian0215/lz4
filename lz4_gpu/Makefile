@@ -52,7 +52,7 @@ $(TARGET): $(SOURCES) $(HEADERS)
 	@echo "Build successful: $(TARGET)"
 
 # Debug executable
-$(DEBUG_TARGET): CFLAGS += -g -DDEBUG
+$(DEBUG_TARGET): CFLAGS += -g -DDEBUG -DLZ4_GPU_HOST_DEBUG
 $(DEBUG_TARGET): $(SOURCES) $(HEADERS)
 	@echo "Compiling LZ4 GPU compressor (debug)..."
 	$(CC) $(CFLAGS) -o $(DEBUG_TARGET) $(SOURCES) $(LDFLAGS)

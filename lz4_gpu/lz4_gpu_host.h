@@ -96,6 +96,9 @@ typedef unsigned char BYTE;
 #define LZ4F_BLOCKUNCOMPRESSED_FLAG 0x80000000U
 
 // Bit manipulation constants from original LZ4
+// Forward declare compressor type for API prototypes that appear earlier in header
+struct LZ4GPUCompressor;
+void lz4_gpu_set_io_overlap(struct LZ4GPUCompressor* compressor, int enabled);
 #define _1BIT  0x01
 #define _2BITS 0x03
 #define _3BITS 0x07
@@ -175,6 +178,10 @@ struct LZ4GPUCompressor {
     void* pinned_output_ptr;
     size_t pinned_input_size;
     size_t pinned_output_size;
+    /* Control whether IO overlap (non-blocking H2D/D2H with events) is enabled
+     * When enabled, host enqueues non-blocking transfers and uses events & wait lists
+     * to allow kernel/transfer overlap rather than clFinish global waits. */
+    int enable_io_overlap;
 
     // Performance timing (last operation)
     LZ4GPUTiming last_timing;

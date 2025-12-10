@@ -440,6 +440,9 @@ static void usage(const char* prog) {
         "  -v        verbose logging\n"
         "  --pinned  Use pinned host memory (enabled if supported).\n"
         "  --no-pinned  Disable pinned host memory.\n"
+        "  --io-overlap  Enable overlapped I/O (non-blocking transfers and chunked kernels)\n"
+        "                 (default: disabled - use only when it improves performance)\n"
+        "  --no-io-overlap  Disable I/O overlap (force blocking H2D/D2H)\n"
         "  --daemon  Run as a persistent lz4_gpu daemon process (accepts IPC requests via unix domain socket)\n"
         "  --use-daemon  Send a compress/decompress request to a running lz4_gpu daemon if one is available\n"
         "  --daemon-socket PATH  Unix domain socket path for daemon (default: /tmp/lz4_gpu_daemon.sock)\n"
@@ -475,6 +478,7 @@ int main(int argc, char** argv) {
     int host_debug = 0;
     int enable_profile = 0;
     int cli_pinned = -1;
+    int cli_io_overlap = -1;
     const char* infile = NULL;
     size_t cli_blocksize = 0;
     int cli_local = 0;
@@ -499,6 +503,8 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--local") == 0 && i+1 < argc) { cli_local = atoi(argv[++i]); }
         else if (strcmp(argv[i], "--pinned") == 0) { cli_pinned = 1; }
         else if (strcmp(argv[i], "--no-pinned") == 0) { cli_pinned = 0; }
+        else if (strcmp(argv[i], "--io-overlap") == 0) { cli_io_overlap = 1; }
+        else if (strcmp(argv[i], "--no-io-overlap") == 0) { cli_io_overlap = 0; }
         else if (strcmp(argv[i], "--daemon") == 0) { daemon_mode = 1; }
         else if (strcmp(argv[i], "--use-daemon") == 0) { use_daemon = 1; }
         // 移除 --daemon-pinned 和 --daemon-no-pinned 参数
@@ -576,6 +582,9 @@ int main(int argc, char** argv) {
     if (verbose) ctx->verbose = 1;
     if (cli_pinned >= 0) {
         lz4_gpu_set_pinned_memory(ctx, cli_pinned);
+    }
+    if (cli_io_overlap >= 0) {
+        lz4_gpu_set_io_overlap(ctx, cli_io_overlap);
     }
 
     // If the user requested to use the daemon, attempt to connect and let the daemon process the request.
