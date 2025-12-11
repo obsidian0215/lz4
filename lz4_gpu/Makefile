@@ -4,6 +4,8 @@
 # Compiler settings
 CC = gcc
 CFLAGS = -std=c99 -O2 -Wall -Wextra -pedantic
+# Add lib includes for CPU-side frame and block API (used for verification)
+CFLAGS += -I.. -I../lib
 LDFLAGS =
 
 # OpenCL detection and settings
@@ -21,7 +23,7 @@ endif
 # Build targets
 TARGET = lz4_gpu
 DEBUG_TARGET = lz4_gpu_debug
-SOURCES = lz4_gpu_host.c lz4_gpu.c xxhash.c
+SOURCES = lz4_gpu_host.c lz4_gpu.c xxhash.c ../lib/lz4.c ../lib/lz4hc.c ../lib/lz4frame.c
 HEADERS = lz4_gpu_host.h
 KERNEL = lz4_gpu.cl
 
@@ -114,15 +116,7 @@ benchmark: $(TARGET) create_test_data
 	fi
 
 
-# GPU roundtrip test: build and run a small round-trip test program
-gpu_roundtrip_test: $(TARGET)
-	@echo "Building and running gpu_roundtrip_test..."
-	$(CC) $(CFLAGS) -o gpu_roundtrip_test gpu_roundtrip_test.c $(LDFLAGS)
-	@if [ -x ./gpu_roundtrip_test ]; then \
-		./gpu_roundtrip_test || echo "gpu_roundtrip_test exited with non-zero status"; \
-	else \
-		echo "Error: gpu_roundtrip_test not built"; exit 1; \
-	fi
+# (Legacy) gpu_roundtrip_test removed. Use lz4_gpu --verify instead.
 
 # Run the AB experiment harness script (run_ab.sh)
 run_ab: $(TARGET)
@@ -214,7 +208,7 @@ help:
 	@echo "  create_test_data - Generate test data for benchmarking"
 	@echo "  debug            - Build with debug symbols"
 	@echo "  help             - Show this help message"
-	@echo "  gpu_roundtrip_test - Build and run a small GPU roundtrip test"
+	# gpu_roundtrip_test removed
 	@echo "  run_ab           - Run the AB experiment harness (run_ab.sh)"
 	@echo ""
 	@echo "Usage examples:"

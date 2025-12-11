@@ -8,6 +8,7 @@
 #include <string.h>
 #include <time.h>
 #include "lz4_gpu_host.h"
+#include "lz4frame.h"
 #if defined(_WIN32)
 #include <io.h>
 #include <fcntl.h>
@@ -108,6 +109,7 @@ static int run_daemon_server(LZ4GPUCompressor* ctx, const char* socket_path, int
 
     // Optional micro-benchmark to prefer smaller acceleration if similar performance
     const char* tune_env = getenv("LZ4_GPU_AUTO_TUNE_ACCEL");
+    int daemon_default_accel = DEFAULT_ACCELERATION;
     if (tune_env && tune_env[0] == '1') {
         // Run a tiny benchmark comparing accel=1 and accel=4 to prefer smaller if within 3%
         size_t sample_size = 1024 * 1024; // 1MB
@@ -134,7 +136,7 @@ static int run_daemon_server(LZ4GPUCompressor* ctx, const char* socket_path, int
                 double diff = fabs(avg1 - avg4) / ((avg1+avg4) * 0.5);
                 if (diff < 0.03) {
                     // Similar performance: prefer smaller acceleration
-                    ctx->default_acceleration = 1;
+                    daemon_default_accel = 1;
                     fprintf(stderr, "Daemon: micro-benchmark: accel 1 and 4 similar; preferring smaller accel=1\n");
                 }
             }
@@ -196,8 +198,8 @@ static int run_daemon_server(LZ4GPUCompressor* ctx, const char* socket_path, int
         }
         dctx.total_requests++;
 
-        // Protocol: header = 16 bytes: op(1) + accel(1) + local(1) + pinned(1) + input_size(8) + block_size(4)
-        uint8_t header[16];
+        // Protocol: header = 17 bytes: op(1) + accel(1) + local(1) + pinned(1) + verify(1) + input_size(8) + block_size(4)
+        uint8_t header[17];
         if (read_all(client_fd, header, sizeof(header)) != sizeof(header)) {
             fprintf(stderr, "Daemon: failed to read header from client\n");
             close(client_fd);
@@ -207,10 +209,11 @@ static int run_daemon_server(LZ4GPUCompressor* ctx, const char* socket_path, int
         int requested_accel = (int)header[1];
         int requested_local = (int)header[2];
         int requested_pinned = (int)header[3];
+        int requested_verify = (int)header[4];
         uint64_t input_size = 0;
-        memcpy(&input_size, &header[4], sizeof(uint64_t));
+        memcpy(&input_size, &header[5], sizeof(uint64_t));
         uint32_t requested_block_size = 0;
-        memcpy(&requested_block_size, &header[12], sizeof(uint32_t));
+        memcpy(&requested_block_size, &header[13], sizeof(uint32_t));
 
         // Expand persistent input buffer if needed
         if ((size_t)input_size > dctx.input_capacity) {
@@ -232,7 +235,7 @@ static int run_daemon_server(LZ4GPUCompressor* ctx, const char* socket_path, int
         }
         if (requested_pinned <= 1) lz4_gpu_set_pinned_memory(ctx, requested_pinned);
         if (requested_local > 0) lz4_gpu_set_workgroup_size(ctx, (size_t)requested_local);
-        if (requested_block_size > 0) lz4_gpu_set_block_sizes(ctx, (size_t)requested_block_size, (size_t)requested_block_size);
+        if (requested_block_size > 0 && op == 1) lz4_gpu_set_block_size(ctx, (size_t)requested_block_size);
 
         // Estimate output buffer size based on operation
         size_t needed_size = dctx.output_capacity;
@@ -268,7 +271,7 @@ static int run_daemon_server(LZ4GPUCompressor* ctx, const char* socket_path, int
         clock_t t_op_start = clock();
         size_t out_sz = 0;
         if (op == 1) { // compress
-            if (requested_accel <= 0) requested_accel = DEFAULT_ACCELERATION;
+            if (requested_accel <= 0) requested_accel = daemon_default_accel;
             out_sz = lz4_gpu_compress_frame_accelerated(ctx, dctx.input_buf, (size_t)input_size, dctx.output_buf, dctx.output_capacity, requested_accel);
             if (out_sz > 0) {
                 dctx.total_compress_bytes += input_size;
@@ -287,6 +290,48 @@ static int run_daemon_server(LZ4GPUCompressor* ctx, const char* socket_path, int
             dctx.total_compress_time_ms += op_time_ms;
         } else if (op == 2) {
             dctx.total_decompress_time_ms += op_time_ms;
+        }
+
+        // If client requested verification, perform additional CPU->GPU verification
+        if (requested_verify && out_sz > 0) {
+            if (op == 1) { // compress: verify decompress produced from our compressed frame matches input
+                unsigned char* cpu_out = NULL; size_t cpu_out_sz = 0;
+                if (!cpu_decompress_frame_to_buf(dctx.output_buf, out_sz, &cpu_out, &cpu_out_sz)) {
+                    fprintf(stderr, "Daemon: Verification failed (CPU decompress compressed output failed)\n");
+                    ctx->last_error = LZ4_GPU_COMPRESS_ERROR;
+                    strncpy(ctx->error_message, "Daemon: verification failed: cpu decompress failed", sizeof(ctx->error_message)-1);
+                    ctx->error_message[sizeof(ctx->error_message)-1] = '\0';
+                    out_sz = 0; // mark as error for reporting
+                } else {
+                    if (cpu_out_sz != input_size || memcmp(cpu_out, dctx.input_buf, input_size) != 0) {
+                        fprintf(stderr, "Daemon: Verification failed (CPU decompressed data does not match original)\n");
+                        ctx->last_error = LZ4_GPU_COMPRESS_ERROR;
+                        strncpy(ctx->error_message, "Daemon: verification failed: data mismatch", sizeof(ctx->error_message)-1);
+                        ctx->error_message[sizeof(ctx->error_message)-1] = '\0';
+                        out_sz = 0;
+                    }
+                    free(cpu_out);
+                }
+            } else {
+                // decompress: compare CPU-decompressed input frame to our GPU-decompressed output
+                unsigned char* cpu_out = NULL; size_t cpu_out_sz = 0;
+                if (!cpu_decompress_frame_to_buf(dctx.input_buf, (size_t)input_size, &cpu_out, &cpu_out_sz)) {
+                    fprintf(stderr, "Daemon: Verification failed (CPU decompress input failed)\n");
+                    ctx->last_error = LZ4_GPU_DECOMPRESS_ERROR;
+                    strncpy(ctx->error_message, "Daemon: verification failed: cpu decompress input failed", sizeof(ctx->error_message)-1);
+                    ctx->error_message[sizeof(ctx->error_message)-1] = '\0';
+                    out_sz = 0;
+                } else {
+                    if (cpu_out_sz != out_sz || memcmp(cpu_out, dctx.output_buf, out_sz) != 0) {
+                        fprintf(stderr, "Daemon: Verification failed (GPU output does not match CPU output)\n");
+                        ctx->last_error = LZ4_GPU_DECOMPRESS_ERROR;
+                        strncpy(ctx->error_message, "Daemon: verification failed: output mismatch", sizeof(ctx->error_message)-1);
+                        ctx->error_message[sizeof(ctx->error_message)-1] = '\0';
+                        out_sz = 0;
+                    }
+                    free(cpu_out);
+                }
+            }
         }
 
         // Send result
@@ -343,7 +388,7 @@ static int run_daemon_server(LZ4GPUCompressor* ctx, const char* socket_path, int
 
 static int run_daemon_client(const char* socket_path, const unsigned char* input_buf, size_t input_size,
                              unsigned char** out_buf, size_t* out_size,
-                             int compress, int accel, int local, int pinned, size_t block_size, double* elapsed_ms, LZ4GPUTiming* timing_out) {
+                             int compress, int accel, int local, int pinned, int verify, size_t block_size, double* elapsed_ms, LZ4GPUTiming* timing_out) {
     if (!socket_path) socket_path = "/tmp/lz4_gpu_daemon.sock";
     clock_t t_start = clock();
     int sd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -357,16 +402,17 @@ static int run_daemon_client(const char* socket_path, const unsigned char* input
         close(sd);
         return 2; // unable to connect
     }
-    // Protocol: 16 byte header = op(1) + accel(1) + local(1) + pinned(1) + input_size(8) + block_size(4)
-    uint8_t header[16];
+    // Protocol: 17 byte header = op(1) + accel(1) + local(1) + pinned(1) + verify(1) + input_size(8) + block_size(4)
+    uint8_t header[17];
     header[0] = compress ? 1 : 2; // op
     header[1] = (uint8_t)(accel & 0xff);
     header[2] = (uint8_t)(local & 0xff);
     header[3] = (uint8_t)((pinned >= 0) ? pinned : 255);
+    header[4] = (uint8_t)((verify != 0) ? 1 : 0);
     uint64_t in_sz_le = (uint64_t)input_size;
-    memcpy(&header[4], &in_sz_le, sizeof(in_sz_le));
+    memcpy(&header[5], &in_sz_le, sizeof(in_sz_le));
     uint32_t block_sz_le = (uint32_t)(block_size & 0xffffffff);
-    memcpy(&header[12], &block_sz_le, sizeof(block_sz_le));
+    memcpy(&header[13], &block_sz_le, sizeof(block_sz_le));
     if (write_all(sd, header, sizeof(header)) != sizeof(header)) { close(sd); return 3; }
     if (write_all(sd, input_buf, input_size) != (ssize_t)input_size) { close(sd); return 4; }
     uint8_t status = 1;
@@ -425,6 +471,54 @@ static int parse_lz4f_content_size(const unsigned char* buf, size_t len, size_t*
     return 1;
 }
 
+/* Decompress an LZ4 frame (in-memory) using CPU LZ4F and return allocated output buffer and size.
+ * The caller should free(*out_buf_ptr) on success.
+ * Returns 1 on success, 0 on failure. */
+static int cpu_decompress_frame_to_buf(const unsigned char* comp, size_t comp_sz, unsigned char** out_buf_ptr, size_t* out_sz_ptr) {
+    if (!comp || !out_buf_ptr || !out_sz_ptr) return 0;
+    size_t parsed_content_size = 0;
+    size_t alloc_size = 0;
+    if (parse_lz4f_content_size(comp, comp_sz, &parsed_content_size) && parsed_content_size > 0) {
+        alloc_size = parsed_content_size + 64;
+    } else {
+        /* fallback: heuristic multiplier + margin */
+        alloc_size = comp_sz * 4 + 65536;
+        if (alloc_size < 65536) alloc_size = 65536;
+    }
+    unsigned char* out = (unsigned char*)malloc(alloc_size);
+    if (!out) return 0;
+
+    LZ4F_decompressionContext_t dctx;
+    size_t err = LZ4F_createDecompressionContext(&dctx, LZ4F_VERSION);
+    if (LZ4F_isError(err)) { free(out); return 0; }
+
+    size_t srcPos = 0;
+    size_t total_out = 0;
+    while (srcPos < comp_sz) {
+        size_t dstCapacity = alloc_size - total_out;
+        size_t srcSize = comp_sz - srcPos;
+        size_t ret = LZ4F_decompress(dctx, out + total_out, &dstCapacity, comp + srcPos, &srcSize, NULL);
+        if (LZ4F_isError(ret)) { LZ4F_freeDecompressionContext(dctx); free(out); return 0; }
+        total_out += dstCapacity;
+        srcPos += srcSize;
+        if (ret == 0) break; /* frame finished */
+        /* Not finished and dst buffer filled -> need to grow output buffer */
+        if (dstCapacity == 0) {
+            size_t new_alloc = alloc_size * 2;
+            if (new_alloc <= alloc_size) { LZ4F_freeDecompressionContext(dctx); free(out); return 0; }
+            unsigned char* new_out = (unsigned char*)realloc(out, new_alloc);
+            if (!new_out) { LZ4F_freeDecompressionContext(dctx); free(out); return 0; }
+            out = new_out; alloc_size = new_alloc;
+        }
+    }
+
+    LZ4F_freeDecompressionContext(dctx);
+    *out_buf_ptr = out;
+    *out_sz_ptr = total_out;
+    return 1;
+}
+
+
 static void usage(const char* prog) {
     fprintf(stderr,
     "Usage: %s [-c|-d] [-l level] [-B blocksize] [-o outfile|-] [--bench] [-v] <input>\n"
@@ -437,6 +531,7 @@ static void usage(const char* prog) {
     "  -p|--profile  Enable OpenCL event profiling and print upload/kernel/download CSV\n"
         "  --local N  Optional override for local work-group size (applies to both compression and decompression kernels)\n"
     "  --bench   print throughput and compression ratio summary\n"
+    "  --verify  Verify decompression correctness by comparing GPU output with CPU decompression (slower)\n"
         "  -v        verbose logging\n"
         "  --pinned  Use pinned host memory (enabled if supported).\n"
         "  --no-pinned  Disable pinned host memory.\n"
@@ -479,6 +574,9 @@ int main(int argc, char** argv) {
     int enable_profile = 0;
     int cli_pinned = -1;
     int cli_io_overlap = -1;
+    int cli_kernel_optimize = -1;
+    int cli_io_overlap_chunk_size = 0;
+    int cli_verify = 0; /* verify decompression correctness via CPU round-trip */
     const char* infile = NULL;
     size_t cli_blocksize = 0;
     int cli_local = 0;
@@ -505,6 +603,10 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--no-pinned") == 0) { cli_pinned = 0; }
         else if (strcmp(argv[i], "--io-overlap") == 0) { cli_io_overlap = 1; }
         else if (strcmp(argv[i], "--no-io-overlap") == 0) { cli_io_overlap = 0; }
+        else if (strcmp(argv[i], "--io-overlap-chunk-size") == 0 && i+1 < argc) { cli_io_overlap_chunk_size = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "--kernel-optimize") == 0) { cli_kernel_optimize = 1; }
+        else if (strcmp(argv[i], "--no-kernel-optimize") == 0) { cli_kernel_optimize = 0; }
+        else if (strcmp(argv[i], "--verify") == 0) { cli_verify = 1; }
         else if (strcmp(argv[i], "--daemon") == 0) { daemon_mode = 1; }
         else if (strcmp(argv[i], "--use-daemon") == 0) { use_daemon = 1; }
         // 移除 --daemon-pinned 和 --daemon-no-pinned 参数
@@ -583,8 +685,24 @@ int main(int argc, char** argv) {
     if (cli_pinned >= 0) {
         lz4_gpu_set_pinned_memory(ctx, cli_pinned);
     }
+    if (cli_kernel_optimize >= 0) {
+        lz4_gpu_set_kernel_optimize(ctx, cli_kernel_optimize);
+    }
     if (cli_io_overlap >= 0) {
         lz4_gpu_set_io_overlap(ctx, cli_io_overlap);
+    }
+    if (cli_io_overlap_chunk_size > 0) {
+        lz4_gpu_set_io_overlap_chunk_size(ctx, cli_io_overlap_chunk_size);
+    }
+    /* No per-mode CLI defaults here. Compression defaults to a single work-item per
+     * block (local=1) when compressor->local_size == 0; decompression defaults are
+     * computed at runtime by compute_device_default_local(). Only apply explicit
+     * CLI-specified workgroup sizes (cli_local > 0) below. */
+    /* Apply default block size if the user did not specify one via CLI.
+     * When operating in compress mode, set the default block size. For
+     * decompression, the block layout is derived from the frame header. */
+    if (cli_blocksize == 0 && compress) {
+        lz4_gpu_set_block_size(ctx, LZ4_GPU_DEFAULT_BLOCK_SIZE);
     }
 
     // If the user requested to use the daemon, attempt to connect and let the daemon process the request.
@@ -603,7 +721,7 @@ int main(int argc, char** argv) {
             // For now, use 16KB default for daemon
             client_block_size = 16 * 1024;
         }
-        int d_rc = run_daemon_client(daemon_socket, input_buf, (size_t)input_size, &d_out, &d_out_sz, compress, accel, cli_local, cli_pinned, client_block_size, &daemon_elapsed_ms, &daemon_timing);
+        int d_rc = run_daemon_client(daemon_socket, input_buf, (size_t)input_size, &d_out, &d_out_sz, compress, accel, cli_local, cli_pinned, cli_verify, client_block_size, &daemon_elapsed_ms, &daemon_timing);
         if (d_rc == 0) {
             // Successful; print statistics in same detailed format as local mode
             if (verbose) {
@@ -691,10 +809,8 @@ int main(int argc, char** argv) {
             // fallthrough to local processing
         }
     }
-    /* Apply any CLI-specified workgroup or block size override before initialize to influence kernel builds/decisions */
-    if (cli_local > 0) {
-        lz4_gpu_set_workgroup_size(ctx, (size_t)cli_local);
-    }
+    /* Apply any CLI-specified block size override before initializing kernels.
+     * Workgroup size overrides are applied after clamping below. */
     if (cli_blocksize > 0) {
         /* Clamp and align CLI-specified block size to GPU-friendly bounds */
         size_t bs = cli_blocksize;
@@ -703,9 +819,11 @@ int main(int argc, char** argv) {
         if (bs < MIN_BLOCK) bs = MIN_BLOCK;
         if (bs > LZ4_GPU_MAX_BLOCK_SIZE) bs = LZ4_GPU_MAX_BLOCK_SIZE;
         bs = ((bs + ALIGN - 1) / ALIGN) * ALIGN;
-          /* Set both compress and decompress block sizes to the same CLI-specified value.
-              Users typically expect --blocksize (-B) to apply to both directions. */
-          lz4_gpu_set_block_sizes(ctx, bs, bs);
+        if (compress) {
+            lz4_gpu_set_block_size(ctx, bs);
+        } else {
+            if (verbose) fprintf(stderr, "Note: --blocksize is ignored for decompression (frame layout determines block size)\n");
+        }
         if (bs != cli_blocksize && verbose) fprintf(stderr, "Note: blocksize clamped/rounded to %zu\n", bs);
     }
     /* Clamp user-specified local sizes to keep kernel launches reasonable */
@@ -714,6 +832,9 @@ int main(int argc, char** argv) {
         cli_local = (int)LZ4_GPU_MAX_LOCAL_SIZE;
     }
     if (cli_local > 0) {
+        /* Apply CLI-specified local/workgroup size after clamping (see above).
+         * This is the only place in this program where lz4_gpu_set_workgroup_size()
+         * is called for CLI overrides (daemon/client handling may set it per request). */
         lz4_gpu_set_workgroup_size(ctx, (size_t)cli_local);
     }
     /* If env variable provided, use it.
@@ -732,7 +853,7 @@ int main(int argc, char** argv) {
     if (verbose) {
         fprintf(stderr, "ENV: LZ4_GPU_CLBIN=%s\n", env_clbin_path ? env_clbin_path : "<unset>");
         fprintf(stderr, "ENV: LZ4_GPU_CLSRC=%s\n", env_clsrc_path ? env_clsrc_path : "<unset>");
-        fprintf(stderr, "DEFAULTS: accel=%d block=%zu local=%zu pinned=%d\n", DEFAULT_ACCELERATION, ctx->dynamic_block_size, ctx->default_local, ctx->use_pinned_memory);
+        fprintf(stderr, "DEFAULTS: accel=%d block=%zu local=%zu pinned=%d\n", DEFAULT_ACCELERATION, ctx->dynamic_block_size, ctx->local_size, ctx->use_pinned_memory);
     }
     /* Clamp acceleration to maximum allowed */
     if (accel < 1) accel = 1;
@@ -797,6 +918,22 @@ int main(int argc, char** argv) {
         clock_t tw1 = clock();
         t_write_ms = (double)(tw1 - tw0) / CLOCKS_PER_SEC * 1000.0;
         if (close_fo) fclose(fo);
+        /* Verify compression correctness by CPU decompression when requested */
+        if (cli_verify) {
+            unsigned char* cpu_out = NULL; size_t cpu_out_sz = 0;
+            if (!cpu_decompress_frame_to_buf(outbuf, out_sz, &cpu_out, &cpu_out_sz)) {
+                fprintf(stderr, "Verification failed: CPU decompression of compressed frame failed\n");
+                rc = 1;
+            } else {
+                if (cpu_out_sz != input_size || memcmp(cpu_out, input_buf, input_size) != 0) {
+                    fprintf(stderr, "Verification failed: decompressed data does not match original (size: cpu=%zu expected=%zu)\n", cpu_out_sz, input_size);
+                    rc = 1;
+                } else if (verbose) {
+                    fprintf(stderr, "Verification success: GPU-compressed frame decompresses correctly with CPU\n");
+                }
+                free(cpu_out);
+            }
+        }
         free(outbuf);
 
         if (verbose && lz4_gpu_get_last_timing(ctx, &timing)) {
@@ -981,6 +1118,22 @@ int main(int argc, char** argv) {
     clock_t tw1 = clock();
     double t_write_ms = (double)(tw1 - tw0) / CLOCKS_PER_SEC * 1000.0;
     if (close_fo) fclose(fo);
+    /* Optionally verify decompression correctness by comparing CPU-decompressed result to GPU output */
+    if (cli_verify) {
+        unsigned char* cpu_out = NULL; size_t cpu_out_sz = 0;
+        if (!cpu_decompress_frame_to_buf(input_buf, (size_t)input_size, &cpu_out, &cpu_out_sz)) {
+            fprintf(stderr, "Verification failed: CPU decompression of input frame failed\n");
+            rc = 1;
+        } else {
+            if (cpu_out_sz != out_sz || memcmp(cpu_out, outbuf, out_sz) != 0) {
+                fprintf(stderr, "Verification failed: GPU decompressed output does not match CPU decompressed output (cpu=%zu gpu=%zu)\n", cpu_out_sz, out_sz);
+                rc = 1;
+            } else if (verbose) {
+                fprintf(stderr, "Verification success: GPU decompression matches CPU decompression\n");
+            }
+            free(cpu_out);
+        }
+    }
     free(outbuf);
 
     if (verbose) {

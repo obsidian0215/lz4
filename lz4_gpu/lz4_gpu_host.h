@@ -17,8 +17,8 @@ extern "C" {
 #define LZ4_GPU_MIN_BLOCK_SIZE (4 * 1024)   // 4KB - used as conservative min when parsing frames
 #define LZ4_GPU_MAX_ACCELERATION 12         // maximum allowed acceleration (clamped)
 #define LZ4_GPU_MAX_LOCAL_SIZE 256          // maximum workgroup local size we allow by API
-#define LZ4_GPU_DEFAULT_ACCELERATION 8      // default acceleration level (best composite ranking)
-#define LZ4_GPU_DEFAULT_BLOCK_SIZE (16 * 1024) // default block size: 16KB (best 5-metric)
+#define LZ4_GPU_DEFAULT_ACCELERATION 1      // default acceleration level
+#define LZ4_GPU_DEFAULT_BLOCK_SIZE (32 * 1024) // default block size: 32KB
 #define LZ4_GPU_DEFAULT_LOCAL_SIZE 64       // default local (work-group) size: 64 (best 5-metric)
 #define LZ4_GPU_DEFAULT_PINNED 0            // default: pinned disabled; daemon mode may override
 #define LZ4_GPU_HASH_TABLE_SIZE (1 << 14)         // 16384 entries (must match LZ4_HASHLOG in kernel)
@@ -147,29 +147,20 @@ struct LZ4GPUCompressor {
     cl_uint device_compute_units;
     size_t device_max_work_group_size;
 
-    // Dynamic block size chosen per-device / per-input
-    size_t dynamic_block_size;
-    /* Optimal block sizes for compression and decompression (can be overridden via API) */
-    size_t compress_block_size;       /* block size for compression (default: 32KB) */
-    size_t decompress_block_size;     /* block size for decompression (default: 32KB) */
-    /* Optional source path for kernel building (if set, used instead of default 'lz4_gpu.cl') */
-    char kernel_src_path[256];
-    /* Default work-group sizes (local size) for kernels. Values are suggested defaults
-     * based on tuning and device properties; these can be overridden via API
-     * calls before initialize() or via environment/harness. */
-    size_t default_local;            /* unified local size for compression & decompression kernels */
-        int default_acceleration;        /* default acceleration level to use for compress_frame */
+    size_t dynamic_block_size;      /* computed block size for compression based on input size */
+    size_t block_size;              /* block size for compression (default: 0 -> compute dynamically) */
+    char kernel_src_path[256];      /* Optional source path for kernel building (default 'lz4_gpu.cl') */
+    size_t local_size;               /* user-specified workgroup size override (0 => no override) */
 
     /* Build/runtime options controlled by host API or CLI. These flags
      * are used by lz4_gpu_build_program_with_options() to select precompiled
-     * binaries or to pass -D options to the OpenCL compiler when building
-     * from source. They must be part of the public struct so callers that
-     * allocate/inspect the compressor can set them prior to initialize(). */
+     * binaries or to pass -D options to the OpenCL compiler. */
     int enable_kernel_debug;   /* if 1, compile kernel with LZ4_GPU_KERNEL_DEBUG */
     int prefer_precompiled;    /* if 1, prefer loading a precompiled .clbin when available */
     char precompiled_path[256];/* optional path to a precompiled clbin to load */
     int enable_profiling;      /* if 1, create command queue with profiling enabled and collect timings */
     int verbose;               /* if 1, print informational messages to stderr */
+    int enable_kernel_optimize; /* if 1, compile kernel with -cl-fast-relaxed-math and throughput-focused defines (default=1) */
 
     int kernel_hashlog;
 
@@ -182,6 +173,11 @@ struct LZ4GPUCompressor {
      * When enabled, host enqueues non-blocking transfers and uses events & wait lists
      * to allow kernel/transfer overlap rather than clFinish global waits. */
     int enable_io_overlap;
+    /* When enabled, control preferred chunk size in blocks for overlapped IO
+     * If zero, compute automatically based on device capabilities and local size
+     * (default: 0 -> auto). A larger number increases per-chunk work and reduces
+     * kernel launch overhead but reduces overlap granularity. */
+    int overlap_chunk_blocks;
 
     // Performance timing (last operation)
     LZ4GPUTiming last_timing;
@@ -195,11 +191,12 @@ struct LZ4GPUCompressor {
 // Opaque compressor structure
 typedef struct LZ4GPUCompressor LZ4GPUCompressor;
 
-void lz4_gpu_set_workgroup_size(LZ4GPUCompressor* compressor, size_t local);
 /* Set explicit block sizes for compress/decompress (0 to use dynamic sizing). */
-void lz4_gpu_set_block_sizes(LZ4GPUCompressor* compressor, size_t compress_block_size, size_t decompress_block_size);
+void lz4_gpu_set_block_size(LZ4GPUCompressor* compressor, size_t block_size);
 /* Set explicit path to kernel source file (overrides default 'lz4_gpu.cl'). */
 void lz4_gpu_set_kernel_source(LZ4GPUCompressor* compressor, const char* path);
+/* Set workgroup (local) size to use for all kernels (0 = auto, otherwise override). */
+void lz4_gpu_set_workgroup_size(LZ4GPUCompressor* compressor, size_t local);
 
 void lz4_gpu_set_pinned_memory(LZ4GPUCompressor* compressor, int enabled);
 
@@ -256,6 +253,12 @@ void lz4_gpu_set_kernel_debug(LZ4GPUCompressor* compressor, int enabled);
  * Call before lz4_gpu_initialize() if you want debug prints during init.
  */
 void lz4_gpu_set_host_debug(LZ4GPUCompressor* compressor, int enabled);
+/* Enable or disable kernel optimizations in build (e.g. -cl-fast-relaxed-math). */
+void lz4_gpu_set_kernel_optimize(LZ4GPUCompressor* compressor, int enabled);
+/* Set the chunk blocks used by the overlapped IO pipeline. When set to 0 (default),
+ * an adaptive default is computed: max(64, device_compute_units * 32), then rounded
+ * up to a multiple of the work-group size. */
+void lz4_gpu_set_io_overlap_chunk_size(LZ4GPUCompressor* compressor, int chunk_blocks);
 int lz4_gpu_rebuild_program(LZ4GPUCompressor* compressor);
 void lz4_gpu_use_precompiled(LZ4GPUCompressor* compressor, int enabled);
 void lz4_gpu_set_precompiled_binary(LZ4GPUCompressor* compressor, const char* path);

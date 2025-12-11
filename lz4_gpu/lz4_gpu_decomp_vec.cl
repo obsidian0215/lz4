@@ -562,6 +562,7 @@ __kernel void lz4_compress_block_accelerated(
     int inputSize,
     int tableType,
     int acceleration,
+    int globalIndexBase,
     __local U32* localHashTable
 ) {
     int gid = get_global_id(0);
@@ -569,12 +570,12 @@ __kernel void lz4_compress_block_accelerated(
 
     int start = blockOffsets[gid * 2];
     int blockSize = blockOffsets[gid * 2 + 1];
-    if (start >= inputSize || blockSize <= 0) { blockSizes[gid] = 0; return; }
+    if (start >= inputSize || blockSize <= 0) { blockSizes[globalIndexBase + gid] = 0; return; }
 
     int dstCapacity = (int)maxOutputSizes[gid];
     __global BYTE* dst = output + outputOffsets[gid];
 
-    blockSizes[gid] = lz4_compress_core_accelerated(
+    blockSizes[globalIndexBase + gid] = lz4_compress_core_accelerated(
         input + start, dst, blockSize, dstCapacity, tableType, localHashTable, acceleration
     );
 }
@@ -629,6 +630,8 @@ __kernel void lz4_compress_block(
     int totalBlocks,
     int inputSize,
     int tableType,
+    int acceleration,
+    int globalIndexBase,
     __local U32* localHashTable
 ) {
     int gid = get_global_id(0);
@@ -636,13 +639,13 @@ __kernel void lz4_compress_block(
 
     int start = blockOffsets[gid * 2];
     int blockSize = blockOffsets[gid * 2 + 1];
-    if (start >= inputSize || blockSize <= 0) { blockSizes[gid] = 0; return; }
+    if (start >= inputSize || blockSize <= 0) { blockSizes[globalIndexBase + gid] = 0; return; }
 
     // Calculate conservative capacity
     int dstCapacity = blockSize + (blockSize/255) + 256;
     __global BYTE* dst = output + outputOffsets[gid];
 
-    blockSizes[gid] = lz4_compress_core_accelerated(
+    blockSizes[globalIndexBase + gid] = lz4_compress_core_accelerated(
         input + start, dst, blockSize, dstCapacity, tableType, localHashTable, 1
     );
 }

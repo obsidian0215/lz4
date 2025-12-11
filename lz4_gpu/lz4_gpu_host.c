@@ -79,28 +79,31 @@ LZ4GPUCompressor* lz4_gpu_create_compressor(void) {
 
     memset(compressor, 0, sizeof(LZ4GPUCompressor));
     compressor->last_error = LZ4_GPU_SUCCESS;
-        compressor->enable_kernel_debug = 0; // Default: keep logs quiet (only enable via CLI -g or debug build)
-        compressor->prefer_precompiled = 1; /* default to prefer using precompiled clbin when available */
-        compressor->precompiled_path[0] = '\0';
-        compressor->kernel_src_path[0] = '\0';
-        compressor->enable_profiling = 0; // By default profiling is disabled; user may enable via API or CLI (-p/--profile)
-        compressor->last_timing.total_ms = 0.0;
-        compressor->last_timing.init_ms = 0.0;
-        compressor->last_timing.alloc_ms = 0.0;
-        compressor->last_timing.h2d_ms = 0.0;
-        compressor->last_timing.kernel_ms = -1.0;
-        compressor->last_timing.kernel_ms_device = -1.0;
-        compressor->last_timing.d2h_ms = 0.0;
-        compressor->last_timing.frame_ms = 0.0;
-        compressor->last_timing.input_bytes = 0;
-        compressor->last_timing.output_bytes = 0;
-        compressor->last_timing.num_blocks = 0;
-        compressor->compress_block_size = 0; /* 0 -> use dynamic block sizing */
-        compressor->decompress_block_size = 0; /* 0 -> use frame's block layout */
-        compressor->default_local = LZ4_GPU_DEFAULT_LOCAL_SIZE;
-        compressor->default_acceleration = LZ4_GPU_DEFAULT_ACCELERATION;
-        compressor->use_pinned_memory = LZ4_GPU_DEFAULT_PINNED;
-        compressor->enable_io_overlap = 0; /* default: disable overlapping transfers (can enable via --io-overlap) */
+    compressor->enable_kernel_debug = 0; // Default: keep logs quiet (only enable via CLI -g or debug build)
+    compressor->prefer_precompiled = 1; /* default to prefer using precompiled clbin when available */
+    compressor->precompiled_path[0] = '\0';
+    compressor->kernel_src_path[0] = '\0';
+    compressor->enable_profiling = 0; // By default profiling is disabled; user may enable via API or CLI (-p/--profile)
+    compressor->enable_kernel_optimize = 1; /* enable kernel optimizations by default */
+    compressor->last_timing.total_ms = 0.0;
+    compressor->last_timing.init_ms = 0.0;
+    compressor->last_timing.alloc_ms = 0.0;
+    compressor->last_timing.h2d_ms = 0.0;
+    compressor->last_timing.kernel_ms = -1.0;
+    compressor->last_timing.kernel_ms_device = -1.0;
+    compressor->last_timing.d2h_ms = 0.0;
+    compressor->last_timing.frame_ms = 0.0;
+    compressor->last_timing.input_bytes = 0;
+    compressor->last_timing.output_bytes = 0;
+    compressor->last_timing.num_blocks = 0;
+    compressor->block_size = 0; /* 0 -> compute dynamic block size unless overridden via API */
+    /* Set defaults: compression local is 1 (safe to preserve compression ratio), decompression local tuned to 1 by heuristics */
+    /* default_local is 0 to indicate "not set"; initialize() will compute heuristics
+     * based on device properties unless the caller sets local via lz4_gpu_set_workgroup_size(). */
+    compressor->use_pinned_memory = LZ4_GPU_DEFAULT_PINNED;
+    compressor->enable_io_overlap = 0; /* default: disable overlapping transfers (can enable via --io-overlap) */
+    compressor->overlap_chunk_blocks = 0; /* default: 0 -> auto compute chunk size */
+    compressor->local_size = 0; /* default: no override */
 
     return compressor;
 }
@@ -447,6 +450,12 @@ static int lz4_gpu_build_program_with_options(LZ4GPUCompressor* compressor) {
     if (compressor->enable_kernel_debug) {
         strcat(build_opts, " -DLZ4_GPU_KERNEL_DEBUG=1");
     }
+    if (compressor->enable_kernel_optimize) {
+        /* Enable compiler throughput optimizations when available */
+        strcat(build_opts, " -DLZ4_GPU_KERNEL_OPTIMIZE=1");
+        /* Recommend relaxed math and MAD for optimized builds (vendor compilers may ignore unknown flags) */
+        strcat(build_opts, " -cl-fast-relaxed-math -cl-mad-enable");
+    }
 
     HDEBUG("DEBUG: Building OpenCL program with options:%s\n", build_opts[0] ? build_opts : " <none>");
     err = clBuildProgram(compressor->program, 1, &compressor->device,
@@ -580,26 +589,25 @@ int lz4_gpu_initialize(LZ4GPUCompressor* compressor) {
      * capabilities and the local memory requirements of the accelerated kernels.
      * The compress kernel uses a per-work-group local hash table sized by LZ4_HASHLOG.
      * If the device doesn't have enough local mem, keep defaults at 1. */
-    size_t default_comp_local = 1;
-    size_t default_decomp_local = 1;
+    size_t default_local = 1;
     size_t local_table_bytes = ((size_t)1 << LZ4_GPU_HASH_LOG) * sizeof(cl_uint);
     if (device_local_mem >= (cl_ulong)local_table_bytes && compressor->device_max_work_group_size >= 16) {
         /* If the device can support our preferred default local size, pick it; otherwise
            fallback to heuristic based on device max work_group size. */
         if (compressor->device_max_work_group_size >= LZ4_GPU_DEFAULT_LOCAL_SIZE) {
-            default_comp_local = LZ4_GPU_DEFAULT_LOCAL_SIZE;
-        } else if (compressor->device_max_work_group_size >= 256) default_comp_local = 256;
-        else if (compressor->device_max_work_group_size >= 128) default_comp_local = 128;
-        else if (compressor->device_max_work_group_size >= 64) default_comp_local = 64;
-        else default_comp_local = 1; /* conservative fallback */
+            default_local = LZ4_GPU_DEFAULT_LOCAL_SIZE;
+        } else if (compressor->device_max_work_group_size >= 256) default_local = 256;
+        else if (compressor->device_max_work_group_size >= 128) default_local = 128;
+        else if (compressor->device_max_work_group_size >= 64) default_local = 64;
+        else default_local = 1; /* conservative fallback */
     } else {
-        default_comp_local = 1; /* fallback if local memory insufficient */
+        default_local = 1; /* fallback if local memory insufficient */
     }
-    default_decomp_local = 1; /* tuning shows decompress kernel-only is best with local=1 */
 
     /* Respect a global API clamp for local sizes (avoid vendor-specific huge locals) */
-    if (default_comp_local > LZ4_GPU_MAX_LOCAL_SIZE) default_comp_local = LZ4_GPU_MAX_LOCAL_SIZE;
-    compressor->default_local = default_comp_local; /* unified default local size */
+    if (default_local > LZ4_GPU_MAX_LOCAL_SIZE) default_local = LZ4_GPU_MAX_LOCAL_SIZE;
+    if (compressor->device_max_work_group_size > 0 && default_local > compressor->device_max_work_group_size) default_local = compressor->device_max_work_group_size;
+    if (device_local_mem < (cl_ulong)local_table_bytes && default_local > 1) default_local = 1; /* if local memory insufficient, force conservative 1 */
 
     // Create context
     compressor->context = clCreateContext(NULL, 1, &compressor->device, NULL, NULL, &err);
@@ -626,9 +634,8 @@ int lz4_gpu_initialize(LZ4GPUCompressor* compressor) {
     if (!lz4_gpu_build_program_with_options(compressor)) {
         return 0;
     }
-        /* persistent device buffers are reused and freed at compressor destruction */
 
-    // Now create the actual compression kernel - use the accelerated version
+    // Create the actual compression kernel
     HDEBUG("DEBUG: Creating accelerated compression kernel...\n");
     compressor->compress_kernel = clCreateKernel(compressor->program, "lz4_compress_block_accelerated", &err);
     if (err != CL_SUCCESS) {
@@ -643,10 +650,9 @@ int lz4_gpu_initialize(LZ4GPUCompressor* compressor) {
         }
     }
 
-    // Get kernel info for debugging
-        /* Done with initialization - record init time */
-        t_init_end = clock();
-        compressor->last_timing.init_ms = (double)(t_init_end - t_init_start) / CLOCKS_PER_SEC * 1000.0;
+    /* Done with initialization - record init time */
+    t_init_end = clock();
+    compressor->last_timing.init_ms = (double)(t_init_end - t_init_start) / CLOCKS_PER_SEC * 1000.0;
     cl_uint num_args;
     err = clGetKernelInfo(compressor->compress_kernel, CL_KERNEL_NUM_ARGS, sizeof(cl_uint), &num_args, NULL);
     // if (err == CL_SUCCESS) {
@@ -738,28 +744,26 @@ void lz4_gpu_set_workgroup_size(LZ4GPUCompressor* compressor, size_t local) {
     if (compressor->device_max_work_group_size > 0 && local > compressor->device_max_work_group_size) {
         local = compressor->device_max_work_group_size;
     }
-    if (local > 0) compressor->default_local = local;
+    compressor->local_size = local; /* 0 means 'not overridden' */
 }
 
-void lz4_gpu_set_block_sizes(LZ4GPUCompressor* compressor, size_t compress_block_size, size_t decompress_block_size) {
+
+
+void lz4_gpu_set_block_size(LZ4GPUCompressor* compressor, size_t block_size) {
     if (!compressor) return;
     /* Clamp and align block sizes for safety */
     const size_t ALIGN = 4 * 1024;
     const size_t MIN_BLOCK = 16 * 1024;
-    if (compress_block_size > 0) {
-        size_t bs = compress_block_size;
+    if (block_size > 0) {
+        size_t bs = block_size;
         if (bs < MIN_BLOCK) bs = MIN_BLOCK;
         if (bs > LZ4_GPU_MAX_BLOCK_SIZE) bs = LZ4_GPU_MAX_BLOCK_SIZE;
         bs = ((bs + ALIGN - 1) / ALIGN) * ALIGN;
-        compressor->compress_block_size = bs;
+        /* Set unified default_block_size for compression; decompress uses actual frame layout */
+        compressor->block_size = bs;
     }
-    if (decompress_block_size > 0) {
-        size_t bs2 = decompress_block_size;
-        if (bs2 < MIN_BLOCK) bs2 = MIN_BLOCK;
-        if (bs2 > LZ4_GPU_MAX_BLOCK_SIZE) bs2 = LZ4_GPU_MAX_BLOCK_SIZE;
-        bs2 = ((bs2 + ALIGN - 1) / ALIGN) * ALIGN;
-        compressor->decompress_block_size = bs2;
-    }
+    /* Single block size parameter: we don't honor separate decompression block size.
+     * Decompression will use the frame's block layout. */
 }
 
 void lz4_gpu_set_pinned_memory(LZ4GPUCompressor* compressor, int enabled) {
@@ -770,6 +774,17 @@ void lz4_gpu_set_pinned_memory(LZ4GPUCompressor* compressor, int enabled) {
 void lz4_gpu_set_io_overlap(LZ4GPUCompressor* compressor, int enabled) {
     if (!compressor) return;
     compressor->enable_io_overlap = enabled ? 1 : 0;
+}
+
+void lz4_gpu_set_io_overlap_chunk_size(LZ4GPUCompressor* compressor, int chunk_blocks) {
+    if (!compressor) return;
+    if (chunk_blocks < 0) chunk_blocks = 0; /* treat negative as 0 (auto) */
+    compressor->overlap_chunk_blocks = chunk_blocks;
+}
+
+void lz4_gpu_set_kernel_optimize(LZ4GPUCompressor* compressor, int enabled) {
+    if (!compressor) return;
+    compressor->enable_kernel_optimize = enabled ? 1 : 0;
 }
 
 
@@ -831,6 +846,31 @@ static size_t compute_dynamic_block_size(LZ4GPUCompressor* compressor, size_t in
     return block_size;
 }
 
+/* Compute a device-friendly default local work-group size based on device capabilities and local memory.
+ * This mirrors the heuristic used during initialization but is computed on demand here to avoid storing
+ * and synchronizing another member in the compressor struct.
+ */
+static size_t compute_device_default_local(LZ4GPUCompressor* compressor) {
+    size_t default_local = 1;
+    cl_ulong device_local_mem = 0;
+    if (compressor && compressor->device) {
+        clGetDeviceInfo(compressor->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(device_local_mem), &device_local_mem, NULL);
+    }
+    if (device_local_mem >= (cl_ulong)(((size_t)1 << LZ4_GPU_HASH_LOG) * sizeof(cl_uint)) && compressor->device_max_work_group_size >= 16) {
+        if (compressor->device_max_work_group_size >= LZ4_GPU_DEFAULT_LOCAL_SIZE) default_local = LZ4_GPU_DEFAULT_LOCAL_SIZE;
+        else if (compressor->device_max_work_group_size >= 256) default_local = 256;
+        else if (compressor->device_max_work_group_size >= 128) default_local = 128;
+        else if (compressor->device_max_work_group_size >= 64) default_local = 64;
+        else default_local = 1;
+    } else {
+        default_local = 1;
+    }
+    if (default_local > LZ4_GPU_MAX_LOCAL_SIZE) default_local = LZ4_GPU_MAX_LOCAL_SIZE;
+    if (compressor->device_max_work_group_size > 0 && default_local > compressor->device_max_work_group_size) default_local = compressor->device_max_work_group_size;
+    if (device_local_mem < (cl_ulong)(((size_t)1 << LZ4_GPU_HASH_LOG) * sizeof(cl_uint)) && default_local > 1) default_local = 1;
+    return default_local > 0 ? default_local : 1;
+}
+
 /* Map an uncompressed block size to LZ4 frame Block Size ID (4=64KB,5=256KB,6=1MB,7=4MB) */
 static unsigned char lz4f_blockSizeID_from_uncompressed_size(size_t size) {
     if (size <= 64 * 1024) return 4;
@@ -863,10 +903,8 @@ int lz4_gpu_query_device_capabilities(LZ4GPUCompressor* compressor, cl_uint* out
     return 1;
 }
 
-size_t lz4_gpu_compress_frame(LZ4GPUCompressor* compressor, const void* input, size_t input_size, void* output, size_t output_capacity) {
-    int accel = LZ4_GPU_DEFAULT_ACCELERATION;
-    if (compressor && compressor->default_acceleration > 0) accel = compressor->default_acceleration;
-    return lz4_gpu_compress_frame_accelerated(compressor, input, input_size, output, output_capacity, accel);
+inline size_t lz4_gpu_compress_frame(LZ4GPUCompressor* compressor, const void* input, size_t input_size, void* output, size_t output_capacity) {
+    return lz4_gpu_compress_frame_accelerated(compressor, input, input_size, output, output_capacity, LZ4_GPU_DEFAULT_ACCELERATION);
 }
 
 size_t lz4_gpu_compress_frame_accelerated(LZ4GPUCompressor* compressor,
@@ -920,13 +958,18 @@ size_t lz4_gpu_compress_frame_accelerated(LZ4GPUCompressor* compressor,
     cl_event *kernel_ev_slots = NULL;
     cl_event *read_sizes_ev_slots = NULL;
     cl_event *read_blocks_ev_slots = NULL;
+    /* Per-slot temporary chunk buffer pointers/sizes for overlapped pipeline (2 slots ping-pong)
+     * These are maintained at function-scope so we can reuse/release them during cleanup. */
+    unsigned char* tmp_chunk_buf_slots[2] = {NULL, NULL};
+    size_t tmp_chunk_buf_slot_sizes[2] = {0, 0};
+    const int IO_SLOTS = 2; /* ping-pong slots (function-scope constant) */
 
     // Determine dynamic block size (smaller when acceleration > 1) and split input into blocks
 
     size_t computed_block = compute_dynamic_block_size(compressor, input_size);
     /* If caller provided an explicit block size, honor it (clamp/align). */
-    if (compressor->compress_block_size > 0) {
-        size_t bs = compressor->compress_block_size;
+    if (compressor->block_size > 0) {
+        size_t bs = compressor->block_size;
         const size_t MIN_BLOCK = 16 * 1024;
         const size_t MAX_BLOCK = 4 * 1024 * 1024;
         const size_t ALIGN = 4 * 1024;
@@ -1091,8 +1134,8 @@ size_t lz4_gpu_compress_frame_accelerated(LZ4GPUCompressor* compressor,
         gpu_buffer_offset += block_buffer_size;
 
         if (i < 3) {
-            HDEBUG("DEBUG: Block %zu: input_size=%zu, buffer_size=%zu, output_offset=%zu\n",
-                i, block_size, block_buffer_size, output_offsets[i]);
+            HDEBUG("DEBUG: Block %zu: input_size=%zu, buffer_size=%zu, output_offset=%u\n",
+                i, block_size, block_buffer_size, (unsigned int)output_offsets[i]);
         }
     }
 
@@ -1178,6 +1221,8 @@ size_t lz4_gpu_compress_frame_accelerated(LZ4GPUCompressor* compressor,
     err |= clSetKernelArg(compressor->compress_kernel, 7, sizeof(cl_uint), &input_size_u32);           // inputSize
     err |= clSetKernelArg(compressor->compress_kernel, 8, sizeof(int), &table_type);                  // tableType
     err |= clSetKernelArg(compressor->compress_kernel, 9, sizeof(int), &acceleration);               // acceleration parameter
+    int globalIndexBaseLocal = 0;
+    err |= clSetKernelArg(compressor->compress_kernel, 10, sizeof(int), &globalIndexBaseLocal); /* base index for global blockSizes */
         /* Allocate per-work-group local hash table */
         size_t local_table_bytes_accel = ((size_t)1 << LZ4_GPU_HASH_LOG) * sizeof(cl_uint);
         /* Clamp local table size to device local memory to avoid kernel arg failures */
@@ -1191,7 +1236,7 @@ size_t lz4_gpu_compress_frame_accelerated(LZ4GPUCompressor* compressor,
                 local_table_bytes_accel = (size_t)device_local_mem;
             }
         }
-        err |= clSetKernelArg(compressor->compress_kernel, 10, local_table_bytes_accel, NULL);
+        err |= clSetKernelArg(compressor->compress_kernel, 11, local_table_bytes_accel, NULL);
 
     if (err != CL_SUCCESS) {
         printf("DEBUG: clSetKernelArg failed with error %d\n", err);
@@ -1211,8 +1256,11 @@ size_t lz4_gpu_compress_frame_accelerated(LZ4GPUCompressor* compressor,
     // size to a multiple of the local work-group size to satisfy strict
     // OpenCL implementations.
     size_t global_work_size = num_blocks;
-    size_t local_work_size = compressor->default_local;
-    if (local_work_size == 0) local_work_size = 1;
+    size_t local_work_size = compressor->local_size;
+    if (local_work_size == 0) {
+        /* Compression default: conservative single-thread per-block to preserve compression ratio */
+        local_work_size = 1;
+    }
     if (compressor->device_max_work_group_size > 0 && local_work_size > compressor->device_max_work_group_size) {
         local_work_size = compressor->device_max_work_group_size;
     }
@@ -1293,10 +1341,8 @@ size_t lz4_gpu_compress_frame_accelerated(LZ4GPUCompressor* compressor,
     size_t frame_pos = 0;
 
     /* chunk size in blocks used by overlapped IO pipeline */
-    int chunk_blocks = 8;
+    int chunk_blocks = 0; /* 0 -> compute dynamically */
     int num_chunks = 0;
-    unsigned char** tmp_chunk_bufs = NULL;
-    size_t* tmp_chunk_buf_sizes = NULL;
     if (!compressed_sizes) {
         printf("ERROR: Failed to allocate compressed_sizes array for %zu blocks\n", num_blocks);
         lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to allocate compressed sizes array");
@@ -1323,7 +1369,27 @@ size_t lz4_gpu_compress_frame_accelerated(LZ4GPUCompressor* compressor,
      * Otherwise fallback to the non-overlap path to avoid small-chunk races.
      */
     if (compressor->enable_io_overlap) {
+        /* If user explicitly requested a chunk size, honor it. Otherwise compute
+         * an adaptive default based on device compute units and local work size.
+         */
+        if (compressor->overlap_chunk_blocks > 0) {
+            chunk_blocks = compressor->overlap_chunk_blocks;
+        } else {
+            /* Adaptive default: start with 64 blocks; increase for many CUs */
+            int desired = 64;
+            if (compressor->device_compute_units > 0) {
+                desired = (int)compressor->device_compute_units * 32;
+                if (desired < 64) desired = 64;
+            }
+            chunk_blocks = desired;
+        }
+        /* Ensure chunk size does not exceed the total number of blocks */
         if ((int)num_blocks < chunk_blocks) chunk_blocks = (int)num_blocks;
+        /* Round up chunk_blocks to a multiple of work-group size for better alignment */
+        if (local_work_size > 0 && (chunk_blocks % (int)local_work_size) != 0) {
+            chunk_blocks = ((chunk_blocks + (int)local_work_size - 1) / (int)local_work_size) * (int)local_work_size;
+        }
+        if (chunk_blocks <= 0) chunk_blocks = (int)num_blocks;
         num_chunks = (int)((num_blocks + chunk_blocks - 1) / chunk_blocks);
     } else {
         num_chunks = 0;
@@ -1344,22 +1410,17 @@ size_t lz4_gpu_compress_frame_accelerated(LZ4GPUCompressor* compressor,
         }
     } else {
         /* Overlapped IO per-chunk pipeline: upload per-chunk, kernel per-chunk, download per-chunk */
-        const int IO_SLOTS = 2;
+        /* IO_SLOTS is declared at function scope; reuse below. */
         /* chunk_blocks and num_chunks were computed above; re-evaluate chunk_blocks
          * just in case num_blocks changed; keep same semantics. */
         if ((int)num_blocks < chunk_blocks) chunk_blocks = (int)num_blocks;
         num_chunks = (int)((num_blocks + chunk_blocks - 1) / chunk_blocks);
 
-        tmp_chunk_bufs = (unsigned char**)malloc(sizeof(unsigned char*) * num_chunks);
-        tmp_chunk_buf_sizes = (size_t*)malloc(sizeof(size_t) * num_chunks);
-        if (!tmp_chunk_bufs || !tmp_chunk_buf_sizes) {
-            if (tmp_chunk_bufs) free(tmp_chunk_bufs);
-            if (tmp_chunk_buf_sizes) free(tmp_chunk_buf_sizes);
-            /* chunk_input_sizes and chunk_output_sizes are not yet allocated at this point */
-            lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to allocate temporary chunk arrays");
-            return 0;
-        }
-        for (int ci = 0; ci < num_chunks; ++ci) { tmp_chunk_bufs[ci] = NULL; tmp_chunk_buf_sizes[ci] = 0; }
+        /* Use a small set of ping-pong slot buffers to reduce per-chunk mallocs
+         * and clCreateBuffer overhead. By default we use 2 slots (double-buffering). */
+        for (int s = 0; s < IO_SLOTS; ++s) { tmp_chunk_buf_slots[s] = NULL; tmp_chunk_buf_slot_sizes[s] = 0; }
+        /* Using per-slot tmp chunk buffers (IO slots) for overlapped pipeline */
+        /* tmp_chunk_bufs per chunk is no longer needed; we will reuse per-slot tmp buffers */
 
         // Precompute chunk sizes
         size_t* chunk_input_sizes = (size_t*)malloc(sizeof(size_t) * num_chunks);
@@ -1398,6 +1459,37 @@ size_t lz4_gpu_compress_frame_accelerated(LZ4GPUCompressor* compressor,
             return 0;
         }
 
+        /* Pre-allocate per-slot chunk-specific device buffers (reuse across chunks) */
+        cl_mem d_chunk_block_offsets_slots[2] = { NULL, NULL };
+        cl_mem d_chunk_output_offsets_slots[2] = { NULL, NULL };
+        cl_mem d_chunk_maxouts_slots[2] = { NULL, NULL };
+        for (int s = 0; s < 2; ++s) {
+            d_chunk_block_offsets_slots[s] = clCreateBuffer(compressor->context, CL_MEM_READ_ONLY, sizeof(cl_uint) * chunk_blocks * 2, NULL, &err);
+            if (err != CL_SUCCESS || !d_chunk_block_offsets_slots[s]) {
+                for (int ss = 0; ss < s; ++ss) { if (d_chunk_block_offsets_slots[ss]) clReleaseMemObject(d_chunk_block_offsets_slots[ss]); }
+                free(chunk_input_sizes); free(chunk_output_sizes);
+                lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create per-slot chunk block_offsets buffer");
+                return 0;
+            }
+            d_chunk_output_offsets_slots[s] = clCreateBuffer(compressor->context, CL_MEM_READ_ONLY, sizeof(cl_uint) * chunk_blocks, NULL, &err);
+            if (err != CL_SUCCESS || !d_chunk_output_offsets_slots[s]) {
+                for (int ss = 0; ss <= s; ++ss) { if (d_chunk_block_offsets_slots[ss]) clReleaseMemObject(d_chunk_block_offsets_slots[ss]); }
+                for (int ss = 0; ss < s; ++ss) { if (d_chunk_output_offsets_slots[ss]) clReleaseMemObject(d_chunk_output_offsets_slots[ss]); }
+                free(chunk_input_sizes); free(chunk_output_sizes);
+                lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create per-slot chunk output_offsets buffer");
+                return 0;
+            }
+            d_chunk_maxouts_slots[s] = clCreateBuffer(compressor->context, CL_MEM_READ_ONLY, sizeof(cl_uint) * chunk_blocks, NULL, &err);
+            if (err != CL_SUCCESS || !d_chunk_maxouts_slots[s]) {
+                for (int ss = 0; ss <= s; ++ss) { if (d_chunk_block_offsets_slots[ss]) clReleaseMemObject(d_chunk_block_offsets_slots[ss]); }
+                for (int ss = 0; ss <= s; ++ss) { if (d_chunk_output_offsets_slots[ss]) clReleaseMemObject(d_chunk_output_offsets_slots[ss]); }
+                for (int ss = 0; ss < s; ++ss) { if (d_chunk_maxouts_slots[ss]) clReleaseMemObject(d_chunk_maxouts_slots[ss]); }
+                free(chunk_input_sizes); free(chunk_output_sizes);
+                lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create per-slot chunk max_outsizes buffer");
+                return 0;
+            }
+        }
+
         cl_uint* h_offsets = (cl_uint*)malloc(sizeof(cl_uint) * chunk_blocks * 2);
         cl_uint* h_outoffs = (cl_uint*)malloc(sizeof(cl_uint) * chunk_blocks);
         cl_uint* h_maxouts = (cl_uint*)malloc(sizeof(cl_uint) * chunk_blocks);
@@ -1421,7 +1513,8 @@ size_t lz4_gpu_compress_frame_accelerated(LZ4GPUCompressor* compressor,
             if (kernel_ev_slots) free(kernel_ev_slots);
             if (read_sizes_ev_slots) free(read_sizes_ev_slots);
             if (read_blocks_ev_slots) free(read_blocks_ev_slots);
-            free(tmp_chunk_bufs); free(tmp_chunk_buf_sizes); free(chunk_input_sizes); free(chunk_output_sizes);
+            for (int s = 0; s < IO_SLOTS; ++s) { if (tmp_chunk_buf_slots[s]) { free(tmp_chunk_buf_slots[s]); tmp_chunk_buf_slots[s] = NULL; tmp_chunk_buf_slot_sizes[s] = 0; } }
+            free(chunk_input_sizes); free(chunk_output_sizes);
             lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to allocate per-chunk event arrays");
             return 0;
         }
@@ -1476,19 +1569,19 @@ size_t lz4_gpu_compress_frame_accelerated(LZ4GPUCompressor* compressor,
             /* Create chunk-specific device buffers for offsets/out offsets/max outs to avoid races when reusing
              * the global per-frame buffer across chunks. This prevents data races where later writes to the
              * global buffer can clobber data used by kernels still running for previous chunks. */
-            cl_mem d_chunk_block_offsets = clCreateBuffer(compressor->context, CL_MEM_READ_ONLY, sizeof(cl_uint) * chunk_n * 2, NULL, &err);
-            if (err != CL_SUCCESS) { lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create chunk block_offsets buffer"); free(h_offsets); free(h_outoffs); free(h_maxouts); free(h_csizes); free(chunk_input_sizes); free(chunk_output_sizes); return 0; }
+            cl_mem d_chunk_block_offsets = d_chunk_block_offsets_slots[slot];
             err = clEnqueueWriteBuffer(compressor->queue, d_chunk_block_offsets, CL_FALSE, 0, sizeof(cl_uint) * chunk_n * 2, h_offsets, 1, &upload_ev_slots[ci], &offsets_ev_local);
             if (err != CL_SUCCESS) { lz4_gpu_set_error(compressor, LZ4_GPU_UPLOAD_ERROR, "Failed to upload chunk offsets"); free(h_offsets); free(h_outoffs); free(h_maxouts); free(h_csizes); free(chunk_input_sizes); free(chunk_output_sizes); return 0; }
+            if (err != CL_SUCCESS) { lz4_gpu_set_error(compressor, LZ4_GPU_UPLOAD_ERROR, "Failed to upload chunk offsets"); free(h_offsets); free(h_outoffs); free(h_maxouts); free(h_csizes); free(chunk_input_sizes); free(chunk_output_sizes); return 0; }
             cl_event outoffs_ev_local = NULL;
-            cl_mem d_chunk_output_offsets = clCreateBuffer(compressor->context, CL_MEM_READ_ONLY, sizeof(cl_uint) * chunk_n, NULL, &err);
-            if (err != CL_SUCCESS) { clReleaseMemObject(d_chunk_block_offsets); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create chunk output_offsets buffer"); free(h_offsets); free(h_outoffs); free(h_maxouts); free(h_csizes); free(chunk_input_sizes); free(chunk_output_sizes); return 0; }
+            cl_mem d_chunk_output_offsets = d_chunk_output_offsets_slots[slot];
             err = clEnqueueWriteBuffer(compressor->queue, d_chunk_output_offsets, CL_FALSE, 0, sizeof(cl_uint) * chunk_n, h_outoffs, 1, &upload_ev_slots[ci], &outoffs_ev_local);
             if (err != CL_SUCCESS) { lz4_gpu_set_error(compressor, LZ4_GPU_UPLOAD_ERROR, "Failed to upload chunk out offsets"); free(h_offsets); free(h_outoffs); free(h_maxouts); free(h_csizes); free(chunk_input_sizes); free(chunk_output_sizes); return 0; }
+            if (err != CL_SUCCESS) { lz4_gpu_set_error(compressor, LZ4_GPU_UPLOAD_ERROR, "Failed to upload chunk out offsets"); free(h_offsets); free(h_outoffs); free(h_maxouts); free(h_csizes); free(chunk_input_sizes); free(chunk_output_sizes); return 0; }
             cl_event maxouts_ev_local = NULL;
-            cl_mem d_chunk_maxouts = clCreateBuffer(compressor->context, CL_MEM_READ_ONLY, sizeof(cl_uint) * chunk_n, NULL, &err);
-            if (err != CL_SUCCESS) { clReleaseMemObject(d_chunk_block_offsets); clReleaseMemObject(d_chunk_output_offsets); lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to create chunk max_outsizes buffer"); free(h_offsets); free(h_outoffs); free(h_maxouts); free(h_csizes); free(chunk_input_sizes); free(chunk_output_sizes); return 0; }
+            cl_mem d_chunk_maxouts = d_chunk_maxouts_slots[slot];
             err = clEnqueueWriteBuffer(compressor->queue, d_chunk_maxouts, CL_FALSE, 0, sizeof(cl_uint) * chunk_n, h_maxouts, 1, &upload_ev_slots[ci], &maxouts_ev_local);
+            if (err != CL_SUCCESS) { lz4_gpu_set_error(compressor, LZ4_GPU_UPLOAD_ERROR, "Failed to upload chunk maxouts"); free(h_offsets); free(h_outoffs); free(h_maxouts); free(h_csizes); free(chunk_input_sizes); free(chunk_output_sizes); return 0; }
             if (err != CL_SUCCESS) { lz4_gpu_set_error(compressor, LZ4_GPU_UPLOAD_ERROR, "Failed to upload chunk maxouts"); free(h_offsets); free(h_outoffs); free(h_maxouts); free(h_csizes); free(chunk_input_sizes); free(chunk_output_sizes); return 0; }
 
             cl_uint chunk_n_u32 = (cl_uint)chunk_n;
@@ -1499,6 +1592,9 @@ size_t lz4_gpu_compress_frame_accelerated(LZ4GPUCompressor* compressor,
             err |= clSetKernelArg(compressor->compress_kernel, 3, sizeof(cl_mem), &d_chunk_block_offsets);
             err |= clSetKernelArg(compressor->compress_kernel, 4, sizeof(cl_mem), &d_chunk_output_offsets);
             err |= clSetKernelArg(compressor->compress_kernel, 5, sizeof(cl_mem), &d_chunk_maxouts);
+            /* Set base index into global blockSizes so kernel writes to correct global slot */
+            int gIdxBase = (int)start_block;
+            err |= clSetKernelArg(compressor->compress_kernel, 10, sizeof(int), &gIdxBase);
             if (err != CL_SUCCESS) { lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_ARGS_ERROR, "Failed to set chunk kernel args"); free(h_offsets); free(h_outoffs); free(h_maxouts); free(h_csizes); free(chunk_input_sizes); free(chunk_output_sizes); return 0; }
 
             size_t cglobal = chunk_n; size_t clocal = local_work_size;
@@ -1527,22 +1623,24 @@ size_t lz4_gpu_compress_frame_accelerated(LZ4GPUCompressor* compressor,
                 if (csz == 0 || csz >= block_uncompressed) total_compressed_size += block_uncompressed; else total_compressed_size += csz;
             }
 
-            // Schedule a single read of the full chunk output region into temp chunk buffer; we'll assemble later
+            // Schedule a single read of the full chunk output region into per-slot tmp buffer; we'll assemble later
             if (chunk_output_sizes[ci] > 0) {
-                tmp_chunk_bufs[ci] = (unsigned char*)malloc(chunk_output_sizes[ci]);
-                tmp_chunk_buf_sizes[ci] = chunk_output_sizes[ci];
-                if (!tmp_chunk_bufs[ci]) {
+                int tmp_slot = ci % IO_SLOTS;
+                if (tmp_chunk_buf_slot_sizes[tmp_slot] < chunk_output_sizes[ci]) {
+                    if (tmp_chunk_buf_slots[tmp_slot]) { free(tmp_chunk_buf_slots[tmp_slot]); tmp_chunk_buf_slots[tmp_slot] = NULL; }
+                    tmp_chunk_buf_slots[tmp_slot] = (unsigned char*)malloc(chunk_output_sizes[ci]);
+                    tmp_chunk_buf_slot_sizes[tmp_slot] = chunk_output_sizes[ci];
+                }
+                if (!tmp_chunk_buf_slots[tmp_slot]) {
                     lz4_gpu_set_error(compressor, LZ4_GPU_BUFFER_ERROR, "Failed to allocate tmp chunk buffer");
                     free(h_offsets); free(h_outoffs); free(h_maxouts); free(h_csizes); free(chunk_input_sizes); free(chunk_output_sizes);
                     return 0;
                 }
-                HDEBUG("DEBUG: Enqueue chunk read for chunk %d slot=%d slot_input_base=%zu slot_output_base=%zu chunk_input_sz=%zu chunk_out_sz=%zu\n", ci, slot, slot_input_base, slot_output_base, chunk_input_sz, chunk_output_sizes[ci]);
-                err = clEnqueueReadBuffer(compressor->queue, compressor->output_buffer, CL_FALSE, slot_output_base, chunk_output_sizes[ci], tmp_chunk_bufs[ci], 1, &kernel_ev_slots[ci], &read_blocks_ev_slots[ci]);
+                HDEBUG("DEBUG: Enqueue chunk read for chunk %d slot=%d slot_input_base=%zu slot_output_base=%zu chunk_input_sz=%zu chunk_out_sz=%zu\n", ci, tmp_slot, slot_input_base, slot_output_base, chunk_input_sz, chunk_output_sizes[ci]);
+                err = clEnqueueReadBuffer(compressor->queue, compressor->output_buffer, CL_FALSE, slot_output_base, chunk_output_sizes[ci], tmp_chunk_buf_slots[tmp_slot], 1, &kernel_ev_slots[ci], &read_blocks_ev_slots[ci]);
                 if (err != CL_SUCCESS) { lz4_gpu_set_error(compressor, LZ4_GPU_DOWNLOAD_ERROR, "Failed to enqueue chunk read"); free(h_offsets); free(h_outoffs); free(h_maxouts); free(h_csizes); free(chunk_input_sizes); free(chunk_output_sizes); return 0; }
             } else {
                 read_blocks_ev_slots[ci] = NULL;
-                tmp_chunk_bufs[ci] = NULL;
-                tmp_chunk_buf_sizes[ci] = 0;
             }
             if (upload_ev_slots[ci]) { clReleaseEvent(upload_ev_slots[ci]); upload_ev_slots[ci] = NULL; }
             if (kernel_ev_slots[ci]) { clReleaseEvent(kernel_ev_slots[ci]); kernel_ev_slots[ci] = NULL; }
@@ -1553,9 +1651,16 @@ size_t lz4_gpu_compress_frame_accelerated(LZ4GPUCompressor* compressor,
                 if (maxouts_ev_local) { clReleaseEvent(maxouts_ev_local); maxouts_ev_local = NULL; }
                 /* Release chunk-specific device buffers; they will remain valid for queued kernels
                     as OpenCL retains object references internally until kernels finish using them. */
-                if (d_chunk_block_offsets) { clReleaseMemObject(d_chunk_block_offsets); d_chunk_block_offsets = NULL; }
-                if (d_chunk_output_offsets) { clReleaseMemObject(d_chunk_output_offsets); d_chunk_output_offsets = NULL; }
-                if (d_chunk_maxouts) { clReleaseMemObject(d_chunk_maxouts); d_chunk_maxouts = NULL; }
+                /* Do not release per-slot chunk device buffers here; they are reused per IO slot and released below */
+                (void)d_chunk_block_offsets;
+                (void)d_chunk_output_offsets;
+                (void)d_chunk_maxouts;
+        }
+        /* Release per-slot chunk device buffers */
+        for (int s = 0; s < 2; ++s) {
+            if (d_chunk_block_offsets_slots[s]) clReleaseMemObject(d_chunk_block_offsets_slots[s]);
+            if (d_chunk_output_offsets_slots[s]) clReleaseMemObject(d_chunk_output_offsets_slots[s]);
+            if (d_chunk_maxouts_slots[s]) clReleaseMemObject(d_chunk_maxouts_slots[s]);
         }
         free(h_offsets); free(h_outoffs); free(h_maxouts); free(h_csizes); free(chunk_input_sizes); free(chunk_output_sizes);
     }
@@ -1749,6 +1854,7 @@ size_t lz4_gpu_compress_frame_accelerated(LZ4GPUCompressor* compressor,
                 /* Overlapped path uses temporary chunk buffers already populated.
                 * Wait for chunk D2H read to complete then copy compressed data from tmp_chunk_bufs to frame output. */
                 int chunk_index = (int)(i / chunk_blocks);
+                int tmp_slot = chunk_index % IO_SLOTS;
                 size_t start_block = (size_t)chunk_index * chunk_blocks;
                 size_t local_pos = 0;
                 /* tmp_chunk_bufs is laid out using per-block buffer sizes (max output sizes per block),
@@ -1768,17 +1874,17 @@ size_t lz4_gpu_compress_frame_accelerated(LZ4GPUCompressor* compressor,
                     read_blocks_ev_slots[chunk_index] = NULL;
                 }
                 /* Debug: dump first bytes of the tmp chunk buffer after D2H read completes */
-                if (tmp_chunk_bufs[chunk_index] && tmp_chunk_buf_sizes[chunk_index] > 0) {
-                    size_t dump_n = tmp_chunk_buf_sizes[chunk_index] < 32 ? tmp_chunk_buf_sizes[chunk_index] : 32;
+                if (tmp_chunk_buf_slots[tmp_slot] && tmp_chunk_buf_slot_sizes[tmp_slot] > 0) {
+                    size_t dump_n = tmp_chunk_buf_slot_sizes[tmp_slot] < 32 ? tmp_chunk_buf_slot_sizes[tmp_slot] : 32;
                     HDEBUG("DEBUG: Chunk %d tmp buffer first %zu bytes: ", chunk_index, dump_n);
-                    for (size_t db = 0; db < dump_n; ++db) HDEBUG("%02x ", tmp_chunk_bufs[chunk_index][db]);
+                    for (size_t db = 0; db < dump_n; ++db) HDEBUG("%02x ", tmp_chunk_buf_slots[tmp_slot][db]);
                     HDEBUG("\n");
                 }
                 /* Debug: log some bytes prior to copy (to detect any corruption) */
-                if (tmp_chunk_bufs[chunk_index]) {
+                if (tmp_chunk_buf_slots[tmp_slot]) {
                     size_t p_dump = csz < 8 ? csz : 8;
                     HDEBUG("DEBUG: Copying compressed block %zu from tmp_chunk[%d] + %zu -> frame_pos=%zu, size=%zu (first %zu bytes): ", i, chunk_index, local_pos, frame_pos, csz, p_dump);
-                    for (size_t bb = 0; bb < p_dump; ++bb) HDEBUG("%02x ", tmp_chunk_bufs[chunk_index][local_pos + bb]);
+                    for (size_t bb = 0; bb < p_dump; ++bb) HDEBUG("%02x ", tmp_chunk_buf_slots[tmp_slot][local_pos + bb]);
                     HDEBUG("\n");
                 }
                 /* Pre-copy bytes at destination for comparison */
@@ -1788,7 +1894,7 @@ size_t lz4_gpu_compress_frame_accelerated(LZ4GPUCompressor* compressor,
                     for (size_t bb = 0; bb < pdd; ++bb) HDEBUG("%02x ", (unsigned int)frame_output[frame_pos + bb]);
                     HDEBUG("\n");
                 }
-                memcpy(frame_output + frame_pos, tmp_chunk_bufs[chunk_index] + local_pos, csz);
+                memcpy(frame_output + frame_pos, tmp_chunk_buf_slots[tmp_slot] + local_pos, csz);
                 /* Debug: print few bytes after copy */
                 {
                     size_t pda = csz < 8 ? csz : 8;
@@ -1988,14 +2094,7 @@ size_t lz4_gpu_compress_frame_accelerated(LZ4GPUCompressor* compressor,
 
     // Free temporary chunk buffers used in overlapped mode
     if (compressor->enable_io_overlap) {
-        if (tmp_chunk_bufs) {
-            for (int ci = 0; ci < num_chunks; ++ci) {
-                if (tmp_chunk_bufs[ci]) free(tmp_chunk_bufs[ci]);
-            }
-            free(tmp_chunk_bufs);
-            tmp_chunk_bufs = NULL;
-        }
-        if (tmp_chunk_buf_sizes) { free(tmp_chunk_buf_sizes); tmp_chunk_buf_sizes = NULL; }
+        for (int s = 0; s < 2; ++s) { if (tmp_chunk_buf_slots[s]) { free(tmp_chunk_buf_slots[s]); tmp_chunk_buf_slots[s] = NULL; tmp_chunk_buf_slot_sizes[s] = 0; } }
         // Release per-chunk events
         if (upload_ev_slots) { free(upload_ev_slots); upload_ev_slots = NULL; }
         if (kernel_ev_slots) { free(kernel_ev_slots); kernel_ev_slots = NULL; }
@@ -2378,8 +2477,11 @@ size_t lz4_gpu_decompress_frame(LZ4GPUCompressor* compressor,
     if (err != CL_SUCCESS) { clReleaseKernel(k_size); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_ARGS_ERROR, "Failed to set size-only kernel args"); return 0; }
 
     size_t gws = ncb;
-    size_t lws = compressor->default_local;
-    if (lws == 0) lws = 1;
+    size_t lws = compressor->local_size;
+    if (lws == 0) {
+        lws = compute_device_default_local(compressor);
+        if (lws == 0) lws = 1;
+    }
     if (compressor->device_max_work_group_size > 0 && lws > compressor->device_max_work_group_size) lws = compressor->device_max_work_group_size;
     if (lws > gws) lws = gws;
     size_t gws_rounded = gws;
@@ -2524,8 +2626,11 @@ size_t lz4_gpu_decompress_frame(LZ4GPUCompressor* compressor,
     if (err != CL_SUCCESS) { clReleaseKernel(k_multi); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); clReleaseMemObject(d_out_offsets); clReleaseMemObject(d_max_outsizes); clReleaseMemObject(d_sizes_out2); free(h_comp_offsets); free(h_comp_sizes); free(h_sizes_out); free(h_comp_block_index); free(h_output_offsets); free(h_out_offsets); free(h_max_outsizes); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_ARGS_ERROR, "Failed to set multi-block kernel args"); return 0; }
 
     gws = ncb;
-    lws = compressor->default_local;
-    if (lws == 0) lws = 1;
+    lws = compressor->local_size;
+    if (lws == 0) {
+        lws = compute_device_default_local(compressor);
+        if (lws == 0) lws = 1;
+    }
     if (compressor->device_max_work_group_size > 0 && lws > compressor->device_max_work_group_size) lws = compressor->device_max_work_group_size;
     if (lws > gws) lws = gws;
     gws_rounded = gws;
@@ -2850,8 +2955,11 @@ size_t lz4_gpu_estimate_decompressed_size(LZ4GPUCompressor* compressor,
     if (err != CL_SUCCESS) { clReleaseKernel(k_size); clReleaseMemObject(d_comp_offsets); clReleaseMemObject(d_comp_sizes); clReleaseMemObject(d_sizes_out); lz4_gpu_set_error(compressor, LZ4_GPU_KERNEL_ARGS_ERROR, "Failed to set size-only kernel args"); goto fail; }
 
     size_t gws = ncb;
-    size_t lws = compressor->default_local;
-    if (lws == 0) lws = 1;
+    size_t lws = compressor->local_size;
+    if (lws == 0) {
+        lws = compute_device_default_local(compressor);
+        if (lws == 0) lws = 1;
+    }
     if (compressor->device_max_work_group_size > 0 && lws > compressor->device_max_work_group_size) lws = compressor->device_max_work_group_size;
     if (lws > gws) lws = gws;
     size_t gws_rounded = gws;
@@ -2998,7 +3106,9 @@ size_t lz4_gpu_decompress_block(LZ4GPUCompressor* compressor,
 
     // Launch kernel
     size_t work_size = 1; // global size (1 block)
-    size_t local = compressor->default_local;
+    size_t local = compressor->local_size;
+    if (local == 0) local = compute_device_default_local(compressor);
+    if (local == 0) local = 1;
     if (local == 0) local = 1;
     if (compressor->device_max_work_group_size > 0 && local > compressor->device_max_work_group_size) local = compressor->device_max_work_group_size;
     if (local > work_size) local = work_size;
