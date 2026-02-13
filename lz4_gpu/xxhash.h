@@ -301,7 +301,7 @@ struct XXH32_state_s {
 #   ifndef XXH_NO_LONG_LONG  /* remove 64-bit support */
 struct XXH64_state_s {
    unsigned long long total_len;
-    unsigned long long v1;
+   unsigned long long v1;
    unsigned long long v2;
    unsigned long long v3;
    unsigned long long v4;

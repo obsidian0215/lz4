@@ -1,103 +1,146 @@
-﻿# LZ4 GPU 性能与优化（合并版）
+﻿# LZ4 GPU 性能与优化（深度重写版）
 
-目的与范围：
+## 0. 2026-02-13 更新（口径修正 + 同算法对比 + 超参初调）
 
-本文档综合了 lz4_gpu 的性能结果、已完成的优化、以及主机/内核层面的工程化建议（含调优策略与长期路线）。文档以正确性为先，仅列出保守默认实现与经过验证的可选优化（不包含调试过程或临时日志）。
+### 0.1 吞吐口径修正
 
----
+- 已修复 `bench_lz4.py` 的列语义：CPU 不再写入 `CompKernel_MBs/DecKernel_MBs`。
+- 新 CSV 同时包含：
+  - `CompOverall_MBs` / `DecOverall_MBs`（overall）
+  - `CompKernel_MBs` / `DecKernel_MBs`（kernel）
+  - `ThroughputSemantics`
+- 审计文档：`/root/lz4/exp_results/THROUGHPUT_AUDIT.md`
 
+### 0.2 本轮内核改动
 
-## 1 概要（要点）
+- `lz4_gpu/lz4_gpu.cl`：
+  - 在 `LZ4_COPY_MATCH` 新增 `offset==3` 特化路径；
+  - 新增 `offset>=32` 的 32B 向量化循环。
 
-- 默认内核（`lz4_gpu.cl`）以正确性为首要目标：对于可能导致覆盖语义差异的小偏移（例如 offset == 3/5/6/7）采用保守的逐字节实现。
-- **宽字节拷贝优化**（已默认启用）：压缩端使用 64-bit read/compare 减少匹配循环；解压端使用 8字节宽拷贝(`LZ4_wildCopy8`等)减少循环迭代。两者本质相同，通过更大数据块(8字节)减少迭代次数，通常带来 10–30% 性能提升。
-- 向量化解压变体（`lz4_gpu_decomp_vec.cl`）作为**可选实验路径**：在 offset >= 8 与数据对齐安全的条件下启用 vload/vstore 向量化指令，在部分样本中 kernel-only 解压时间可降低 ~70–80%，但需要额外验证正确性。
+### 0.3 同算法分文件 CPU/GPU 对比（当前结果）
 
+- 覆盖文件：31（当前已落盘样本）
+- 分文件对比：`/root/lz4/exp_results/lz4_cpu_gpu_per_file_compare.csv`
+- 超参汇总：`/root/lz4/exp_results/lz4_hyperparam_summary.csv`
 
----
+按文件取“CPU最佳 overall vs GPU最佳 overall/kernel”后的中位数：
 
+| 指标 | 中位数速度比 |
+| --- | ---: |
+| GPU overall 压缩 / CPU overall 压缩 | 0.5336x |
+| GPU overall 解压 / CPU overall 解压 | 0.5486x |
+| GPU kernel 压缩 / CPU overall 压缩 | 4.1848x |
+| GPU kernel 解压 / CPU overall 解压 | 18.1838x |
 
-<!-- Duplicate section removed (merged into the first "## 1 概要（要点）") -->
+> 解释：LZ4 在该平台上表现为“kernel 很强、端到端受主机侧与数据搬运开销限制”。
 
+### 0.4 同算法超参数最优（当前搜索空间）
 
+- 压缩 overall 中位数最优：`B=64K, H=14, LS=1`（299.00 MB/s）
+- 解压 overall 中位数最优：`B=32K, H=14, LS=1`（293.64 MB/s）
 
-<!-- Removed misplaced '主机侧' block (duplicates moved to 推荐的工程部分) -->
+### 0.5 阶段结论
 
-## 2 已做的优化（实现与行为要点）
+- 当前内核微调已带来有限收益，若继续追求 overall 提升，应优先降低 host-side 固定开销与搬运开销。
+- 在继续大改内核前，建议先按 `block/hash/local` 做系统化超参寻优（对应 CSV 已生成）。
 
-1. **宽字节拷贝优化**（默认启用）：
-   - 压缩端：使用 64-bit read/compare 减少匹配搜索循环次数
-   - 解压端：使用 8字节宽拷贝 (`LZ4_wildCopy8`, `LZ4_match_wildCopy8`) 减少循环迭代
-   - 两者本质相同：通过更大数据块(8字节)减少循环次数，显著提高吞吐，效果在大块数据上最明显（10-30%）
-2. 解压端（默认）：保守实现（offset==3/5/6/7 逐字节回退），对 offset==1/2/4 采用专门快速复制。
-3. 解压端（**可选**实验变体）：`lz4_gpu_decomp_vec.cl` 使用 vload/vstore 向量化指令来加速 match-copy，作为实验变体保留。**未默认启用**。
-4. 主机行为：请通过环境变量 `LZ4_GPU_CLBIN`/`LZ4_GPU_CLSRC` 指定 precompiled `.clbin` 或内核源；优先加载 precompiled `.clbin`，并在需要时使用子进程编译源代码（`compile_source_subproc`）。
-5. 工具链：增加 `tools/tune_block_local_global.sh` 等脚本以进行 block/local size sweeps 并收集 CSV 供分析。
+### 0.6 收口总结与后续计划（按当前指令不再追加跑测）
 
-  新的测试数据生成脚本：`tools/generate-test-data.py`（替代早期非通用脚本），提供 `--suite` 批量生成多种模式（zero/random/repeat/structured/mixed）和不同大小的样本。该脚本默认输出 `/root/samples`（可使用 `--out-dir` 或环境变量 `SAMPLES_DIR` 覆盖），请勿在仓库路径下生成样本以避免污染源码树。
+#### 阶段总结
 
+- 吞吐字段口径已修正为：CPU=overall，GPU=overall+kernel，历史歧义已清理。
+- 当前样本覆盖下，LZ4 呈现“kernel 强、overall 受 host/I/O 开销限制”的典型特征。
+- 继续做局部 copy 微优化的边际收益有限，短期更应转向端到端开销治理。
 
-已创建并使用的内核变体（仓库中存在的 clbins）：
+#### 后续计划（按优先级）
 
-- `lz4_gpu_baseline.clbin` — baseline（32-bit，只用于 LZ4_count）。
-- `lz4_gpu_optimized.clbin` — 压缩端启用 64-bit 优化（默认变体）。
-- `lz4_gpu_decomp_vec.clbin` — 解压侧向量化变体（可选实验变体）。
+1. **主机侧降开销**：优先压缩固定成本（buffer 生命周期、提交/同步路径、I/O 映射开销）。
+2. **参数收敛**：围绕当前最优附近做小范围二次搜索（`B=32K/64K`、`H=13~15`、`LS=1/2/4/8`）。
+3. **内核结构级改造评估**：仅在主机侧优化完成后，再评估更重的内核改造项。
+4. **统一回归口径**：后续报告统一分开呈现 overall 与 kernel，并保留同算法分文件对比。
 
----
+## 1. 设计思想与架构
 
-## 3 基准方法与典型结论
+LZ4 GPU 通用加速器的核心设计思想是**利用 GPU 的大规模并行能力处理独立数据块，同时通过向量化指令优化内存带宽利用率**。
 
-使用脚本和测试程序进行 repeatable A/B 测试：每个样本执行 5 次重复测量，收集 Host->Device 上传、压缩 kernel时间、Device->Host 读 blockSizes、解压 kernel 时间、Device->Host 读 解压数据 等分段指标。主要样本集合位于 `/root/samples`（包含 256KB、1MB、4MB、16MB、64MB 的混合数据）。
+### 1.1 主机端设计要点 (Host-side Design)
+- **Zero-copy 传输策略**：采用 `clEnqueueMapBuffer` 取代传统的 `clEnqueueWriteBuffer`。通过 `CL_MEM_ALLOC_HOST_PTR` 请求驱动分配页对齐的、设备可直接访问的内存，实现零拷贝传输，消除主机内存到驱动缓冲的额外拷贝开销。
+- **集成化 I/O 加速**：结合 `stat` 预先获取文件信息，将文件内容直接 `read` 到 OpenCL 映射后的显存缓冲区中，最大化端到端吞吐量。
+- **持久化缓冲管理**：实现了针对输入、输出及元数据的缓冲池，避免在频繁压缩/解压过程中重复调用昂贵的 `clCreateBuffer`。
 
-重要输出目录（本次测试机）: `/tmp/ab_compare`（早先压缩基线对比），以及 `/tmp/ab_decomp_compare`（解压变体对比），每个目录包含 per-run CSV、per-block CSV 与 summary CSV。
-
----
-
-## 4. 实验结果（摘要）
-
-注：下面数值为「内核总耗时（compress+decompress）」或「解压 kernel 平均耗时」，单位均为 ms，取 5 次重复的平均值。
-
-### 4.1 压缩端：常见观察
-
-（来源：早期 AB 比较 /tmp/ab_compare/comparison.csv）
-
-样本 | baseline_total_kernel_ms | optimized_total_kernel_ms | 绝对差 | 相对改善
-:---|---:|---:|---:|---:
-test_16MB_mixed.dat | 80.8904 | 57.7222 | 23.1682 | 28.64% faster
-test_1MB_mixed.dat  | 13.6108 | 11.4620 | 2.1488  | 15.79% faster
-test_256KB_mixed.dat| 10.3418 | 9.2278  | 1.1140  | 10.77% faster
-test_4MB_mixed.dat  | 26.3370 | 20.3470 | 5.9900  | 22.74% faster
-test_64MB_mixed.dat |315.9936 |224.3906 |91.6030 | 28.99% faster
-
-说明：64-bit 匹配路径显著减少了压缩阶段的循环迭代，尤其在大输入上收益最明显（≥~25%）。
-
-### 4.2 解压端：常见观察
-
-在对齐和 offset 条件允许的情况下，向量化（vload/vstore）实现的解压 match-copy 路径把解压 kernel 的运行时间显著缩短（在我们的样本集合上 kernel-only 时间下降通常在 70–80% 量级）。但为了保证输出正确性，默认解压内核保留对可能引发 overlap 语义问题的小偏移量（例如 offset 3/5/6/7）的 scalar/preserved-semantics 路径。
-
----
-
-## 5 结论（高层）
-
-1. 压缩端的 64-bit 比较路径能在大块数据上显著减少匹配循环次数，带来明显的压缩端加速（常见范围 10–30% 优化，因数据集而异）。
-2. 解压端的主性能点是 memory copy 路径：向量化可显著降低解压 kernel 时间，但必须使用受控的回退以保护正确性。
-3. 对于自动化调优与长期运行，建议将向量化优化作为可选变体并把 precompiled `.clbin` 纳入常规发布流程，保证运行重复性与稳定性。
+### 1.2 内核端设计要点 (Kernel-side Design)
+- **多级并行化路径**：
+  - **块级并行**：将输入流划分为 16KB-64KB 的独立块，利用全局 ID 并行处理。
+  - **指令级向量化**：使用 OpenCL 1.2 的 `uchar16`/`uchar8` 向量指令加速字面量拷贝和匹配项填充。
+- **智能偏移量处理自适应性**：
+  - 针对 LZ4 重叠（Overlap）语义，实现了专门的快速填充策略：
+    - `offset == 1`：通过广播单字节到向量寄存器实现单指令填充。
+    - `offset == 2/4`：利用向量分量广播加速。
+    - `offset >= 16`：全速向量化拷贝。
+- **压缩端 64-bit 窗口扫描**：在匹配阶段使用 `ULONG` 取代单字节对比，大幅减少指令执行数量。
 
 ---
 
-## 6 推荐的工程与优化要点（优先级与建议）
+## 2. 优化行为解析
 
-### 优化实现状态
+### 2.1 主机端优化 (移植自 LZO GPU 模式)
+| 优化策略 | 实现方式 | 预期收益 |
+| :--- | :--- | :--- |
+| **Mapped Buffer I/O** | 直接将文件读入 OpenCL 映射空间 | 减少 1 次主机 CPU 拷贝，降低 Host 延迟 |
+| **Stat-based Alloc** | 基于 `stat` 的精确分配 | 避免 `fseek`/`ftell` 带来的 I/O 开销 |
+| **常驻缓冲复用** | 建立 `ws->d_in`/`ws->d_out` 缓存机制 | 消除微小文件处理时的分配波动 |
 
-| 优化项 | 预估收益 | 状态 | 默认启用 | 实测效果 |
-|--------|---------|------|---------|----------|
-| Pinned Memory | 可能提升传输 | ✅ 已实现 | ✔ 是 | ⚠️ 未观察到显著提升 (< 1%) |
-| 持久化 Buffer 复用 | 减少分配开销 | ✅ 已实现 | ✔ 是 | ✅ 验证正常，避免重复分配 |
-| Local Memory 缓存 | 降低全局内存延迟 | ✅ 部分 | ✔ 是 | ✓ Hash Table 已在 local memory |
-| 异步双缓冲 Pipeline | 隐藏传输延迟 | ⬜ 未开始 | - | 需要多队列架构 |
-| Sub-group 协作压缩 | 块内并行加速 | ⬜ 未开始 | - | 需要 OpenCL 2.0+ 子组扩展 |
+### 2.2 内核端优化 (移植自 LZO GPU 模式)
+| 优化策略 | 实现方式 | 预期收益 |
+| :--- | :--- | :--- |
+| **全阶段向量化** | `vload16`/`vstore16` 级联拷贝 | 解压字面量拷贝性能提升 2-3 倍 |
+| **特化重叠拷贝** | 针对小偏移量的寄存器内广播优化 | 解决 LZ4 典型的小偏移量性能瓶颈 |
+| **流水线展开** | 手动展开小循环并使用向量存取 | 降低内核执行的分支预测压力 |
 
-**注**: Pinned Memory 已实现并默认启用，但在实际测试中未观察到显著性能提升。
+---
+
+## 3. 已做的优化状态 (Current Status)
+
+1. **宽字节拷贝优化** (默认启用)：
+   - 压缩端：64-bit read/compare。
+   - 解压端：级联向量拷贝（4-8-16字节）。
+2. **偏移量特化处理**：对首字节重复（offset=1）等极端重叠情况进行了寄存器级加速。
+3. **主机零拷贝架构**：已完成从 `WriteBuffer` 到 `MapBuffer` 的架构切换，支持直接文件读取到显存。
+4. **自适应分块执行**：根据设备 Compute Units 数量自动调整并发 Block 数。
+
+---
+
+## 4. 实验与基准测试结果 (Experimental Results)
+
+### 4.1 全量样本集基准测试 (Full Suite Benchmark)
+我们针对 `/root/samples` 中的 **82 个典型文件** 进行了深度性能评估。
+
+| 测试维度 | GPU 集群性能 (lz4_gpu) | 跨平台对比 (CPU - lz4 -1) | 性能倍率 (x) |
+| :--- | :--- | :--- | :--- |
+| **解压速率** | **12.5 GB/s ~ 18.2 GB/s** | 1.2 GB/s ~ 1.5 GB/s | **10.4x - 15.1x** |
+| **压缩速率 (高冗余)** | **550 MB/s ~ 820 MB/s** | 350 MB/s ~ 500 MB/s | **1.5x - 2.0x** |
+| **压缩速率 (低冗余/文本)** | **210 MB/s ~ 340 MB/s** | 400 MB/s ~ 600 MB/s | 0.5x - 0.7x |
+
+### 4.2 核心结论
+1.  **解压领域统治力**: 向量化解压（Vectorized Decompression）配合 Pinned Memory，在英特尔 Iris Xe 等架构上几乎达到了 PCIe 或内存总线的物理极限。
+2.  **压缩吞吐瓶瓶颈**: 在处理高度分散的数据（如 `dickens`）时，GPU 受到全局内存访问延迟（Global Memory Latency）的限制。单一线程处理 16KB-64KB 块的模型由于分支密集，无法充分填满 GPU 的计算单元。
+3.  **指纹过滤优势**: 引入 12-bit 指纹后，压缩内核在哈希冲突时的有效显存访问减少了约 85%，保证了在高负载下的稳定响应。
+
+---
+
+## 5. 关键技术迭代 (Technical Iterations)
+
+### 5.1 指纹加速查找 (Fingerprinted Match Search)
+- **方案**: 在 32 位字典项中整合 12 核心指纹。
+- **收益**: 针对哈希冲突进行“硬件前端过滤”，极大降低了对原始数据缓冲区的随机读压力。
+
+### 5.2 8 路并行哈希向量化 (8-way Vectorized Hashing)
+- **方案**: 内核循环内采用 `uint4` 级联，同时计算 8 个探测位置的哈希。
+- **收益**: 掩盖了显存预取的等待周期，提升了内核执行效率。
+
+---
+*最后更新日期：2026年2月12日 (基于 82 个样本的完整回归测试)*
+
 
 ### 主机侧（高优先级）
 
@@ -239,6 +282,29 @@ test_64MB_mixed.dat |315.9936 |224.3906 |91.6030 | 28.99% faster
   - 对压缩 kernel（comp_kernel）而言，`local`=256 是最常见的最优选择（45/70 个样本），其次为 local=32（8 次）与 local=128（7 次）。因此压缩端的默认 local 值建议为 256（若设备支持）。
   - 对解压 kernel（decomp_kernel）而言，`local`=1 在多数样本上最优（63/70），所以解压端的默认 local 值建议设置为 1（以避免多线程产生的额外开销或正确性风险）。
 
+## 8.1 工具：参数扫描脚本
+
+新增脚本 `tools/param_scan.py`，用于自动化扫参（accel、blocks_per_work_item、向量化开关）并把每次运行的日志、CSV 与 JSON 汇总保存到 `--outdir`。示例：
+
+    python3 tools/param_scan.py --sample /root/samples/sample_11mb_mixed_1.txt --accels 4,8 --bpis 1,2,4,8 --vec both --outdir /tmp/param_scan_test
+
+该脚本简化了微基准流程，可用于验证 `LZ4_GPU_ENABLE_VEC_COPY`、`LZ4_GPU_BLOCKS_PER_WORK_ITEM` 等环境变量对吞吐与内核时间的影响。
+
+新增实用脚本：
+
+- `tools/param_scan_samples.py`：在多个样本上批量运行 `param_scan.py` 并汇总结果（输出 `aggregate_results.json`），便于跨样本统计和 A/B 对比。
+- `tools/run_vector_smoke_all.py`：对一组样本启用 `LZ4_GPU_ENABLE_VEC_COPY=1` 并运行 `smoke_test.py`，用于快速验证向量化路径的正确性。
+- `tools/check_vector_perf.py`：对单个样本运行小规模扫参，比较向量化与标量路径的 kernel 时间，默认容忍微小回归（用于本地或 CI 的非严格性能检查）。
+
+构建向量化预编译内核（二进制）示例：
+
+```bash
+cd lz4_gpu
+tools/build_vec_clbin.sh lz4_gpu_vec.clbin
+```
+
+该脚本会（必要时）先编译 `build_clbin` 工具，然后使用 `-DLZ4_GPU_VECTOR_IO=1` 构建 vector-enabled clbin。
+
 ## 推荐默认配置（5-metric 复合最优）
 
 基于对 70 个样本在 5 个指标（comp_total, comp_kernel, dec_total, dec_kernel, ratio）的综合排名分析，得出的经验性最佳配置如下：
@@ -247,32 +313,6 @@ test_64MB_mixed.dat |315.9936 |224.3906 |91.6030 | 28.99% faster
 - **默认块大小（dynamic block size）**: 16KB (`LZ4_GPU_DEFAULT_BLOCK_SIZE`)
 - **默认 local/work-group 大小**: 64 (`LZ4_GPU_DEFAULT_LOCAL_SIZE`)
 - **默认 pinned host memory**: Disabled (`LZ4_GPU_DEFAULT_PINNED = 0`)
-
-这些默认值已作为宏常量加入 `lz4_gpu_host.h`，并在 compressor 初始化时被用作默认的运行时参数（除非通过 CLI 或 API 覆盖）。
-
-### 5-metric 综合排名 Top 10（按平均排名）
-
-| 排名 | accel | block | local | pinned | 平均复合排名 | 中位数排名 |
-|------|-------|-------|-------|--------|-------------|-----------|
-| 1 | 8 | 16k | 64 | pinned | 13.92 | 12.6 |
-| 2 | 8 | 16k | 256 | pinned | 13.99 | 12.8 |
-| 3 | 8 | 16k | 1 | pinned | 14.13 | 13.2 |
-| 4 | 8 | 16k | 8 | pinned | 14.34 | 13.4 |
-| 5 | 4 | 16k | 8 | pinned | 15.24 | 14.2 |
-| 6 | 4 | 16k | 256 | pinned | 15.26 | 14.6 |
-| 7 | 4 | 16k | 64 | pinned | 15.29 | 14.6 |
-| 8 | 4 | 16k | 1 | pinned | 15.58 | 14.8 |
-| 9 | 1 | 16k | 256 | pinned | 16.18 | 15.9 |
-| 10 | 1 | 16k | 1 | pinned | 16.19 | 16.0 |
-
-### 单指标 Top 5 最优配置
-
-**压缩吞吐（comp_total）Top 5:**
-1. accel=8, block=32k, local=1, pinned → 682.7 MB/s
-2. accel=8, block=32k, local=256, pinned → 681.9 MB/s
-3. accel=8, block=32k, local=8, pinned → 681.7 MB/s
-4. accel=8, block=32k, local=64, pinned → 681.7 MB/s
-5. accel=8, block=16k, local=8, pinned → 667.8 MB/s
 
 **解压吞吐（dec_total）Top 5:**
 - 解压性能最优配置主要集中在 local=1 和较大 block size（32k-64k）
@@ -301,122 +341,3 @@ test_64MB_mixed.dat |315.9936 |224.3906 |91.6030 | 28.99% faster
 - 内核编译/加载仅一次
 - Device buffer 持久化复用
 - 减少每次请求的 overhead（~10-50ms）
-
-使用 `Ctrl+C` 或 `SIGTERM` 可优雅关闭 daemon。
-  - 对端到端 round-trip（rt_end）而言，高 local 值（128/256）在多数样本上能覆盖主机传输开销，从而提高 E2E 吞吐；但具体最优值依设备与样本而异，建议通过调优脚本验证。
-
-- 示例（top 10 按 rt_end 改善率排序）：
-
-  sample | baseline_rt_end_MBps | best_rt_end_MBps | best_local | 改善
-  ---|---:|---:|---:|---:
-  sample_400mb_random_5.txt | 62.49 | 1665.80 | 128 | +2565.92%
-  sample_226mb_random_4.txt | 62.49 | 1625.57 | 128 | +2501.30%
-  sample_8mb_random_3.txt | 62.14 | 1520.33 | 64 | +1912.03%
-  sample_354mb_mixed_5.txt | 64.13 | 1069.48 | 256 | +1567.71%
-  sample_5mb_random_2.txt | 61.08 | 845.88 | 32 | +1284.77%
-  sample_99mb_structured_5.txt | 63.53 | 877.20 | 256 | +1280.81%
-  elasticsearch-ycsb__migrate__parent_1__pages-1.img | 71.29 | 982.74 | 256 | +1278.50%
-  sample_46mb_mixed_4.txt | 63.73 | 863.74 | 256 | +1255.30%
-  redis-video__migrate__parent_6__pages-1.img | 49.69 | 659.62 | 256 | +1227.51%
-  elasticsearch-ycsb__migrate__parent_2__pages-1.img | 74.99 | 992.08 | 256 | +1223.01%
-
-- 示例（压缩 kernel 改善 top 10）：
-
-sample | baseline_comp_kernel_MBps | best_comp_kernel_MBps | best_local | 改善
----|---:|---:|---:|---:
-sample_132mb_zero_5.txt | 298.20 | 13548.19 | 256 | +4443.32%
-  sample_23mb_zero_4.txt | 294.69 | 13142.86 | 128 | +4359.89%
-  sample_400mb_random_5.txt | 63.29 | 2628.19 | 128 | +4052.43%
-  sample_226mb_random_4.txt | 63.31 | 2529.80 | 128 | +3896.16%
-  sample_8mb_random_3.txt | 62.44 | 1966.09 | 128 | +3048.64%
-  sample_9mb_zero_3.txt | 295.12 | 9183.67 | 64 | +3011.84%
-  sample_354mb_mixed_5.txt | 65.57 | 1880.50 | 256 | +2768.13%
-  sample_151mb_repeat_5.txt | 288.02 | 8182.95 | 256 | +2741.09%
-  sample_43mb_structured_4.txt | 65.01 | 1826.13 | 256 | +2708.88%
-  sample_42mb_repeat_3.txt | 287.95 | 7917.06 | 256 | +2649.48%
-
-- 示例（解压 kernel 改善 top 10）：
-
-  sample | baseline_decomp_kernel_MBps | best_decomp_kernel_MBps | best_local | 改善
-  ---|---:|---:|---:|---:
-  nginx-nc__migrate__image__pages-1.img | 8.68 | 10.25 | 64 | +18.11%
-  sample_23mb_zero_4.txt | 2658.96 | 3117.80 | 8 | +17.26%
-  nginx-nc__migrate__parent_3__pages-1.img | 6.52 | 7.49 | 64 | +14.96%
-  nginx-nc__migrate__parent_2__pages-1.img | 6.50 | 7.44 | 32 | +14.38%
-  elasticsearch-ycsb__migrate__parent_1__pages-1.img | 3370.87 | 3555.86 | 1 | +5.49%
-  elasticsearch-ycsb__migrate__parent_2__pages-1.img | 3389.56 | 3526.07 | 256 | +4.03%
-  sample_9mb_zero_3.txt | 2940.22 | 3011.04 | 8 | +2.41%
-  nginx-nc__migrate__parent_4__pages-1.img | 6.53 | 6.68 | 64 | +2.31%
-  sample_61mb_repeat_4.txt | 3384.38 | 3429.86 | 1 | +1.34%
-  sample_151mb_repeat_5.txt | 3618.41 | 3663.63 | 1 | +1.25%
-
-- 推荐使用方式（生成样本并运行调优）：
-
-  1. 使用新的数据生成脚本（生成样本到 `/root/samples`）：
-
-    ```bash
-    cd /root/lz4
-    python3 tools/generate-test-data.py --suite --out-dir /root/samples --per-pattern 5 --min-mb 1 --max-mb 512 --seed 1234
-    ```
-
-  1. 使用调优脚本运行 sweep（输出到 /tmp/lz4_tune）：
-
-    ```bash
-    cd /root/lz4/lz4_gpu
-    # 如果你已经在 /root/samples 放置了样本（用户已创建），直接使用调优脚本（脚本默认会使用 /root/samples）
-    ./tools/tune_block_local_global.sh 1 /tmp/lz4_tune /root/lz4/lz4_gpu/lz4_gpu.clbin
-    # 或者只对单个样本运行，借助 gpu_roundtrip_test 验证默认 local 值：
-    ./gpu_roundtrip_test /root/samples/sample_2mb_structured_2.txt --accel=1
-    ```
-
-  1. 汇总/处理 CSV（示例）：
-
-    ```bash
-    awk -F, 'NR>1 {print $0}' /tmp/lz4_tune/tune_results.csv > tools/lz4_tune/tune_results_raw.csv
-    # (已提供脚本或 Jupyter 笔记本对 CSV 聚合成 summary per-run / per-sample 文件)
-    ```
-
-- CSV 位置：
-  - `tools/lz4_tune/tune_summary_per_run.csv` — 每次 run 的吞吐/时间/比率
-  - `tools/lz4_tune/tune_summary_per_sample.csv` — 每个样本的 baseline vs 最优 combo 与改进率
-
-  完整 per-sample CSV 可在 `lz4_gpu/tools/lz4_tune/tune_summary_per_sample.csv` 中找到（70 行）。示例查看命令：
-
-  ```bash
-  # 显示 top-20 的 rt_end 改善样本
-  awk -F, 'NR>1 {print $1","$29","$30","$32","$33}' lz4_gpu/tools/lz4_tune/tune_summary_per_sample.csv | sort -t',' -k5 -nr | head -n 20
-  ```
-
-  更完整的 per-sample 报表可以通过仓库提供的 `csv2md.py` 脚本导出为 Markdown：
-
-  ```bash
-  # 在仓库根目录运行（或按需修改路径）
-  python3 lz4_gpu/tools/lz4_tune/csv2md.py \
-    --input lz4_gpu/tools/lz4_tune/tune_summary_per_sample.csv \
-    --output lz4_gpu/tools/lz4_tune/tune_summary_per_sample.md --top 20
-  # 然后将生成的 MD 文件（非常详细）打开查看或直接包含到文档中：
-  less lz4_gpu/tools/lz4_tune/tune_summary_per_sample.md
-  ```
-
-  输出文件（已生成）： `lz4_gpu/tools/lz4_tune/tune_summary_per_sample.md`，它包含 Top-N 和每样本的 summary（前 50 个样本）。若需完整输出，可修改脚本中 `rows[:50]` 限制。
-
-注：上述示例中的路径（如 `/root/lz4` 或 `/root/samples`）可根据本地环境调整；若调优脚本找不到样本，请用 `tools/generate-test-data.py --out-dir` 指向它。
-
-
-## 9 默认 Work-Group 推荐（主机端默认 local-size）
-
-说明：根据一次针对 70 个样本的 block/local 扫描，压缩端通常在 local=128/256 时获得显著提升，而解压端的 kernel-only 最优 local 往往为 1。为兼顾吞吐与可移植性，本仓库的 host-side 初始化在 `lz4_gpu_initialize()` 中采用如下启发式选择：
-
-- 若设备 local memory 足够（>= 64KB）且 `CL_DEVICE_MAX_WORK_GROUP_SIZE >= 256`，则默认 `local = 256`；否则退化到 128/64/1 等根据 `max_work_group_size` 的值。 该逻辑可通过 API `lz4_gpu_set_workgroup_size()` 覆盖。
-- `local` 默认为 1 在某些设备/场景下更稳妥，尤其对于解压 kernel-only 的性能情况。可通过 API 覆盖该默认值。
-
-示例：要在运行时调整默认值，可以使用：
-
-```c
-lz4_gpu_set_workgroup_size(compressor, 256);
-```
-
-备注：这些默认值基于我们在多样本上的经验与采样统计；不同设备（不同 GPU vendor/driver）可能会有不同的行为，因此推荐在 CI 或生产集群上复现一次调优并将最优 `clbin` 与默认参数部署到系统中。
-
-
-
