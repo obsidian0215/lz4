@@ -79,3 +79,4 @@ lz4_gpu/lz4_gpu
 lz4_gpu/lz4_gpu_debug
 sample*
 __pycache__/
+exp_results/
