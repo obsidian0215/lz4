@@ -755,6 +755,7 @@ int main(int argCount, const char** argv)
     /* benchmark and test modes */
     if (mode == om_bench) {
         BMK_setNotificationLevel(displayLevel);
+        BMK_setNbWorkers(nbWorkers);
         operationResult = BMK_benchFiles(inFileNames, ifnIdx, cLevel, cLevelLast, dictionary_filename);
         goto _cleanup;
     }
