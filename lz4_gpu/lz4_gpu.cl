@@ -365,20 +365,13 @@ inline U32 LZ4_getIndexOnHashLocal(U32 h, __local U16* table) __attribute__((alw
     return (U32)table[h & ((1 << (LZ4_HASHLOG + 1)) - 1)];
 }
 
-static void dict_clear(__global U32* p) {
-    uint tid = get_local_id(0);
-    uint sz = get_local_size(0);
+static inline void dict_clear_single(__global U32* p) {
     const uint n = 1 << LZ4_HASHLOG;
-
-    // Use extreme 512-bit (uint16) vectorization for clearing global memory
-    // Each Dictionary is 64KB (16384 * 4B). uint16 is 64B.
-    // Total 1024 uint16 blocks per dictionary.
     __global uint16* p16 = (__global uint16*)p;
-    uint n16 = n / 16;
-    for (uint i = tid; i < n16; i += sz) {
+    const uint n16 = n / 16;
+    for (uint i = 0; i < n16; ++i) {
         p16[i] = (uint16)(0);
     }
-    barrier(CLK_GLOBAL_MEM_FENCE);
 }
 
 // --- Matching ---
@@ -680,29 +673,25 @@ __kernel void lz4_compress_block(
     int globalIndexBase,
     __global U32* globalHashTablePool
 ) {
-    const uint gid = get_group_id(0);
-    const uint num_groups = get_num_groups(0);
-    const uint tid = get_local_id(0);
+    const uint wi = get_global_id(0);
+    const uint total_wi = get_global_size(0);
+    const uint dict_entries = (1U << LZ4_HASHLOG);
 
-    __global U32* dict = globalHashTablePool + (size_t)gid * (1 << LZ4_HASHLOG);
+    for (uint b = wi; b < (uint)totalBlocks; b += total_wi) {
+        __global U32* dict = globalHashTablePool + (size_t)wi * dict_entries;
+        dict_clear_single(dict);
 
-    for (uint b = gid; b < (uint)totalBlocks; b += num_groups) {
-        dict_clear(dict);
-
-        if (tid == 0) {
-            int start = blockOffsets[b * 2];
-            int blockSize = blockOffsets[b * 2 + 1];
-            if (start < inputSize && blockSize > 0) {
-                int dstCapacity = blockSize + (blockSize/255) + 256;
-                __global BYTE* dst = output + outputOffsets[b];
-                blockSizes[globalIndexBase + b] = lz4_compress_core_accelerated(
-                    input + start, dst, blockSize, dstCapacity, tableType, dict, acceleration
-                );
-            } else {
-                blockSizes[globalIndexBase + b] = 0;
-            }
+        int start = blockOffsets[b * 2];
+        int blockSize = blockOffsets[b * 2 + 1];
+        if (start < inputSize && blockSize > 0) {
+            int dstCapacity = blockSize + (blockSize / 255) + 256;
+            __global BYTE* dst = output + outputOffsets[b];
+            blockSizes[globalIndexBase + b] = lz4_compress_core_accelerated(
+                input + start, dst, blockSize, dstCapacity, tableType, dict, acceleration
+            );
+        } else {
+            blockSizes[globalIndexBase + b] = 0;
         }
-        barrier(CLK_GLOBAL_MEM_FENCE);
     }
 }
 

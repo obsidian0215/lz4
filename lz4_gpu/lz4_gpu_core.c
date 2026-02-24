@@ -26,6 +26,56 @@ static cl_mem ensure_buffer(cl_context context, cl_mem buf, size_t size, size_t*
     return clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, size, NULL, err);
 }
 
+static size_t round_up_size(size_t v, size_t align) {
+    if (align == 0) return v;
+    return ((v + align - 1) / align) * align;
+}
+
+static size_t sanitize_local_size(cl_command_queue queue, size_t requested, size_t upper_blocks) {
+    if (upper_blocks == 0) return 1;
+    size_t l = (requested == 0) ? 1 : requested;
+
+    cl_device_id qdev = NULL;
+    size_t max_wg = 1;
+    if (clGetCommandQueueInfo(queue, CL_QUEUE_DEVICE, sizeof(qdev), &qdev, NULL) == CL_SUCCESS && qdev) {
+        clGetDeviceInfo(qdev, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(max_wg), &max_wg, NULL);
+    }
+
+    if (l > max_wg) l = max_wg;
+    if (l > upper_blocks) l = upper_blocks;
+    if (l == 0) l = 1;
+
+    /* Keep local size as power-of-two for stable occupancy behavior. */
+    size_t p2 = 1;
+    while ((p2 << 1) <= l) p2 <<= 1;
+    return p2;
+}
+
+static size_t choose_worker_count(cl_command_queue queue, size_t num_blocks, size_t local_size) {
+    if (num_blocks == 0) return 1;
+
+    cl_device_id qdev = NULL;
+    cl_uint cu = 1;
+    if (clGetCommandQueueInfo(queue, CL_QUEUE_DEVICE, sizeof(qdev), &qdev, NULL) == CL_SUCCESS && qdev) {
+        clGetDeviceInfo(qdev, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cu), &cu, NULL);
+    }
+    if (cu == 0) cu = 1;
+
+    size_t wi_per_cu = 8;
+    const char* env = getenv("LZ4_GPU_WI_PER_CU");
+    if (env && *env) {
+        char* end = NULL;
+        unsigned long parsed = strtoul(env, &end, 10);
+        if (end != env && parsed > 0) wi_per_cu = (size_t)parsed;
+    }
+
+    size_t target = (size_t)cu * wi_per_cu;
+    if (target < local_size) target = local_size;
+    if (target > num_blocks) target = num_blocks;
+    if (target == 0) target = 1;
+    return target;
+}
+
 int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kernel,
                     const char* input_path, const char* output_path,
                     size_t block_size, int acceleration, lz4_gpu_workspace_t* ws,
@@ -44,6 +94,10 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
 
     t1 = get_us();
     int num_blocks = (file_size + block_size - 1) / block_size;
+    size_t l_ws = sanitize_local_size(queue, (local_size > 0) ? (size_t)local_size : 1, (size_t)num_blocks);
+    size_t worker_count = choose_worker_count(queue, (size_t)num_blocks, l_ws);
+    size_t g_ws = round_up_size(worker_count, l_ws);
+
     uint32_t* h_block_info = malloc(num_blocks * 2 * sizeof(uint32_t));
     uint32_t* h_out_offsets = malloc(num_blocks * sizeof(uint32_t));
     uint32_t single_block_max_out = (uint32_t)(block_size * 1.1 + 64);
@@ -71,8 +125,8 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
     cl_mem out_offsets_buf = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, out_offsets_cap, h_out_offsets, &err);
 
     ws->output_size_buf = ensure_buffer(context, ws->output_size_buf, num_blocks * sizeof(uint32_t), &ws->current_osize_capacity, &err);
-    size_t dict_size_per_block = (1ULL << hash_log) * (sizeof(int));
-    ws->dict_buf = ensure_buffer(context, ws->dict_buf, (size_t)num_blocks * dict_size_per_block, &ws->current_dict_capacity, &err);
+    size_t dict_size_per_worker = (1ULL << hash_log) * (sizeof(int));
+    ws->dict_buf = ensure_buffer(context, ws->dict_buf, g_ws * dict_size_per_worker, &ws->current_dict_capacity, &err);
     t->buffer_alloc_us = (unsigned long)(get_us() - t1);
 
     t1 = get_us();
@@ -98,8 +152,6 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
     clSetKernelArg(kernel, 10, sizeof(cl_mem), &ws->dict_buf);
 
     t1 = get_us();
-    size_t g_ws = (size_t)num_blocks * local_size;
-    size_t l_ws = (size_t)local_size;
     t->global_size = (unsigned long)g_ws;
     t->local_size = (unsigned long)l_ws;
     cl_event ev;
@@ -228,8 +280,8 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
     clSetKernelArg(kernel, 6, sizeof(cl_mem), &d_sizes_out);
     clSetKernelArg(kernel, 7, sizeof(uint32_t), &num_blocks);
 
-    size_t g_ws = ((num_blocks + local_size - 1) / local_size) * local_size;
-    size_t l_ws = (size_t)local_size;
+    size_t l_ws = sanitize_local_size(queue, (local_size > 0) ? (size_t)local_size : 1, (size_t)num_blocks);
+    size_t g_ws = round_up_size((size_t)num_blocks, l_ws);
     t->global_size = (unsigned long)g_ws;
     t->local_size = (unsigned long)l_ws;
     cl_event ev;
