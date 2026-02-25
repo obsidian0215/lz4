@@ -61,7 +61,7 @@ static size_t choose_worker_count(cl_command_queue queue, size_t num_blocks, siz
     }
     if (cu == 0) cu = 1;
 
-    size_t wi_per_cu = 8;
+    size_t wi_per_cu = 12;
     const char* env = getenv("LZ4_GPU_WI_PER_CU");
     if (env && *env) {
         char* end = NULL;
@@ -333,7 +333,7 @@ static char* read_file_bin_local(const char* path, size_t* out_len) {
 
 cl_program lz4_load_program(cl_context context, cl_device_id device, int hash_log) {
     char bin_name[128];
-    snprintf(bin_name, sizeof(bin_name), "/root/lz4/lz4_gpu/lz4_gpu_%d.clbin", hash_log);
+    snprintf(bin_name, sizeof(bin_name), "/root/lz4/lz4_gpu/lz4_gpu_v3_%d.clbin", hash_log);
     size_t sz = 0;
     char* bin = read_file_bin_local(bin_name, &sz);
     if (bin) {

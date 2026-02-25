@@ -330,9 +330,6 @@ inline U32 LZ4_hash5(U64 sequence, int tableType) __attribute__((always_inline))
 inline U32 LZ4_hashPosition(const __global BYTE* p, int tableType, U32* sequence) __attribute__((always_inline)) {
     U32 s = LZ4_read32(p);
     if (sequence) *sequence = s;
-    if ((sizeof(size_t) == 8) && (tableType != 0)) {
-        return LZ4_hash5(LZ4_read64(p), tableType);
-    }
     return LZ4_hash4(s, tableType);
 }
 
