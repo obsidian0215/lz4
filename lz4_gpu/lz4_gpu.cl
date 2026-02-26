@@ -94,6 +94,10 @@ inline void LZ4_UA_COPYN(__global BYTE* d, const __global BYTE* s, uint nn)
 inline void LZ4_COPY_MATCH(__global BYTE* op, const __global BYTE* m_pos, uint len)
 {
     uint offset = op - m_pos;
+    if (offset >= len) {
+        LZ4_UA_COPYN(op, m_pos, len);
+        return;
+    }
     if (offset <= 4) {
         if (offset == 1) {
             BYTE c = *m_pos; uchar16 v16 = (uchar16)c;
