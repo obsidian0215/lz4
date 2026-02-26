@@ -597,6 +597,15 @@ void lz4_decompress_generic(
             offset = LZ4_readLE16(ip); ip += 2;
             match = op - offset;
 
+            {
+                uint mlen_fast = (uint)(length + MINMATCH);
+                if ((match >= dst) && (offset >= mlen_fast)) {
+                    LZ4_UA_COPYN(op, match, mlen_fast);
+                    op += mlen_fast;
+                    continue;
+                }
+            }
+
             if ((length != ML_MASK) && (offset >= 8) && (match >= dst)) {
                 LZ4_memcpy(op, match, 8);
                 LZ4_memcpy(op + 8, match + 8, 8);
