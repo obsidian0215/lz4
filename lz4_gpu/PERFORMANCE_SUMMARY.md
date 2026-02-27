@@ -1,150 +1,79 @@
-# LZ4 GPU 性能总结（本轮优化、回退与逐文件对比）
+# LZ4 GPU 性能总结（本轮实现与全量结果）
 
-更新时间：2026-02-26
+更新时间：2026-02-27
 
-## 1) 本轮提交链路与目标
+## 1. 范围与口径
 
-- 压缩优化基线：`c9336314`
-- 压缩优化提交：`eb763574`（`lz4_gpu: optimize compression hash path and worker scheduling baseline`）
-- 解压优化提交：`48c311df`（`lz4_gpu: decomp fast-path for non-overlap match copies`）
+- 对比区间：`mod3_lz4_decomp.csv` → `mod6_lz4_full.csv`
+- 对齐方式：按 `File + BlockSize + HashLog + Acceleration + Threads_LSZ` 对齐 GPU 行
+- 对齐样本：`3024` 组
+- Roundtrip：`3024/3024` 通过（GPU 行失败 `0`）
+- CPU 对照口径：采用 `mod3` 中同文件 CPU 最佳 `CompMBs/DecMBs` 作为参考（`mod6` 为 GPU-only 跑测）
 
-本轮目标：
+## 2. 本轮设计与实现（不含 roundtrip 故障修正细节）
 
-1. 压缩率不明显退化；
-2. 压缩 kernel 吞吐提升；
-3. 解压 kernel 吞吐提升；
-4. roundtrip 维持 100%。
+涉及文件：`lz4_gpu/lz4_gpu.cl`、`lz4_gpu/lz4_gpu_core.c`、`lz4_gpu/lz4_gpu.c`、`lz4_gpu/lz4_gpu_daemon.c`
 
-## 2) 设计实现（优化与回退）
+1. **压缩字典“按 epoch 懒清理”**
+   - 词典槽从 32-bit entry 扩展为 64-bit packed（高 32 位为 epoch tag，低 32 位为 entry）。
+   - 每个 work-item 仅前进 epoch，不再每块全量清表，减少了词典初始化开销。
+   - host 侧在 epoch 接近回卷时触发一次性清零并重置基线。
 
-### 2.1 压缩优化（已落地）
+2. **压缩调度并行度上调**
+   - `wi_per_cu` 默认值由 12 提升到 24（可被环境变量覆盖）。
+   - local size 做设备上限与 block 数双重约束，稳定 occupancy。
 
-涉及文件：`lz4_gpu/lz4_gpu.cl`、`lz4_gpu/lz4_gpu_core.c`
+3. **解压 copy 路径的非重叠快路强化**
+   - 在 match copy 中优先识别非重叠区间，走 `LZ4_UA_COPYN` 批量复制。
+   - 重叠场景仍保留安全路径，保持语义一致。
 
-- 优化 hash/match 路径，减少无效探测；
-- 调整 worker 调度与并行度估算，提升 CU 利用率；
-- 继续采用每 work-item 独占字典槽，避免并发冲突。
+4. **OpenCL 初始化鲁棒性增强**
+   - 设备选择从“仅 GPU”改为 `GPU → DEFAULT → ALL` 逐级回退。
+   - standalone 与 daemon 均补充关键创建/编译失败检查与报错。
 
-### 2.2 解压优化（已落地）
+## 3. 全量结果（mod6 vs mod3）
 
-涉及文件：`lz4_gpu/lz4_gpu.cl`
+### 3.1 聚合指标
 
-- 新增 non-overlap match copy fast-path；
-- 保留 overlap 安全路径，保证与参考实现语义一致；
-- 目标是把常见“非重叠拷贝”场景的分支与访存开销压低。
+- `CompKernelReported_MBs`：median **+217.52%**，p10 **+73.13%**
+- `DecKernelReported_MBs`：median **+111.24%**，p10 **-18.30%**
+- `Ratio%`：median **0.00**，p90 **0.00**，`>1% / >5% / >10% = 0 / 0 / 0`
+- 解压提升覆盖率：`2530/3024 = 83.66%`
 
-补充（本次下一阶段）：
+### 3.2 与 CPU 的中位对照（逐文件）
 
-- 在 `lz4_decompress_generic()` 的 fast-path 中增加“`offset >= match_len` 直接精确复制”分支；
-- 对于非重叠且短匹配，优先走 `LZ4_UA_COPYN()`，避免固定 18 字节复制带来的冗余访存。
+- `GPU CompKernel / CPU Comp`：**3.09x**（文件级中位）
+- `GPU DecKernel / CPU Dec`：**1.71x**（文件级中位）
 
-### 2.3 回退/保守处理（已执行）
+## 4. 提升较多/较少文件（逐文件中位）
 
-- 曾尝试过更激进的 I/O overlap 方向，未作为当前默认路径保留（见历史提交 `65a41f1f` 的 disable 轨迹）；
-- 本轮采用“稳态优先”策略：先锁定 roundtrip 与压缩率，再在 kernel 吞吐上增量推进；
-- 对尾部样本（小文件/特定数据分布）保留保守路径，避免单点激进优化导致全局回退。
+> 说明：表中 `old/new` 分别对应 `mod3/mod6`；CPU 吞吐为 `mod3` 同文件 CPU 最佳值；压缩率变化均为 0（本轮无压缩率回退）。
 
-## 3) 测试口径与数据资产
+### 4.1 提升较多（按解压 kernel 提升排序）
 
-- 样本目录：`/root/samples`
-- 聚合方式：`repeats=3`，`AggMethod=median_mad`
-- 矩阵：
-  - CPU：`threads=1`, `block=64K,256K,1M`
-  - GPU：`block=16K,32K,64K,128K`, `hash=14,15,16`, `local=1`, `accel=1,2,4`
-- 阶段汇总：
-  - 压缩阶段：`/tmp/ab_compare/ab_summary_compress_opt.json`
-  - 解压阶段：`/tmp/ab_compare/ab_summary_decomp_opt.json`
-  - 下一阶段：`/tmp/ab_compare/ab_summary_next_stage.json`
-- 逐文件详细表（已入库）：
-  - `exp_results/lz4_per_file_cpu_gpu_compare_detailed.csv`
-  - `exp_results/lz4_per_file_cpu_gpu_compare_detailed.md`
-  - `exp_results/lz4_per_file_rankings.md`
-  - 本轮全量结果：`/tmp/ab_compare/mod3_lz4_decomp.csv`
+| 文件 | CompK old→new (MB/s) | DecK old→new (MB/s) | DecK变化 | CPU Comp / Dec (MB/s) | GPU/CPU(CompK, DecK) | Ratio 变化 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `transportation_parent_0_pages_img.tar` | 257.28 → 4017.66 | 590.49 → 7799.43 | **+1220.84%** | 1677.31 / 5536.50 | 2.40x / 1.41x | 0.00 |
+| `sample_2mb_structured_2.txt` | 267.09 → 4439.95 | 664.07 → 5181.49 | **+680.26%** | 1621.40 / 7331.70 | 2.74x / 0.71x | 0.00 |
+| `ooffice` | 261.06 → 1892.45 | 735.03 → 3751.40 | **+410.37%** | 606.40 / 3604.20 | 3.12x / 1.04x | 0.00 |
 
-## 4) 全量 A/B 结果（含压缩阶段与解压阶段）
+### 4.2 提升较少（含回退）
 
-### 4.1 稳定性
+| 文件 | CompK old→new (MB/s) | DecK old→new (MB/s) | DecK变化 | CPU Comp / Dec (MB/s) | GPU/CPU(CompK, DecK) | Ratio 变化 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `sample_6.80mb_zero_1.txt` | 2902.50 → 4176.06 | 9736.16 → 2751.70 | **-71.74%** | 27621.64 / 5627.00 | 0.15x / 0.49x | 0.00 |
+| `sample_9mb_zero_3.txt` | 3400.10 → 5023.73 | 11357.01 → 3230.74 | **-71.55%** | 27486.81 / 5643.00 | 0.18x / 0.57x | 0.00 |
+| `sample_42mb_repeat_3.txt` | 4540.06 → 9325.06 | 15032.87 → 7742.07 | **-48.50%** | 14098.01 / 17401.90 | 0.66x / 0.44x | 0.00 |
 
-- `rows_base/mod/common = 3705/3705/3705`
-- `gpu_rows = 3420`
-- roundtrip：`3420/3420`（100%）
+## 5. 结论
 
-### 4.2 压缩优化阶段（`c9336314 -> eb763574`）
+1. 本轮改动在压缩与解压 kernel 吞吐上都实现了显著中位提升。
+2. 压缩率保持稳定（统计口径下无正向回退样本）。
+3. 存在少量“高重复/全零类”尾部文件，解压 kernel 仍有明显回退，需要专项治理。
 
-- `CompKernelReported_MBs`：median **+5.53%**，p10 **+0.45%**
-- `DecKernelReported_MBs`：median **-0.21%**，p10 **-10.56%**
-- `Ratio%` 回退：
-  - median `0.00%`
-  - p90 `+2.05%`
-  - `>1% / >5% / >10%`：`483 / 90 / 6`
-- CPU 单核对比（pair=95）：
-  - `Ratio(GPU/CPU)` median：`1.0256`
-  - `CompKernel(GPU)/Comp(CPU)` median：`1.1792x`
-  - `DecKernel(GPU)/Dec(CPU)` median：`1.1056x`
+## 6. 下一步优化方向
 
-结论：压缩优化阶段的主要收益在压缩内核吞吐；但在少数样本上解压尾部存在回退信号。
-
-### 4.3 解压优化阶段（`eb763574 -> 48c311df`）
-
-- `CompKernelReported_MBs`：median **+0.09%**，p10 **-0.81%**
-- `DecKernelReported_MBs`：median **+0.06%**，p10 **-1.48%**
-- `Ratio%` 回退：
-  - median `0.00%`
-  - p90 `0.00%`
-  - `>1% / >5% / >10%`：`0 / 0 / 0`
-- CPU 单核对比（pair=95）：
-  - `Ratio(GPU/CPU)` median：`1.0256`
-  - `CompKernel(GPU)/Comp(CPU)` median：`1.1743x`
-  - `DecKernel(GPU)/Dec(CPU)` median：`1.1080x`
-
-结论：解压 fast-path 把压缩率风险压到 0（就本轮统计口径），并小幅抬升解压中位表现。
-
-### 4.4 下一阶段优化验证（当前工作树）
-
-对比基线：`mod2_lz4_decomp.csv -> mod3_lz4_decomp.csv`（按 common rows 对齐）
-
-- `rows(base/mod/common) = 3705/3276/3276`
-- `gpu_rows = 3024`，roundtrip：`3024/3024`（100%）
-- `CompKernelReported_MBs`：median **-0.082%**，p10 **-0.964%**
-- `DecKernelReported_MBs`：median **+0.079%**，p10 **-0.791%**
-- `Ratio%` 回退：`>1% / >5% / >10% = 0 / 0 / 0`
-- CPU 单核对比（pair=84）：
-  - `Ratio(GPU/CPU)` median：`1.0256`
-  - `CompKernel(GPU)/Comp(CPU)` median：`1.1852x`
-  - `DecKernel(GPU)/Dec(CPU)` median：`1.1140x`
-
-结论：该阶段改动在保持压缩率稳定和 100% roundtrip 的前提下，解压中位吞吐继续小幅上升，可接受。
-
-## 5) 逐文件详细展示（压缩率/压缩核吞吐/解压核吞吐 对 CPU）
-
-完整逐文件明细已写入：`exp_results/lz4_per_file_cpu_gpu_compare_detailed.md`。
-
-该表逐行给出（95 个文件）：
-
-- `CPU最佳Ratio%` 与 `GPU最佳Ratio%`（压缩率）；
-- `CPU最佳Comp MB/s` 与 `GPU最佳CompK MB/s`（压缩内核吞吐）；
-- `CPU最佳Dec MB/s` 与 `GPU最佳DecK MB/s`（解压内核吞吐）；
-- `GPU/CPU` 三个比值（ratio/comp/dec）；
-- `GPU *ΔvsBase%`（对压缩优化基线的增量）。
-
-补充排名（见 `exp_results/lz4_per_file_rankings.md`）：
-
-- 解压核吞吐增益 Top：`x-ray(+5.364%)`、`ooffice(+5.226%)`、`sample_9mb_zero_3.txt(+2.586%)`
-- 解压核吞吐增益尾部：`sample_6.80mb_zero_1.txt(-6.333%)`、`sample_6.86mb_random_1.txt(-5.492%)`
-- GPU/CPU 解压核吞吐比 Top：`3.334x`（`sample_132mb_zero_5.txt`）
-- GPU/CPU 解压核吞吐比尾部：`0.057x`（`nginx-nc__migrate__parent_3__pages.img`）
-
-## 6) 下一轮优化点（LZ4）
-
-1. **解压小块特化路径**：对小块与高跳转 case 增加更轻量分支，优先改善 tail；
-2. **host 侧重叠传输**：在保证稳定性的前提下，重新评估分段异步下载/写回（先在灰度配置验证）；
-3. **参数自适应**：按文件特征动态选择 block/hash/accel，减少“一组参数吃全场”导致的尾部回退；
-4. **验收门槛细化**：除中位数外纳入 p10/p5 约束，避免“中位数好看、尾部变差”。
-
-## 7) 当前结论
-
-- roundtrip 继续保持 100%；
-- 压缩率整体稳定（解压阶段统计下无 `>1%` 回退）；
-- GPU 压缩与解压内核吞吐相对 CPU 单核均保持优势（中位数分别约 `1.17x`、`1.11x`）；
-- 下一阶段验证显示：解压中位吞吐进一步 +`0.079%`（对 `mod2`），且无新增压缩率回退；
-- 逐文件细表与排名已完整沉淀在 `exp_results/`，可直接用于复盘与后续迭代验收。
+1. **主机侧链路优化（优先）**：当前部分场景 kernel 已快于端到端链路，后续将重点压缩 `upload/download/write` 占比，推进分段异步与更稳健 pipeline。
+2. **尾部文件分型优化**：针对全零/高重复数据，增加更轻量的解压分流策略，改善 p10/p5。
+3. **参数自适应**：基于文件特征动态选择 `block/hash/accel/local`，避免单配置拖累尾部。
+4. **验收门槛升级**：除 median 外，固定纳入 p10 与“正向覆盖率”双指标。

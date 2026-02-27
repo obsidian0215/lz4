@@ -28,11 +28,39 @@ static cl_command_queue queue;
 static cl_device_id dev;
 
 static void ocl_init() {
-    cl_platform_id pf;
-    clGetPlatformIDs(1, &pf, NULL);
-    clGetDeviceIDs(pf, CL_DEVICE_TYPE_GPU, 1, &dev, NULL);
-    ctx = clCreateContext(NULL, 1, &dev, NULL, NULL, NULL);
-    queue = clCreateCommandQueue(ctx, dev, CL_QUEUE_PROFILING_ENABLE, NULL);
+    cl_int err;
+    cl_platform_id pf = NULL;
+    err = clGetPlatformIDs(1, &pf, NULL);
+    if (err != CL_SUCCESS || pf == NULL) {
+        fprintf(stderr, "OpenCL init failed: clGetPlatformIDs err=%d\n", err);
+        return;
+    }
+
+    err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_GPU, 1, &dev, NULL);
+    if (err != CL_SUCCESS) {
+        err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_DEFAULT, 1, &dev, NULL);
+    }
+    if (err != CL_SUCCESS) {
+        err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_ALL, 1, &dev, NULL);
+    }
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "OpenCL init failed: clGetDeviceIDs err=%d\n", err);
+        return;
+    }
+
+    ctx = clCreateContext(NULL, 1, &dev, NULL, NULL, &err);
+    if (err != CL_SUCCESS || ctx == NULL) {
+        fprintf(stderr, "OpenCL init failed: clCreateContext err=%d\n", err);
+        ctx = NULL;
+        return;
+    }
+    queue = clCreateCommandQueue(ctx, dev, CL_QUEUE_PROFILING_ENABLE, &err);
+    if (err != CL_SUCCESS || queue == NULL) {
+        fprintf(stderr, "OpenCL init failed: clCreateCommandQueue err=%d\n", err);
+        if (ctx) clReleaseContext(ctx);
+        ctx = NULL;
+        queue = NULL;
+    }
 }
 
 static void show_help(const char* prog_name) {
@@ -143,6 +171,10 @@ int run_lz4_standalone(int argc, char** argv) {
 
     t1 = get_us();
     ocl_init();
+    if (!ctx || !queue) {
+        fprintf(stderr, "Failed to initialize OpenCL runtime\n");
+        return 1;
+    }
     t2 = get_us();
     g_ocl_init_us = t2 - t1;
 

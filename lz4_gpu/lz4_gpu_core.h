@@ -11,6 +11,7 @@ typedef struct {
     cl_mem block_info_buf;
     cl_mem output_size_buf;
     cl_mem dict_buf;
+    uint32_t comp_epoch_base;
     size_t current_in_capacity;
     size_t current_out_capacity;
     size_t current_blocks_capacity;

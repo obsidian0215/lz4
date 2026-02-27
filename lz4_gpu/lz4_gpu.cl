@@ -337,18 +337,26 @@ inline U32 LZ4_hashPosition(const __global BYTE* p, int tableType, U32* sequence
     return LZ4_hash4(s, tableType);
 }
 
-inline void LZ4_putIndexOnHash(U32 idx, U32 h, __global U32* tableBase, int tableType, U32 sequence) __attribute__((always_inline)) {
+inline void LZ4_putIndexOnHash(U32 idx, U32 h, __global U64* tableBase, int tableType, U32 sequence, U32 epoch) __attribute__((always_inline)) {
     U32 const mask = (1 << LZ4_HASHLOG) - 1;
+    U32 entry;
     if (tableType == 0) { // byU16 with 16-bit fingerprint
-        tableBase[h & mask] = (idx & 0xFFFF) | ((sequence >> 16) << 16);
+        entry = (idx & 0xFFFF) | ((sequence >> 16) << 16);
     } else { // byU32
-        tableBase[h & mask] = idx;
+        entry = idx;
     }
+    tableBase[h & mask] = (((U64)epoch) << 32) | (U64)entry;
 }
 
-inline U32 LZ4_getIndexOnHash(U32 h, __global U32* tableBase, int tableType, U32 sequence, int* fp_match) __attribute__((always_inline)) {
+inline U32 LZ4_getIndexOnHash(U32 h, __global U64* tableBase, int tableType, U32 sequence, int* fp_match, U32 epoch) __attribute__((always_inline)) {
     U32 const mask = (1 << LZ4_HASHLOG) - 1;
-    U32 const entry = tableBase[h & mask];
+    U64 const packed = tableBase[h & mask];
+    U32 const tag = (U32)(packed >> 32);
+    if (tag != epoch) {
+        *fp_match = 0;
+        return 0;
+    }
+    U32 const entry = (U32)packed;
     if (tableType == 0) { // byU16
         *fp_match = ((entry >> 16) == (sequence >> 16));
         return entry & 0xFFFF;
@@ -364,15 +372,6 @@ inline void LZ4_putIndexOnHashLocal(U32 idx, U32 h, __local U16* table) __attrib
 
 inline U32 LZ4_getIndexOnHashLocal(U32 h, __local U16* table) __attribute__((always_inline)) {
     return (U32)table[h & ((1 << (LZ4_HASHLOG + 1)) - 1)];
-}
-
-static inline void dict_clear_single(__global U32* p) {
-    const uint n = 1 << LZ4_HASHLOG;
-    __global uint16* p16 = (__global uint16*)p;
-    const uint n16 = n / 16;
-    for (uint i = 0; i < n16; ++i) {
-        p16[i] = (uint16)(0);
-    }
 }
 
 // --- Matching ---
@@ -436,8 +435,9 @@ int lz4_compress_core_accelerated(
     int srcSize,
     int dstCapacity,
     int tableType,
-    __global U32* restrict hashTable,
-    int acceleration
+    __global U64* restrict hashTable,
+    int acceleration,
+    U32 epoch
 ) {
     const __global BYTE* ip = src;
     __global BYTE* op = dst;
@@ -451,7 +451,7 @@ int lz4_compress_core_accelerated(
 
     U32 ipValue, forwardIpValue;
     U32 h_init = LZ4_hashPosition(ip, tableType, &ipValue);
-    LZ4_putIndexOnHash(0, h_init, hashTable, tableType, ipValue);
+    LZ4_putIndexOnHash(0, h_init, hashTable, tableType, ipValue, epoch);
     ip++;
     U32 forwardH = LZ4_hashPosition(ip, tableType, &forwardIpValue);
 
@@ -467,13 +467,13 @@ int lz4_compress_core_accelerated(
                 ipValue = forwardIpValue;
                 U32 current = (U32)(forwardIp - src);
                 int fp_match;
-                U32 matchIndex = LZ4_getIndexOnHash(h_iter, hashTable, tableType, ipValue, &fp_match);
+                U32 matchIndex = LZ4_getIndexOnHash(h_iter, hashTable, tableType, ipValue, &fp_match, epoch);
                 ip = forwardIp;
                 forwardIp += step;
                 step = (searchMatchNb++ >> 6);
                 if (forwardIp > mflimitPlusOne) goto _last_literals_g;
                 forwardH = LZ4_hashPosition(forwardIp, tableType, &forwardIpValue);
-                LZ4_putIndexOnHash(current, h_iter, hashTable, tableType, ipValue);
+                LZ4_putIndexOnHash(current, h_iter, hashTable, tableType, ipValue, epoch);
                 if (fp_match && (matchIndex < current) && (current - matchIndex < LZ4_DISTANCE_MAX)) {
                     match = src + matchIndex;
                     if (LZ4_read32(match) == ipValue) break;
@@ -514,12 +514,12 @@ _next_match_g:
         if (ip >= mflimitPlusOne) break;
         U32 seq2, seq_ip, seq_f;
         U32 h2 = LZ4_hashPosition(ip - 2, tableType, &seq2);
-        LZ4_putIndexOnHash((U32)(ip - 2 - src), h2, hashTable, tableType, seq2);
+        LZ4_putIndexOnHash((U32)(ip - 2 - src), h2, hashTable, tableType, seq2, epoch);
         U32 h_ip = LZ4_hashPosition(ip, tableType, &seq_ip);
         U32 current = (U32)(ip - src);
         int fp_match;
-        U32 matchIndex = LZ4_getIndexOnHash(h_ip, hashTable, tableType, seq_ip, &fp_match);
-        LZ4_putIndexOnHash(current, h_ip, hashTable, tableType, seq_ip);
+        U32 matchIndex = LZ4_getIndexOnHash(h_ip, hashTable, tableType, seq_ip, &fp_match, epoch);
+        LZ4_putIndexOnHash(current, h_ip, hashTable, tableType, seq_ip, epoch);
         if (fp_match && (matchIndex < current) && (current - matchIndex < LZ4_DISTANCE_MAX)) {
             if (LZ4_read32(src + matchIndex) == seq_ip) {
                 token = op++; *token = 0; match = src + matchIndex; goto _next_match_g;
@@ -599,7 +599,7 @@ void lz4_decompress_generic(
 
             {
                 uint mlen_fast = (uint)(length + MINMATCH);
-                if ((match >= dst) && (offset >= mlen_fast)) {
+                if ((length != ML_MASK) && (match >= dst) && (offset >= mlen_fast)) {
                     LZ4_UA_COPYN(op, match, mlen_fast);
                     op += mlen_fast;
                     continue;
@@ -681,23 +681,24 @@ __kernel void lz4_compress_block(
     int tableType,
     int acceleration,
     int globalIndexBase,
-    __global U32* globalHashTablePool
+    __global U64* globalHashTablePool,
+    U32 epoch_base
 ) {
     const uint wi = get_global_id(0);
     const uint total_wi = get_global_size(0);
     const uint dict_entries = (1U << LZ4_HASHLOG);
 
-    for (uint b = wi; b < (uint)totalBlocks; b += total_wi) {
-        __global U32* dict = globalHashTablePool + (size_t)wi * dict_entries;
-        dict_clear_single(dict);
+    __global U64* dict = globalHashTablePool + (size_t)wi * dict_entries;
+    U32 epoch = epoch_base + 1U;
 
+    for (uint b = wi; b < (uint)totalBlocks; b += total_wi, ++epoch) {
         int start = blockOffsets[b * 2];
         int blockSize = blockOffsets[b * 2 + 1];
         if (start < inputSize && blockSize > 0) {
             int dstCapacity = blockSize + (blockSize / 255) + 256;
             __global BYTE* dst = output + outputOffsets[b];
             blockSizes[globalIndexBase + b] = lz4_compress_core_accelerated(
-                input + start, dst, blockSize, dstCapacity, tableType, dict, acceleration
+                input + start, dst, blockSize, dstCapacity, tableType, dict, acceleration, epoch
             );
         } else {
             blockSizes[globalIndexBase + b] = 0;
@@ -708,10 +709,10 @@ __kernel void lz4_compress_block(
 __kernel void lz4_decompress_block(
     const __global BYTE* input,
     __global BYTE* output,
-    U64 compressed_offset,
-    U64 compressed_size,
-    U64 output_offset,
-    U64 max_output_size,
+    U32 compressed_offset,
+    U32 compressed_size,
+    U32 output_offset,
+    U32 max_output_size,
     __global U32* output_sizes,
     U32 block_index
 ) {
@@ -727,10 +728,10 @@ __kernel void lz4_decompress_block(
 __kernel void lz4_decompress_blocks(
     const __global BYTE* input,
     __global BYTE* output,
-    __global const U64* comp_offsets,
-    __global const U64* comp_sizes,
-    __global const U64* out_offsets,
-    __global const U64* max_out_sizes,
+    __global const U32* comp_offsets,
+    __global const U32* comp_sizes,
+    __global const U32* out_offsets,
+    __global const U32* max_out_sizes,
     __global U32* sizes_out,
     U32 totalBlocks
 ) {

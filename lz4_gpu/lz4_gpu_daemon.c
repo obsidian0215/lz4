@@ -118,6 +118,12 @@ int init_resources(void) {
     err = clGetPlatformIDs(1, &g_state.platform, NULL);
     if (err != CL_SUCCESS) return -1;
     err = clGetDeviceIDs(g_state.platform, CL_DEVICE_TYPE_GPU, 1, &g_state.device, NULL);
+    if (err != CL_SUCCESS) {
+        err = clGetDeviceIDs(g_state.platform, CL_DEVICE_TYPE_DEFAULT, 1, &g_state.device, NULL);
+    }
+    if (err != CL_SUCCESS) {
+        err = clGetDeviceIDs(g_state.platform, CL_DEVICE_TYPE_ALL, 1, &g_state.device, NULL);
+    }
     if (err != CL_SUCCESS) return -1;
     g_state.context = clCreateContext(NULL, 1, &g_state.device, NULL, NULL, &err);
     if (err != CL_SUCCESS) return -1;
