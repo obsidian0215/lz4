@@ -187,6 +187,7 @@ class TelemetryProbe:
                 gpu_energy = ((p0 + p1) * 0.5) * elapsed
 
         return {
+            "elapsed_s": float(elapsed),
             "cpu_freq_start_mhz": float(start.get("cpu_freq_mhz") or 0.0),
             "cpu_freq_end_mhz": float(end.get("cpu_freq_mhz") or 0.0),
             "gpu_freq_start_mhz": float(start.get("gpu_freq_mhz") or 0.0),

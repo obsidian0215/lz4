@@ -65,7 +65,6 @@ inline void LZ4_write64(__global BYTE* ptr, U64 value) __attribute__((always_inl
 
 inline U16 LZ4_readLE16(const __global BYTE* ptr) __attribute__((always_inline)) { return LZ4_read16(ptr); }
 
-// --- Memory Copy ---
 // --- Memory Copy (Vectorized) ---
 inline void LZ4_UA_COPYN(__global BYTE* d, const __global BYTE* s, uint nn)
 {
@@ -669,6 +668,7 @@ _output_error:
 }
 
 // --- Kernels ---
+#ifndef LZ4_GPU_NO_ENTRY_KERNELS
 
 __kernel void lz4_compress_block(
     __global const BYTE* input,
@@ -736,14 +736,18 @@ __kernel void lz4_decompress_blocks(
     U32 totalBlocks
 ) {
     int gid = get_global_id(0);
-    if (gid >= (int)totalBlocks) return;
+    int gsz = get_global_size(0);
 
-    lz4_decompress_generic(
-        input + comp_offsets[gid],
-        output + out_offsets[gid],
-        (int)comp_sizes[gid],
-        (int)max_out_sizes[gid],
-        &sizes_out[gid]
-    );
+    for (int idx = gid; idx < (int)totalBlocks; idx += gsz) {
+        lz4_decompress_generic(
+            input + comp_offsets[idx],
+            output + out_offsets[idx],
+            (int)comp_sizes[idx],
+            (int)max_out_sizes[idx],
+            &sizes_out[idx]
+        );
+    }
 }
+
+#endif /* LZ4_GPU_NO_ENTRY_KERNELS */
 

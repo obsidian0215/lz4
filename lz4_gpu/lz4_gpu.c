@@ -8,6 +8,7 @@
 #include <sys/types.h>
 #include <signal.h>
 #include <errno.h>
+#include <time.h>
 #include "lz4_gpu_core.h"
 #include "lz4_gpu_protocol.h"
 #include "lz4_gpu_utils.h"
@@ -19,7 +20,7 @@ int run_lz4_client(int mode, const char* input_path, const char* output_path, in
 
 int g_verbose = 0;
 static size_t g_cli_local_size = 1;
-static size_t g_cli_fixed_block_bytes = 64 * 1024;
+static size_t g_cli_fixed_block_bytes = 32 * 1024;
 static int g_cli_acceleration = 1;
 static int g_cli_hash_log = 14;
 
@@ -80,6 +81,8 @@ static void show_help(const char* prog_name) {
     fprintf(stderr, "  -H, --hash N         Hash log bits (default: 14)\n");
     fprintf(stderr, "  -l, --local N        Local work-group size (default: 1)\n");
     fprintf(stderr, "  -v, --verbose        Enable performance statistics\n");
+    fprintf(stderr, "  --bench [SECONDS]    Stable benchmark (compress+decompress+verify)\n");
+    fprintf(stderr, "  --bench-seconds N    Benchmark duration in seconds (default: 3)\n");
 }
 
 static int stop_daemon_cmd() {
@@ -110,8 +113,395 @@ static size_t parse_size_bytes(const char* s) {
     return val;
 }
 
+static int cmp_double_asc(const void* a, const void* b) {
+    double da = *(const double*)a;
+    double db = *(const double*)b;
+    if (da < db) return -1;
+    if (da > db) return 1;
+    return 0;
+}
+
+static double median_double(const double* vals, size_t n) {
+    if (!vals || n == 0) return 0.0;
+    double* tmp = (double*)malloc(n * sizeof(double));
+    if (!tmp) return 0.0;
+    memcpy(tmp, vals, n * sizeof(double));
+    qsort(tmp, n, sizeof(double), cmp_double_asc);
+    double out = (n % 2 == 0) ? (tmp[n / 2 - 1] + tmp[n / 2]) / 2.0 : tmp[n / 2];
+    free(tmp);
+    return out;
+}
+
+static double elapsed_sec(const struct timespec* start, const struct timespec* end) {
+    return (double)(end->tv_sec - start->tv_sec) + (double)(end->tv_nsec - start->tv_nsec) / 1000000000.0;
+}
+
+static int run_lz4_bench(const char* input_path,
+                         int block_size,
+                         int acceleration,
+                         int local_size,
+                         int hash_log,
+                         double bench_seconds) {
+    struct stat st;
+    if (!input_path || stat(input_path, &st) != 0 || st.st_size <= 0) {
+        fprintf(stderr, "bench error: invalid input file\n");
+        return 1;
+    }
+    if (bench_seconds <= 0.0) bench_seconds = 3.0;
+
+    size_t in_size_ref = (size_t)st.st_size;
+    unsigned char* input_ref = (unsigned char*)malloc(in_size_ref);
+    unsigned long ref_read_us = 0;
+    if (!input_ref || in_size_ref == 0 ||
+        lz4_read_file_to_buf(input_path, input_ref, in_size_ref, &ref_read_us) != 0) {
+        free(input_ref);
+        fprintf(stderr, "bench error: failed to read input\n");
+        return 1;
+    }
+    (void)ref_read_us;
+
+    ocl_init();
+    if (!ctx || !queue) {
+        fprintf(stderr, "bench error: OpenCL init failed\n");
+        free(input_ref);
+        return 1;
+    }
+
+    cl_program prog = lz4_load_program(ctx, dev, hash_log);
+    if (!prog) {
+        fprintf(stderr, "bench error: kernel program load failed\n");
+        clReleaseCommandQueue(queue);
+        clReleaseContext(ctx);
+        free(input_ref);
+        return 1;
+    }
+
+    cl_int err = CL_SUCCESS;
+    cl_kernel kcomp = clCreateKernel(prog, "lz4_compress_block", &err);
+    if (err != CL_SUCCESS || !kcomp) {
+        fprintf(stderr, "bench error: create compress kernel failed (%d)\n", err);
+        clReleaseProgram(prog);
+        clReleaseCommandQueue(queue);
+        clReleaseContext(ctx);
+        free(input_ref);
+        return 1;
+    }
+    cl_kernel kdec = clCreateKernel(prog, "lz4_decompress_blocks", &err);
+    if (err != CL_SUCCESS || !kdec) {
+        fprintf(stderr, "bench error: create decompress kernel failed (%d)\n", err);
+        clReleaseKernel(kcomp);
+        clReleaseProgram(prog);
+        clReleaseCommandQueue(queue);
+        clReleaseContext(ctx);
+        free(input_ref);
+        return 1;
+    }
+
+    lz4_gpu_workspace_t ws;
+    lz4_gpu_workspace_init(&ws);
+
+    size_t cap = 16, n = 0;
+    double* comp_tp = (double*)malloc(cap * sizeof(double));
+    double* dec_tp = (double*)malloc(cap * sizeof(double));
+    double* ratio_pct = (double*)malloc(cap * sizeof(double));
+    int verify_ok = 1;
+
+    if (!comp_tp || !dec_tp || !ratio_pct) {
+        fprintf(stderr, "bench error: malloc failed\n");
+        verify_ok = 0;
+    }
+
+    struct timespec ts0, ts1;
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+
+    while (verify_ok) {
+        timing_t tc;
+        memset(&tc, 0, sizeof(tc));
+
+        int rc = lz4_compress_core(ctx, queue, kcomp, input_path, "/dev/null",
+                                   (size_t)block_size, acceleration, &ws, &tc,
+                                   local_size, hash_log);
+        if (rc != 0) {
+            verify_ok = 0;
+            break;
+        }
+
+        size_t nblk = (size_t)tc.nblk;
+        size_t blk = (size_t)tc.blk_size_bytes;
+        size_t worst_blk = (size_t)((double)blk * 1.1 + 64.0);
+        size_t comp_total = (size_t)tc.out_size;
+        if (nblk == 0 || blk == 0 || comp_total == 0) {
+            verify_ok = 0;
+            break;
+        }
+
+        cl_uint* h_sizes = (cl_uint*)malloc(nblk * sizeof(cl_uint));
+        cl_uint* h_comp_off = (cl_uint*)malloc(nblk * sizeof(cl_uint));
+        cl_uint* h_out_off = (cl_uint*)malloc(nblk * sizeof(cl_uint));
+        cl_uint* h_max_out = (cl_uint*)malloc(nblk * sizeof(cl_uint));
+        unsigned char* packed = (unsigned char*)malloc(comp_total);
+        if (!h_sizes || !h_comp_off || !h_out_off || !h_max_out || !packed) {
+            free(h_sizes); free(h_comp_off); free(h_out_off); free(h_max_out); free(packed);
+            verify_ok = 0;
+            break;
+        }
+
+        void* map_sizes = clEnqueueMapBuffer(queue, ws.output_size_buf, CL_TRUE, CL_MAP_READ,
+                                             0, nblk * sizeof(cl_uint), 0, NULL, NULL, &err);
+        if (err != CL_SUCCESS || !map_sizes) {
+            free(h_sizes); free(h_comp_off); free(h_out_off); free(h_max_out); free(packed);
+            verify_ok = 0;
+            break;
+        }
+        memcpy(h_sizes, map_sizes, nblk * sizeof(cl_uint));
+        clEnqueueUnmapMemObject(queue, ws.output_size_buf, map_sizes, 0, NULL, NULL);
+        clFinish(queue);
+
+        void* map_comp = clEnqueueMapBuffer(queue, ws.out_buf, CL_TRUE, CL_MAP_READ,
+                                            0, nblk * worst_blk, 0, NULL, NULL, &err);
+        if (err != CL_SUCCESS || !map_comp) {
+            free(h_sizes); free(h_comp_off); free(h_out_off); free(h_max_out); free(packed);
+            verify_ok = 0;
+            break;
+        }
+
+        size_t co = 0;
+        for (size_t i = 0; i < nblk; ++i) {
+            size_t csz = (size_t)h_sizes[i];
+            h_comp_off[i] = (cl_uint)co;
+            h_out_off[i] = (cl_uint)(i * blk);
+            h_max_out[i] = (cl_uint)((i + 1 == nblk) ? (tc.in_size - i * blk) : blk);
+            if (co + csz > comp_total) {
+                verify_ok = 0;
+                break;
+            }
+            memcpy(packed + co, ((unsigned char*)map_comp) + i * worst_blk, csz);
+            co += csz;
+        }
+        clEnqueueUnmapMemObject(queue, ws.out_buf, map_comp, 0, NULL, NULL);
+        clFinish(queue);
+        if (!verify_ok || co != comp_total) {
+            free(h_sizes); free(h_comp_off); free(h_out_off); free(h_max_out); free(packed);
+            verify_ok = 0;
+            break;
+        }
+
+        cl_mem d_comp = clCreateBuffer(ctx, CL_MEM_READ_ONLY, comp_total, NULL, &err);
+        cl_mem d_out = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, (size_t)tc.in_size, NULL, &err);
+        cl_mem d_comp_off = clCreateBuffer(ctx, CL_MEM_READ_ONLY, nblk * sizeof(cl_uint), NULL, &err);
+        cl_mem d_comp_sz = clCreateBuffer(ctx, CL_MEM_READ_ONLY, nblk * sizeof(cl_uint), NULL, &err);
+        cl_mem d_out_off = clCreateBuffer(ctx, CL_MEM_READ_ONLY, nblk * sizeof(cl_uint), NULL, &err);
+        cl_mem d_max_out = clCreateBuffer(ctx, CL_MEM_READ_ONLY, nblk * sizeof(cl_uint), NULL, &err);
+        cl_mem d_sizes_out = clCreateBuffer(ctx, CL_MEM_READ_WRITE, nblk * sizeof(cl_uint), NULL, &err);
+        cl_mem d_dbg_dec = NULL;
+        cl_uint kernel_num_args_dec = 0;
+        int kernel_has_dbg_dec = 0;
+
+        if (clGetKernelInfo(kdec, CL_KERNEL_NUM_ARGS, sizeof(kernel_num_args_dec), &kernel_num_args_dec, NULL) == CL_SUCCESS) {
+            kernel_has_dbg_dec = (kernel_num_args_dec >= 10U);
+        }
+
+        if (!d_comp || !d_out || !d_comp_off || !d_comp_sz || !d_out_off || !d_max_out || !d_sizes_out) {
+            if (d_comp) clReleaseMemObject(d_comp);
+            if (d_out) clReleaseMemObject(d_out);
+            if (d_comp_off) clReleaseMemObject(d_comp_off);
+            if (d_comp_sz) clReleaseMemObject(d_comp_sz);
+            if (d_out_off) clReleaseMemObject(d_out_off);
+            if (d_max_out) clReleaseMemObject(d_max_out);
+            if (d_sizes_out) clReleaseMemObject(d_sizes_out);
+            free(h_sizes); free(h_comp_off); free(h_out_off); free(h_max_out); free(packed);
+            verify_ok = 0;
+            break;
+        }
+
+        if (kernel_has_dbg_dec) {
+            size_t dbg_bytes = nblk * 5U * sizeof(cl_uint);
+            d_dbg_dec = clCreateBuffer(ctx, CL_MEM_READ_WRITE, dbg_bytes, NULL, &err);
+            if (err == CL_SUCCESS && d_dbg_dec) {
+                cl_uint zero = 0;
+                err = clEnqueueFillBuffer(queue, d_dbg_dec, &zero, sizeof(zero), 0, dbg_bytes, 0, NULL, NULL);
+                if (err != CL_SUCCESS) {
+                    clReleaseMemObject(d_dbg_dec);
+                    d_dbg_dec = NULL;
+                }
+            } else {
+                d_dbg_dec = NULL;
+            }
+        }
+
+        err  = clEnqueueWriteBuffer(queue, d_comp, CL_TRUE, 0, comp_total, packed, 0, NULL, NULL);
+        err |= clEnqueueWriteBuffer(queue, d_comp_off, CL_TRUE, 0, nblk * sizeof(cl_uint), h_comp_off, 0, NULL, NULL);
+        err |= clEnqueueWriteBuffer(queue, d_comp_sz, CL_TRUE, 0, nblk * sizeof(cl_uint), h_sizes, 0, NULL, NULL);
+        err |= clEnqueueWriteBuffer(queue, d_out_off, CL_TRUE, 0, nblk * sizeof(cl_uint), h_out_off, 0, NULL, NULL);
+        err |= clEnqueueWriteBuffer(queue, d_max_out, CL_TRUE, 0, nblk * sizeof(cl_uint), h_max_out, 0, NULL, NULL);
+        if (err != CL_SUCCESS) {
+            clReleaseMemObject(d_comp); clReleaseMemObject(d_out); clReleaseMemObject(d_comp_off);
+            clReleaseMemObject(d_comp_sz); clReleaseMemObject(d_out_off); clReleaseMemObject(d_max_out); clReleaseMemObject(d_sizes_out);
+            if (d_dbg_dec) clReleaseMemObject(d_dbg_dec);
+            free(h_sizes); free(h_comp_off); free(h_out_off); free(h_max_out); free(packed);
+            verify_ok = 0;
+            break;
+        }
+
+        cl_uint totalBlocks = (cl_uint)nblk;
+        err  = clSetKernelArg(kdec, 0, sizeof(cl_mem), &d_comp);
+        err |= clSetKernelArg(kdec, 1, sizeof(cl_mem), &d_out);
+        err |= clSetKernelArg(kdec, 2, sizeof(cl_mem), &d_comp_off);
+        err |= clSetKernelArg(kdec, 3, sizeof(cl_mem), &d_comp_sz);
+        err |= clSetKernelArg(kdec, 4, sizeof(cl_mem), &d_out_off);
+        err |= clSetKernelArg(kdec, 5, sizeof(cl_mem), &d_max_out);
+        err |= clSetKernelArg(kdec, 6, sizeof(cl_mem), &d_sizes_out);
+        err |= clSetKernelArg(kdec, 7, sizeof(cl_uint), &totalBlocks);
+        if (kernel_has_dbg_dec) {
+            cl_mem dbg_arg = d_dbg_dec ? d_dbg_dec : d_sizes_out;
+            cl_uint dbg_flag = d_dbg_dec ? 1U : 0U;
+            err |= clSetKernelArg(kdec, 8, sizeof(cl_mem), &dbg_arg);
+            err |= clSetKernelArg(kdec, 9, sizeof(cl_uint), &dbg_flag);
+        }
+        if (err != CL_SUCCESS) {
+            clReleaseMemObject(d_comp); clReleaseMemObject(d_out); clReleaseMemObject(d_comp_off);
+            clReleaseMemObject(d_comp_sz); clReleaseMemObject(d_out_off); clReleaseMemObject(d_max_out); clReleaseMemObject(d_sizes_out);
+            if (d_dbg_dec) clReleaseMemObject(d_dbg_dec);
+            free(h_sizes); free(h_comp_off); free(h_out_off); free(h_max_out); free(packed);
+            verify_ok = 0;
+            break;
+        }
+
+        size_t lsz = (local_size > 0) ? (size_t)local_size : 1;
+        if (lsz > nblk) lsz = 1;
+        size_t gsz = ((nblk + lsz - 1) / lsz) * lsz;
+        if (gsz == 0) gsz = 1;
+
+        uint64_t td0 = get_us();
+        err = clEnqueueNDRangeKernel(queue, kdec, 1, NULL, &gsz, &lsz, 0, NULL, NULL);
+        if (err == CL_SUCCESS) clFinish(queue);
+        uint64_t td1 = get_us();
+        if (err != CL_SUCCESS) {
+            clReleaseMemObject(d_comp); clReleaseMemObject(d_out); clReleaseMemObject(d_comp_off);
+            clReleaseMemObject(d_comp_sz); clReleaseMemObject(d_out_off); clReleaseMemObject(d_max_out); clReleaseMemObject(d_sizes_out);
+            free(h_sizes); free(h_comp_off); free(h_out_off); free(h_max_out); free(packed);
+            verify_ok = 0;
+            break;
+        }
+
+        cl_uint* h_sizes_out = (cl_uint*)malloc(nblk * sizeof(cl_uint));
+        if (!h_sizes_out) {
+            clReleaseMemObject(d_comp); clReleaseMemObject(d_out); clReleaseMemObject(d_comp_off);
+            clReleaseMemObject(d_comp_sz); clReleaseMemObject(d_out_off); clReleaseMemObject(d_max_out); clReleaseMemObject(d_sizes_out);
+            free(h_sizes); free(h_comp_off); free(h_out_off); free(h_max_out); free(packed);
+            verify_ok = 0;
+            break;
+        }
+        err = clEnqueueReadBuffer(queue, d_sizes_out, CL_TRUE, 0, nblk * sizeof(cl_uint), h_sizes_out, 0, NULL, NULL);
+        if (err != CL_SUCCESS) {
+            free(h_sizes_out);
+            clReleaseMemObject(d_comp); clReleaseMemObject(d_out); clReleaseMemObject(d_comp_off);
+            clReleaseMemObject(d_comp_sz); clReleaseMemObject(d_out_off); clReleaseMemObject(d_max_out); clReleaseMemObject(d_sizes_out);
+            if (d_dbg_dec) clReleaseMemObject(d_dbg_dec);
+            free(h_sizes); free(h_comp_off); free(h_out_off); free(h_max_out); free(packed);
+            verify_ok = 0;
+            break;
+        }
+
+        size_t out_total = 0;
+        for (size_t i = 0; i < nblk; ++i) {
+            if (h_sizes_out[i] == 0xFFFFFFFFU) {
+                verify_ok = 0;
+                break;
+            }
+            out_total += (size_t)h_sizes_out[i];
+        }
+
+        void* map_out = clEnqueueMapBuffer(queue, d_out, CL_TRUE, CL_MAP_READ, 0, (size_t)tc.in_size, 0, NULL, NULL, &err);
+        if (err != CL_SUCCESS || !map_out) {
+            verify_ok = 0;
+        } else {
+            if (out_total != (size_t)tc.in_size || memcmp(map_out, input_ref, (size_t)tc.in_size) != 0) {
+                verify_ok = 0;
+            }
+            clEnqueueUnmapMemObject(queue, d_out, map_out, 0, NULL, NULL);
+            clFinish(queue);
+        }
+
+        clReleaseMemObject(d_comp);
+        clReleaseMemObject(d_out);
+        clReleaseMemObject(d_comp_off);
+        clReleaseMemObject(d_comp_sz);
+        clReleaseMemObject(d_out_off);
+        clReleaseMemObject(d_max_out);
+        clReleaseMemObject(d_sizes_out);
+        if (d_dbg_dec) clReleaseMemObject(d_dbg_dec);
+        free(h_sizes_out);
+        free(h_sizes); free(h_comp_off); free(h_out_off); free(h_max_out); free(packed);
+        if (!verify_ok) break;
+
+        if (n == cap) {
+            size_t new_cap = cap * 2;
+            double* nc = (double*)realloc(comp_tp, new_cap * sizeof(double));
+            if (!nc) {
+                verify_ok = 0;
+                break;
+            }
+            comp_tp = nc;
+
+            double* nd = (double*)realloc(dec_tp, new_cap * sizeof(double));
+            if (!nd) {
+                verify_ok = 0;
+                break;
+            }
+            dec_tp = nd;
+
+            double* nr = (double*)realloc(ratio_pct, new_cap * sizeof(double));
+            if (!nr) {
+                verify_ok = 0;
+                break;
+            }
+            ratio_pct = nr;
+            cap = new_cap;
+        }
+
+        double in_mb = (double)tc.in_size / (1024.0 * 1024.0);
+        comp_tp[n] = (tc.kernel_exec_us > 0) ? (in_mb * 1000000.0 / (double)tc.kernel_exec_us) : 0.0;
+        double dec_kernel_us = (double)(td1 - td0);
+        dec_tp[n] = (dec_kernel_us > 0.0) ? (in_mb * 1000000.0 / dec_kernel_us) : 0.0;
+        ratio_pct[n] = (tc.in_size > 0) ? (100.0 * (double)tc.out_size / (double)tc.in_size) : 0.0;
+        n++;
+
+        clock_gettime(CLOCK_MONOTONIC, &ts1);
+        if (elapsed_sec(&ts0, &ts1) >= bench_seconds && n > 0) break;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    double sec = elapsed_sec(&ts0, &ts1);
+
+    if (n > 0) {
+        printf("Bench Compress : kernel_tp=%.2f MB/s ratio=%.2f%%\n",
+               median_double(comp_tp, n), median_double(ratio_pct, n));
+        printf("Bench Decompress : kernel_tp=%.2f MB/s verify=%s\n",
+               median_double(dec_tp, n), verify_ok ? "OK" : "FAIL");
+        printf("Bench Summary : iterations=%zu seconds=%.2f\n", n, sec);
+    } else {
+        fprintf(stderr, "bench error: no successful iteration\n");
+        verify_ok = 0;
+    }
+
+    free(comp_tp);
+    free(dec_tp);
+    free(ratio_pct);
+    free(input_ref);
+    lz4_gpu_workspace_free(&ws);
+    clReleaseKernel(kdec);
+    clReleaseKernel(kcomp);
+    clReleaseProgram(prog);
+    clReleaseCommandQueue(queue);
+    clReleaseContext(ctx);
+    return verify_ok ? 0 : 1;
+}
+
 int run_lz4_standalone(int argc, char** argv) {
     int mode = mode_compress;
+    int bench_mode = 0;
+    double bench_seconds = 3.0;
     const char* input_path = NULL;
     char output_path[512] = {0};
     int output_explicit = 0;
@@ -121,6 +511,20 @@ int run_lz4_standalone(int argc, char** argv) {
             mode = mode_decompress;
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             g_verbose = 1;
+        } else if (strcmp(argv[i], "--bench") == 0) {
+            bench_mode = 1;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                bench_seconds = atof(argv[++i]);
+            }
+        } else if (strcmp(argv[i], "--bench-seconds") == 0) {
+            if (i + 1 < argc) {
+                bench_seconds = atof(argv[++i]);
+            } else {
+                fprintf(stderr, "Error: --bench-seconds requires an argument\n");
+                return 1;
+            }
+        } else if (strncmp(argv[i], "--bench-seconds=", 16) == 0) {
+            bench_seconds = atof(argv[i] + 16);
         } else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) {
             if (i + 1 < argc) {
                 strncpy(output_path, argv[++i], sizeof(output_path) - 1);
@@ -159,6 +563,19 @@ int run_lz4_standalone(int argc, char** argv) {
     if (!input_path) {
         show_help(argv[0]);
         return 1;
+    }
+
+    if (bench_mode) {
+        if (mode != mode_compress) {
+            fprintf(stderr, "Error: --bench only supports compress mode input (it runs compress+decompress internally)\n");
+            return 1;
+        }
+        return run_lz4_bench(input_path,
+                            (int)g_cli_fixed_block_bytes,
+                            g_cli_acceleration,
+                            (int)g_cli_local_size,
+                            g_cli_hash_log,
+                            bench_seconds);
     }
 
     if (!output_explicit) {

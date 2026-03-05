@@ -166,16 +166,60 @@ set_cpu_freq() {
     local max_freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq)
     local min_freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq)
     local target_freq=$(( (max_freq - min_freq) * freq_percent / 100 + min_freq ))
+    local use_perf_pct=false
+    if [ -f /sys/devices/system/cpu/intel_pstate/status ] && [ "$(cat /sys/devices/system/cpu/intel_pstate/status 2>/dev/null)" = "active" ] \
+       && [ -w /sys/devices/system/cpu/intel_pstate/min_perf_pct ] && [ -w /sys/devices/system/cpu/intel_pstate/max_perf_pct ]; then
+        use_perf_pct=true
+    fi
 
     log_info "Target frequency: $((target_freq / 1000)) MHz"
 
-    # 设置所有CPU的频率
-    for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do
-        echo $target_freq | sudo tee $cpu > /dev/null || {
-            log_error "Failed to set frequency"
+    # 为了让频率点更可控：先切换到performance governor（若支持）
+    if [ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
+        for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+            echo performance | sudo tee $cpu > /dev/null 2>&1 || true
+        done
+    fi
+
+    # 关闭Turbo，避免超过目标频率导致频点混叠
+    if [ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]; then
+        echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo > /dev/null 2>&1 || true
+    fi
+
+    if [ "$use_perf_pct" = true ]; then
+        # 先放宽min，再设置max，最后锁定min=max，避免约束导致写入被夹住
+        echo 0 | sudo tee /sys/devices/system/cpu/intel_pstate/min_perf_pct > /dev/null 2>&1 || true
+        echo $freq_percent | sudo tee /sys/devices/system/cpu/intel_pstate/max_perf_pct > /dev/null || {
+            log_error "Failed to set intel_pstate max_perf_pct"
             return 1
         }
-    done
+        echo $freq_percent | sudo tee /sys/devices/system/cpu/intel_pstate/min_perf_pct > /dev/null || {
+            log_error "Failed to set intel_pstate min_perf_pct"
+            return 1
+        }
+
+        local actual_min_pct=$(cat /sys/devices/system/cpu/intel_pstate/min_perf_pct 2>/dev/null || echo -1)
+        local actual_max_pct=$(cat /sys/devices/system/cpu/intel_pstate/max_perf_pct 2>/dev/null || echo -1)
+        if [ "$actual_min_pct" != "$freq_percent" ] || [ "$actual_max_pct" != "$freq_percent" ]; then
+            log_error "intel_pstate perf pct verify failed (want=$freq_percent, got min=$actual_min_pct max=$actual_max_pct)"
+            return 1
+        fi
+    else
+        # 非intel_pstate路径：设置所有CPU的频率上下限
+        for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_min_freq; do
+            echo $target_freq | sudo tee $cpu > /dev/null || {
+                log_error "Failed to set min frequency"
+                return 1
+            }
+        done
+
+        for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do
+            echo $target_freq | sudo tee $cpu > /dev/null || {
+                log_error "Failed to set max frequency"
+                return 1
+            }
+        done
+    fi
 
     log_info "CPU frequency set successfully"
 }
@@ -338,6 +382,17 @@ reset_cpu() {
         for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do
             echo $max_freq | sudo tee $cpu > /dev/null 2>&1 || true
         done
+
+        local min_freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq)
+        for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_min_freq; do
+            echo $min_freq | sudo tee $cpu > /dev/null 2>&1 || true
+        done
+    fi
+
+    # 恢复intel_pstate perf百分比
+    if [ -f /sys/devices/system/cpu/intel_pstate/status ] && [ "$(cat /sys/devices/system/cpu/intel_pstate/status 2>/dev/null)" = "active" ]; then
+        [ -w /sys/devices/system/cpu/intel_pstate/min_perf_pct ] && echo 9 | sudo tee /sys/devices/system/cpu/intel_pstate/min_perf_pct > /dev/null 2>&1 || true
+        [ -w /sys/devices/system/cpu/intel_pstate/max_perf_pct ] && echo 100 | sudo tee /sys/devices/system/cpu/intel_pstate/max_perf_pct > /dev/null 2>&1 || true
     fi
 
     # 恢复governor
