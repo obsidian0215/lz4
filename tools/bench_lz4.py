@@ -29,7 +29,7 @@ LZ4_DAEMON_PID_PATH = "/tmp/lz4_gpu_daemon.pid"
 CPU_BLOCK_SIZES = ["64K", "256K"]
 GPU_BLOCK_SIZES = ["16K", "32K", "64K"]
 CPU_THREADS = [1, 2, 3]
-HASH_LOGS = [13, 14]
+HASH_LOGS = [14, 15]
 LOCAL_SIZES = [1]
 GPU_ACCELS = [1, 2, 3]
 
@@ -590,22 +590,28 @@ def parse_gpu_output(output):
 
 def parse_stable_bench_output(output):
     comp = re.search(
-        r"Bench\s+Compress\s*:\s*kernel_tp=([0-9]+\.?[0-9]*)\s*MB/s\s*ratio=([0-9]+\.?[0-9]*)%",
+        r"Bench\s+Compress\s*:\s*kernel_tp=([0-9]+\.?[0-9]*)\s*MB/s"
+        r"(?:\s+total_tp=([0-9]+\.?[0-9]*)\s*MB/s)?"
+        r"\s+ratio=([0-9]+\.?[0-9]*)%",
         output or "",
         re.IGNORECASE,
     )
     dec = re.search(
-        r"Bench\s+Decompress\s*:\s*kernel_tp=([0-9]+\.?[0-9]*)\s*MB/s\s*verify=(OK|FAIL)",
+        r"Bench\s+Decompress\s*:\s*kernel_tp=([0-9]+\.?[0-9]*)\s*MB/s"
+        r"(?:\s+total_tp=([0-9]+\.?[0-9]*)\s*MB/s)?"
+        r"\s+verify=(OK|FAIL)",
         output or "",
         re.IGNORECASE,
     )
     if not comp or not dec:
         return None
     return {
-        "ratio": float(comp.group(2)),
+        "ratio": float(comp.group(3)),
         "comp_kernel_tp": float(comp.group(1)),
+        "comp_total_tp": float(comp.group(2)) if comp.group(2) else 0.0,
         "dec_kernel_tp": float(dec.group(1)),
-        "verify_ok": dec.group(2).upper() == "OK",
+        "dec_total_tp": float(dec.group(2)) if dec.group(2) else 0.0,
+        "verify_ok": dec.group(3).upper() == "OK",
     }
 
 
@@ -722,6 +728,8 @@ def run_lz4_gpu(file_path, bs, hl, lsz, accel, orig_hash, telemetry=None, bench_
         'ratio': 0,
         'comp_mbs': 0,
         'dec_mbs': 0,
+        'comp_total_mbs': 0,
+        'dec_total_mbs': 0,
         'comp_time_s': 0,
         'dec_time_s': 0,
         'throughput_semantics': 'op_time_bench',
@@ -755,6 +763,8 @@ def run_lz4_gpu(file_path, bs, hl, lsz, accel, orig_hash, telemetry=None, bench_
             stats['ratio'] = stable['ratio']
             stats['comp_mbs'] = stable['comp_kernel_tp']
             stats['dec_mbs'] = stable['dec_kernel_tp']
+            stats['comp_total_mbs'] = stable.get('comp_total_tp', 0.0)
+            stats['dec_total_mbs'] = stable.get('dec_total_tp', 0.0)
             if in_sz > 0 and stats['comp_mbs'] > 0:
                 stats['comp_time_s'] = in_sz / (stats['comp_mbs'] * 1024.0 * 1024.0)
             if in_sz > 0 and stats['dec_mbs'] > 0:
@@ -871,7 +881,8 @@ def main():
             writer.writerow([
                 "File", "FreqPoint", "CPUFreqTargetPct", "GPUFreqTargetPct",
                 "Engine", "Threads_LSZ", "BlockSize", "HashLog", "Acceleration", "Ratio%",
-                "CompMBs", "DecMBs", "CompTime_s", "DecTime_s",
+                "CompMBs", "DecMBs", "CompTotalMBs", "DecTotalMBs",
+                "CompTime_s", "DecTime_s",
                 "CPUFreqAvgKernel_MHz", "GPUFreqAvgKernel_MHz",
                 "CompCPUEnergy_J", "CompGPUEnergy_J", "CompCPUPower_W", "CompGPUPower_W",
                 "Roundtrip_OK"
@@ -902,6 +913,7 @@ def main():
                                     "" if gpu_freq_target is None else gpu_freq_target,
                                     "CPU", t, bs, "N/A", "N/A", fmtf(cpu_stats['ratio'], 2),
                                     fmtf(cpu_stats['comp_mbs'], 2), fmtf(cpu_stats['dec_mbs'], 2),
+                                    "", "",
                                     fmtf(cpu_stats['comp_time_s'], 6), fmtf(cpu_stats['dec_time_s'], 6),
                                     fmtf(cpu_stats['cpu_freq_avg_mhz'], 2),
                                     fmtf(cpu_stats['gpu_freq_avg_mhz'], 2),
@@ -932,6 +944,8 @@ def main():
                                             "" if gpu_freq_target is None else gpu_freq_target,
                                             "GPU", lsz, bs, hl, accel, fmtf(gpu_stats['ratio'], 2),
                                             fmtf(gpu_stats['comp_mbs'], 2), fmtf(gpu_stats['dec_mbs'], 2),
+                                            fmtf(gpu_stats.get('comp_total_mbs', 0), 2),
+                                            fmtf(gpu_stats.get('dec_total_mbs', 0), 2),
                                             fmtf(gpu_stats['comp_time_s'], 6), fmtf(gpu_stats['dec_time_s'], 6),
                                             fmtf(gpu_stats['cpu_freq_avg_mhz'], 2),
                                             fmtf(gpu_stats['gpu_freq_avg_mhz'], 2),

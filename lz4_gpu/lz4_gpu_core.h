@@ -36,6 +36,9 @@ void lz4_gpu_workspace_free(lz4_gpu_workspace_t* ws);
 
 cl_program lz4_load_program(cl_context context, cl_device_id device, int hash_log);
 
+cl_mem ensure_buffer(cl_context context, cl_mem buf, size_t size, size_t* current_capacity, cl_int* err);
+int write_buffer_mapped(cl_command_queue queue, cl_mem buf, const void* src, size_t bytes);
+
 int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kernel,
                     const char* input_path, const char* output_path,
                     size_t block_size, int acceleration, lz4_gpu_workspace_t* ws,

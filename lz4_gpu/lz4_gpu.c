@@ -202,13 +202,64 @@ static int run_lz4_bench(const char* input_path,
 
     size_t cap = 16, n = 0;
     double* comp_tp = (double*)malloc(cap * sizeof(double));
+    double* comp_total_tp = (double*)malloc(cap * sizeof(double));
     double* dec_tp = (double*)malloc(cap * sizeof(double));
+    double* dec_total_tp = (double*)malloc(cap * sizeof(double));
     double* ratio_pct = (double*)malloc(cap * sizeof(double));
     int verify_ok = 1;
 
-    if (!comp_tp || !dec_tp || !ratio_pct) {
+    cl_mem d_comp = NULL;
+    cl_mem d_out = NULL;
+    size_t d_comp_capacity = 0;
+    size_t d_out_capacity = 0;
+
+    cl_uint* h_sizes = NULL;
+    cl_uint* h_comp_off = NULL;
+    cl_uint* h_out_off = NULL;
+    cl_uint* h_max_out = NULL;
+    size_t h_blocks_capacity = 0;
+
+    unsigned char* packed = NULL;
+    size_t packed_capacity = 0;
+
+    cl_uint kernel_num_args_dec = 0;
+    int kernel_has_dbg_dec = 0;
+    if (clGetKernelInfo(kdec, CL_KERNEL_NUM_ARGS, sizeof(kernel_num_args_dec), &kernel_num_args_dec, NULL) == CL_SUCCESS) {
+        kernel_has_dbg_dec = (kernel_num_args_dec >= 10U);
+    }
+
+    if (!comp_tp || !comp_total_tp || !dec_tp || !dec_total_tp || !ratio_pct) {
         fprintf(stderr, "bench error: malloc failed\n");
         verify_ok = 0;
+    }
+
+    if (verify_ok) {
+        ws.decomp_comp_off_buf = ensure_buffer(ctx, ws.decomp_comp_off_buf, sizeof(cl_uint),
+                                               &ws.current_decomp_comp_off_capacity, &err);
+        if (!ws.decomp_comp_off_buf || err != CL_SUCCESS) verify_ok = 0;
+    }
+    if (verify_ok) {
+        ws.decomp_comp_size_buf = ensure_buffer(ctx, ws.decomp_comp_size_buf, sizeof(cl_uint),
+                                                &ws.current_decomp_comp_size_capacity, &err);
+        if (!ws.decomp_comp_size_buf || err != CL_SUCCESS) verify_ok = 0;
+    }
+    if (verify_ok) {
+        ws.decomp_out_off_buf = ensure_buffer(ctx, ws.decomp_out_off_buf, sizeof(cl_uint),
+                                              &ws.current_decomp_out_off_capacity, &err);
+        if (!ws.decomp_out_off_buf || err != CL_SUCCESS) verify_ok = 0;
+    }
+    if (verify_ok) {
+        ws.decomp_max_out_buf = ensure_buffer(ctx, ws.decomp_max_out_buf, sizeof(cl_uint),
+                                              &ws.current_decomp_max_out_capacity, &err);
+        if (!ws.decomp_max_out_buf || err != CL_SUCCESS) verify_ok = 0;
+    }
+    if (verify_ok) {
+        ws.decomp_sizes_out_buf = ensure_buffer(ctx, ws.decomp_sizes_out_buf, sizeof(cl_uint),
+                                                &ws.current_decomp_sizes_out_capacity, &err);
+        if (!ws.decomp_sizes_out_buf || err != CL_SUCCESS) verify_ok = 0;
+    }
+    if (!verify_ok) {
+        fprintf(stderr, "bench error: failed to allocate reusable decomp buffers\n");
     }
 
     struct timespec ts0, ts1;
@@ -218,9 +269,12 @@ static int run_lz4_bench(const char* input_path,
         timing_t tc;
         memset(&tc, 0, sizeof(tc));
 
+        uint64_t tcomp0 = get_us();
+
         int rc = lz4_compress_core(ctx, queue, kcomp, input_path, "/dev/null",
                                    (size_t)block_size, acceleration, &ws, &tc,
                                    local_size, hash_log);
+        uint64_t tcomp1 = get_us();
         if (rc != 0) {
             verify_ok = 0;
             break;
@@ -235,21 +289,52 @@ static int run_lz4_bench(const char* input_path,
             break;
         }
 
-        cl_uint* h_sizes = (cl_uint*)malloc(nblk * sizeof(cl_uint));
-        cl_uint* h_comp_off = (cl_uint*)malloc(nblk * sizeof(cl_uint));
-        cl_uint* h_out_off = (cl_uint*)malloc(nblk * sizeof(cl_uint));
-        cl_uint* h_max_out = (cl_uint*)malloc(nblk * sizeof(cl_uint));
-        unsigned char* packed = (unsigned char*)malloc(comp_total);
-        if (!h_sizes || !h_comp_off || !h_out_off || !h_max_out || !packed) {
-            free(h_sizes); free(h_comp_off); free(h_out_off); free(h_max_out); free(packed);
-            verify_ok = 0;
-            break;
+        if (h_blocks_capacity < nblk) {
+            cl_uint* nh_sizes = (cl_uint*)realloc(h_sizes, nblk * sizeof(cl_uint));
+            if (!nh_sizes) {
+                verify_ok = 0;
+                break;
+            }
+            h_sizes = nh_sizes;
+
+            cl_uint* nh_comp_off = (cl_uint*)realloc(h_comp_off, nblk * sizeof(cl_uint));
+            if (!nh_comp_off) {
+                verify_ok = 0;
+                break;
+            }
+            h_comp_off = nh_comp_off;
+
+            cl_uint* nh_out_off = (cl_uint*)realloc(h_out_off, nblk * sizeof(cl_uint));
+            if (!nh_out_off) {
+                verify_ok = 0;
+                break;
+            }
+            h_out_off = nh_out_off;
+
+            cl_uint* nh_max_out = (cl_uint*)realloc(h_max_out, nblk * sizeof(cl_uint));
+            if (!nh_max_out) {
+                verify_ok = 0;
+                break;
+            }
+            h_max_out = nh_max_out;
+
+            h_blocks_capacity = nblk;
         }
+        if (packed_capacity < comp_total) {
+            unsigned char* npacked = (unsigned char*)realloc(packed, comp_total);
+            if (!npacked) {
+                verify_ok = 0;
+                break;
+            }
+            packed = npacked;
+            packed_capacity = comp_total;
+        }
+
+        uint64_t tdec_total0 = get_us();
 
         void* map_sizes = clEnqueueMapBuffer(queue, ws.output_size_buf, CL_TRUE, CL_MAP_READ,
                                              0, nblk * sizeof(cl_uint), 0, NULL, NULL, &err);
         if (err != CL_SUCCESS || !map_sizes) {
-            free(h_sizes); free(h_comp_off); free(h_out_off); free(h_max_out); free(packed);
             verify_ok = 0;
             break;
         }
@@ -260,7 +345,6 @@ static int run_lz4_bench(const char* input_path,
         void* map_comp = clEnqueueMapBuffer(queue, ws.out_buf, CL_TRUE, CL_MAP_READ,
                                             0, nblk * worst_blk, 0, NULL, NULL, &err);
         if (err != CL_SUCCESS || !map_comp) {
-            free(h_sizes); free(h_comp_off); free(h_out_off); free(h_max_out); free(packed);
             verify_ok = 0;
             break;
         }
@@ -281,35 +365,40 @@ static int run_lz4_bench(const char* input_path,
         clEnqueueUnmapMemObject(queue, ws.out_buf, map_comp, 0, NULL, NULL);
         clFinish(queue);
         if (!verify_ok || co != comp_total) {
-            free(h_sizes); free(h_comp_off); free(h_out_off); free(h_max_out); free(packed);
             verify_ok = 0;
             break;
         }
 
-        cl_mem d_comp = clCreateBuffer(ctx, CL_MEM_READ_ONLY, comp_total, NULL, &err);
-        cl_mem d_out = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, (size_t)tc.in_size, NULL, &err);
-        cl_mem d_comp_off = clCreateBuffer(ctx, CL_MEM_READ_ONLY, nblk * sizeof(cl_uint), NULL, &err);
-        cl_mem d_comp_sz = clCreateBuffer(ctx, CL_MEM_READ_ONLY, nblk * sizeof(cl_uint), NULL, &err);
-        cl_mem d_out_off = clCreateBuffer(ctx, CL_MEM_READ_ONLY, nblk * sizeof(cl_uint), NULL, &err);
-        cl_mem d_max_out = clCreateBuffer(ctx, CL_MEM_READ_ONLY, nblk * sizeof(cl_uint), NULL, &err);
-        cl_mem d_sizes_out = clCreateBuffer(ctx, CL_MEM_READ_WRITE, nblk * sizeof(cl_uint), NULL, &err);
-        cl_mem d_dbg_dec = NULL;
-        cl_uint kernel_num_args_dec = 0;
-        int kernel_has_dbg_dec = 0;
-
-        if (clGetKernelInfo(kdec, CL_KERNEL_NUM_ARGS, sizeof(kernel_num_args_dec), &kernel_num_args_dec, NULL) == CL_SUCCESS) {
-            kernel_has_dbg_dec = (kernel_num_args_dec >= 10U);
+        d_comp = ensure_buffer(ctx, d_comp, comp_total, &d_comp_capacity, &err);
+        if (!d_comp || err != CL_SUCCESS) {
+            verify_ok = 0;
+            break;
+        }
+        d_out = ensure_buffer(ctx, d_out, (size_t)tc.in_size, &d_out_capacity, &err);
+        if (!d_out || err != CL_SUCCESS) {
+            verify_ok = 0;
+            break;
         }
 
-        if (!d_comp || !d_out || !d_comp_off || !d_comp_sz || !d_out_off || !d_max_out || !d_sizes_out) {
-            if (d_comp) clReleaseMemObject(d_comp);
-            if (d_out) clReleaseMemObject(d_out);
-            if (d_comp_off) clReleaseMemObject(d_comp_off);
-            if (d_comp_sz) clReleaseMemObject(d_comp_sz);
-            if (d_out_off) clReleaseMemObject(d_out_off);
-            if (d_max_out) clReleaseMemObject(d_max_out);
-            if (d_sizes_out) clReleaseMemObject(d_sizes_out);
-            free(h_sizes); free(h_comp_off); free(h_out_off); free(h_max_out); free(packed);
+        ws.decomp_comp_off_buf = ensure_buffer(ctx, ws.decomp_comp_off_buf, nblk * sizeof(cl_uint),
+                                               &ws.current_decomp_comp_off_capacity, &err);
+        ws.decomp_comp_size_buf = ensure_buffer(ctx, ws.decomp_comp_size_buf, nblk * sizeof(cl_uint),
+                                                &ws.current_decomp_comp_size_capacity, &err);
+        ws.decomp_out_off_buf = ensure_buffer(ctx, ws.decomp_out_off_buf, nblk * sizeof(cl_uint),
+                                              &ws.current_decomp_out_off_capacity, &err);
+        ws.decomp_max_out_buf = ensure_buffer(ctx, ws.decomp_max_out_buf, nblk * sizeof(cl_uint),
+                                              &ws.current_decomp_max_out_capacity, &err);
+        ws.decomp_sizes_out_buf = ensure_buffer(ctx, ws.decomp_sizes_out_buf, nblk * sizeof(cl_uint),
+                                                &ws.current_decomp_sizes_out_capacity, &err);
+
+        cl_mem d_comp_off = ws.decomp_comp_off_buf;
+        cl_mem d_comp_sz = ws.decomp_comp_size_buf;
+        cl_mem d_out_off = ws.decomp_out_off_buf;
+        cl_mem d_max_out = ws.decomp_max_out_buf;
+        cl_mem d_sizes_out = ws.decomp_sizes_out_buf;
+        cl_mem d_dbg_dec = NULL;
+
+        if (!d_comp_off || !d_comp_sz || !d_out_off || !d_max_out || !d_sizes_out || err != CL_SUCCESS) {
             verify_ok = 0;
             break;
         }
@@ -329,16 +418,12 @@ static int run_lz4_bench(const char* input_path,
             }
         }
 
-        err  = clEnqueueWriteBuffer(queue, d_comp, CL_TRUE, 0, comp_total, packed, 0, NULL, NULL);
-        err |= clEnqueueWriteBuffer(queue, d_comp_off, CL_TRUE, 0, nblk * sizeof(cl_uint), h_comp_off, 0, NULL, NULL);
-        err |= clEnqueueWriteBuffer(queue, d_comp_sz, CL_TRUE, 0, nblk * sizeof(cl_uint), h_sizes, 0, NULL, NULL);
-        err |= clEnqueueWriteBuffer(queue, d_out_off, CL_TRUE, 0, nblk * sizeof(cl_uint), h_out_off, 0, NULL, NULL);
-        err |= clEnqueueWriteBuffer(queue, d_max_out, CL_TRUE, 0, nblk * sizeof(cl_uint), h_max_out, 0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            clReleaseMemObject(d_comp); clReleaseMemObject(d_out); clReleaseMemObject(d_comp_off);
-            clReleaseMemObject(d_comp_sz); clReleaseMemObject(d_out_off); clReleaseMemObject(d_max_out); clReleaseMemObject(d_sizes_out);
+        if (write_buffer_mapped(queue, d_comp, packed, comp_total) != 0 ||
+            write_buffer_mapped(queue, d_comp_off, h_comp_off, nblk * sizeof(cl_uint)) != 0 ||
+            write_buffer_mapped(queue, d_comp_sz, h_sizes, nblk * sizeof(cl_uint)) != 0 ||
+            write_buffer_mapped(queue, d_out_off, h_out_off, nblk * sizeof(cl_uint)) != 0 ||
+            write_buffer_mapped(queue, d_max_out, h_max_out, nblk * sizeof(cl_uint)) != 0) {
             if (d_dbg_dec) clReleaseMemObject(d_dbg_dec);
-            free(h_sizes); free(h_comp_off); free(h_out_off); free(h_max_out); free(packed);
             verify_ok = 0;
             break;
         }
@@ -359,10 +444,7 @@ static int run_lz4_bench(const char* input_path,
             err |= clSetKernelArg(kdec, 9, sizeof(cl_uint), &dbg_flag);
         }
         if (err != CL_SUCCESS) {
-            clReleaseMemObject(d_comp); clReleaseMemObject(d_out); clReleaseMemObject(d_comp_off);
-            clReleaseMemObject(d_comp_sz); clReleaseMemObject(d_out_off); clReleaseMemObject(d_max_out); clReleaseMemObject(d_sizes_out);
             if (d_dbg_dec) clReleaseMemObject(d_dbg_dec);
-            free(h_sizes); free(h_comp_off); free(h_out_off); free(h_max_out); free(packed);
             verify_ok = 0;
             break;
         }
@@ -377,40 +459,29 @@ static int run_lz4_bench(const char* input_path,
         if (err == CL_SUCCESS) clFinish(queue);
         uint64_t td1 = get_us();
         if (err != CL_SUCCESS) {
-            clReleaseMemObject(d_comp); clReleaseMemObject(d_out); clReleaseMemObject(d_comp_off);
-            clReleaseMemObject(d_comp_sz); clReleaseMemObject(d_out_off); clReleaseMemObject(d_max_out); clReleaseMemObject(d_sizes_out);
-            free(h_sizes); free(h_comp_off); free(h_out_off); free(h_max_out); free(packed);
+            if (d_dbg_dec) clReleaseMemObject(d_dbg_dec);
             verify_ok = 0;
             break;
         }
 
-        cl_uint* h_sizes_out = (cl_uint*)malloc(nblk * sizeof(cl_uint));
-        if (!h_sizes_out) {
-            clReleaseMemObject(d_comp); clReleaseMemObject(d_out); clReleaseMemObject(d_comp_off);
-            clReleaseMemObject(d_comp_sz); clReleaseMemObject(d_out_off); clReleaseMemObject(d_max_out); clReleaseMemObject(d_sizes_out);
-            free(h_sizes); free(h_comp_off); free(h_out_off); free(h_max_out); free(packed);
-            verify_ok = 0;
-            break;
-        }
-        err = clEnqueueReadBuffer(queue, d_sizes_out, CL_TRUE, 0, nblk * sizeof(cl_uint), h_sizes_out, 0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            free(h_sizes_out);
-            clReleaseMemObject(d_comp); clReleaseMemObject(d_out); clReleaseMemObject(d_comp_off);
-            clReleaseMemObject(d_comp_sz); clReleaseMemObject(d_out_off); clReleaseMemObject(d_max_out); clReleaseMemObject(d_sizes_out);
+        cl_uint* map_sizes_out = (cl_uint*)clEnqueueMapBuffer(queue, d_sizes_out, CL_TRUE, CL_MAP_READ,
+                                                              0, nblk * sizeof(cl_uint), 0, NULL, NULL, &err);
+        if (err != CL_SUCCESS || !map_sizes_out) {
             if (d_dbg_dec) clReleaseMemObject(d_dbg_dec);
-            free(h_sizes); free(h_comp_off); free(h_out_off); free(h_max_out); free(packed);
             verify_ok = 0;
             break;
         }
 
         size_t out_total = 0;
         for (size_t i = 0; i < nblk; ++i) {
-            if (h_sizes_out[i] == 0xFFFFFFFFU) {
+            if (map_sizes_out[i] == 0xFFFFFFFFU) {
                 verify_ok = 0;
                 break;
             }
-            out_total += (size_t)h_sizes_out[i];
+            out_total += (size_t)map_sizes_out[i];
         }
+        clEnqueueUnmapMemObject(queue, d_sizes_out, map_sizes_out, 0, NULL, NULL);
+        clFinish(queue);
 
         void* map_out = clEnqueueMapBuffer(queue, d_out, CL_TRUE, CL_MAP_READ, 0, (size_t)tc.in_size, 0, NULL, NULL, &err);
         if (err != CL_SUCCESS || !map_out) {
@@ -423,17 +494,10 @@ static int run_lz4_bench(const char* input_path,
             clFinish(queue);
         }
 
-        clReleaseMemObject(d_comp);
-        clReleaseMemObject(d_out);
-        clReleaseMemObject(d_comp_off);
-        clReleaseMemObject(d_comp_sz);
-        clReleaseMemObject(d_out_off);
-        clReleaseMemObject(d_max_out);
-        clReleaseMemObject(d_sizes_out);
         if (d_dbg_dec) clReleaseMemObject(d_dbg_dec);
-        free(h_sizes_out);
-        free(h_sizes); free(h_comp_off); free(h_out_off); free(h_max_out); free(packed);
         if (!verify_ok) break;
+
+        uint64_t tdec_total1 = get_us();
 
         if (n == cap) {
             size_t new_cap = cap * 2;
@@ -444,12 +508,26 @@ static int run_lz4_bench(const char* input_path,
             }
             comp_tp = nc;
 
+            double* nct = (double*)realloc(comp_total_tp, new_cap * sizeof(double));
+            if (!nct) {
+                verify_ok = 0;
+                break;
+            }
+            comp_total_tp = nct;
+
             double* nd = (double*)realloc(dec_tp, new_cap * sizeof(double));
             if (!nd) {
                 verify_ok = 0;
                 break;
             }
             dec_tp = nd;
+
+            double* ndt = (double*)realloc(dec_total_tp, new_cap * sizeof(double));
+            if (!ndt) {
+                verify_ok = 0;
+                break;
+            }
+            dec_total_tp = ndt;
 
             double* nr = (double*)realloc(ratio_pct, new_cap * sizeof(double));
             if (!nr) {
@@ -462,8 +540,12 @@ static int run_lz4_bench(const char* input_path,
 
         double in_mb = (double)tc.in_size / (1024.0 * 1024.0);
         comp_tp[n] = (tc.kernel_exec_us > 0) ? (in_mb * 1000000.0 / (double)tc.kernel_exec_us) : 0.0;
+        double comp_total_us = (double)(tcomp1 - tcomp0);
+        comp_total_tp[n] = (comp_total_us > 0.0) ? (in_mb * 1000000.0 / comp_total_us) : 0.0;
         double dec_kernel_us = (double)(td1 - td0);
         dec_tp[n] = (dec_kernel_us > 0.0) ? (in_mb * 1000000.0 / dec_kernel_us) : 0.0;
+        double dec_total_us = (double)(tdec_total1 - tdec_total0);
+        dec_total_tp[n] = (dec_total_us > 0.0) ? (in_mb * 1000000.0 / dec_total_us) : 0.0;
         ratio_pct[n] = (tc.in_size > 0) ? (100.0 * (double)tc.out_size / (double)tc.in_size) : 0.0;
         n++;
 
@@ -475,10 +557,10 @@ static int run_lz4_bench(const char* input_path,
     double sec = elapsed_sec(&ts0, &ts1);
 
     if (n > 0) {
-        printf("Bench Compress : kernel_tp=%.2f MB/s ratio=%.2f%%\n",
-               median_double(comp_tp, n), median_double(ratio_pct, n));
-        printf("Bench Decompress : kernel_tp=%.2f MB/s verify=%s\n",
-               median_double(dec_tp, n), verify_ok ? "OK" : "FAIL");
+        printf("Bench Compress : kernel_tp=%.2f MB/s total_tp=%.2f MB/s ratio=%.2f%%\n",
+               median_double(comp_tp, n), median_double(comp_total_tp, n), median_double(ratio_pct, n));
+        printf("Bench Decompress : kernel_tp=%.2f MB/s total_tp=%.2f MB/s verify=%s\n",
+               median_double(dec_tp, n), median_double(dec_total_tp, n), verify_ok ? "OK" : "FAIL");
         printf("Bench Summary : iterations=%zu seconds=%.2f\n", n, sec);
     } else {
         fprintf(stderr, "bench error: no successful iteration\n");
@@ -486,8 +568,17 @@ static int run_lz4_bench(const char* input_path,
     }
 
     free(comp_tp);
+    free(comp_total_tp);
     free(dec_tp);
+    free(dec_total_tp);
     free(ratio_pct);
+    free(h_sizes);
+    free(h_comp_off);
+    free(h_out_off);
+    free(h_max_out);
+    free(packed);
+    if (d_comp) clReleaseMemObject(d_comp);
+    if (d_out) clReleaseMemObject(d_out);
     free(input_ref);
     lz4_gpu_workspace_free(&ws);
     clReleaseKernel(kdec);

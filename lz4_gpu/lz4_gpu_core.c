@@ -46,7 +46,7 @@ void lz4_gpu_workspace_free(lz4_gpu_workspace_t* ws) {
     memset(ws, 0, sizeof(*ws));
 }
 
-static cl_mem ensure_buffer(cl_context context, cl_mem buf, size_t size, size_t* current_capacity, cl_int* err) {
+cl_mem ensure_buffer(cl_context context, cl_mem buf, size_t size, size_t* current_capacity, cl_int* err) {
     if (buf && *current_capacity >= size) {
         if (err) *err = CL_SUCCESS;
         return buf;
@@ -65,7 +65,7 @@ static cl_mem ensure_buffer(cl_context context, cl_mem buf, size_t size, size_t*
     }
 }
 
-static int write_buffer_mapped(cl_command_queue queue, cl_mem buf, const void* src, size_t bytes) {
+int write_buffer_mapped(cl_command_queue queue, cl_mem buf, const void* src, size_t bytes) {
     cl_int err;
     if (!buf || !src || bytes == 0) return 0;
 
@@ -434,7 +434,7 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
             fprintf(stderr, "[LZ4-DBG][COMP] warning: failed to enable debug counters, continuing without them\n");
         }
     }
-    size_t dict_size_per_worker = (1ULL << hash_log) * sizeof(cl_ulong);
+    size_t dict_size_per_worker = (1ULL << hash_log) * sizeof(cl_uint);  /* 32-bit compact entries */
     size_t prev_dict_capacity = ws->current_dict_capacity;
     ws->dict_buf = ensure_buffer(context, ws->dict_buf, g_ws * dict_size_per_worker, &ws->current_dict_capacity, &err);
     if (ws->current_dict_capacity != prev_dict_capacity) {
@@ -445,7 +445,11 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
         uint32_t blocks_per_worker = (uint32_t)(((size_t)num_blocks + g_ws - 1) / g_ws);
         uint32_t epochs_needed = blocks_per_worker + 2U;
         if (epochs_needed >= UINT32_MAX - 1024U) epochs_needed = 1024U;
-        if (ws->comp_epoch_base > (uint32_t)(UINT32_MAX - epochs_needed)) {
+        /* 8-bit epoch in kernel: clear dict when low byte would wrap to avoid stale collisions */
+        uint32_t cur_low = ws->comp_epoch_base & 0xFF;
+        uint32_t end_low = (ws->comp_epoch_base + epochs_needed) & 0xFF;
+        int wraps_8bit = (end_low <= cur_low) || (ws->comp_epoch_base > (uint32_t)(UINT32_MAX - epochs_needed));
+        if (wraps_8bit) {
             (void)zero_buffer(queue, ws->dict_buf, ws->current_dict_capacity);
             ws->comp_epoch_base = 1;
         }
