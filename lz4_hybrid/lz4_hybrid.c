@@ -7,9 +7,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <limits.h>
+#include <unistd.h>
 
 #include "../lz4_gpu/lz4_gpu_core.h"
 #include "../lz4_gpu/lz4_gpu_utils.h"
@@ -24,6 +26,8 @@ typedef struct {
     int local_size;
     int cpu_threads;
     double gpu_ratio;
+    int adaptive_split;
+    size_t adaptive_sample_blocks;
     int verbose;
 } hybrid_cfg_t;
 
@@ -41,6 +45,7 @@ typedef struct {
     cl_program prog;
     cl_kernel kcomp;
     cl_kernel kdec;
+    lz4_gpu_workspace_t ws;
 } ocl_env_t;
 
 typedef struct {
@@ -50,6 +55,7 @@ typedef struct {
     size_t global_start_block;
     size_t num_blocks;
     int num_threads;
+    int acceleration;
 
     unsigned char* out_slots;
     size_t out_slot_size;
@@ -86,6 +92,38 @@ typedef struct {
     size_t thread_count;
     cpu_decomp_job_t* job;
 } cpu_decomp_worker_arg_t;
+
+static cl_device_type preferred_opencl_device_type(void) {
+    const char* pref = getenv("FORCE_OPENCL_DEVICE");
+    if (!pref || !*pref) return CL_DEVICE_TYPE_GPU;
+    if (strcasecmp(pref, "CPU") == 0) return CL_DEVICE_TYPE_CPU;
+    if (strcasecmp(pref, "GPU") == 0) return CL_DEVICE_TYPE_GPU;
+    if (strcasecmp(pref, "DEFAULT") == 0) return CL_DEVICE_TYPE_DEFAULT;
+    if (strcasecmp(pref, "ALL") == 0) return CL_DEVICE_TYPE_ALL;
+    return CL_DEVICE_TYPE_GPU;
+}
+
+static int gpu_compress_blocks(ocl_env_t* ocl,
+                               const unsigned char* src,
+                               size_t src_size,
+                               size_t block_size,
+                               int acceleration,
+                               int local_size,
+                               int hash_log,
+                               uint32_t** out_sizes,
+                               unsigned char** out_slots,
+                               size_t* out_slot_size,
+                               uint64_t* kernel_us);
+
+static int gpu_decompress_blocks(ocl_env_t* ocl,
+                                 const unsigned char* comp_data,
+                                 const uint32_t* comp_sizes,
+                                 size_t num_blocks,
+                                 size_t block_size,
+                                 int local_size,
+                                 unsigned char* out_full,
+                                 uint32_t* out_sizes,
+                                 uint64_t* kernel_us);
 
 static size_t parse_size_bytes(const char* s) {
     char* endptr = NULL;
@@ -147,6 +185,83 @@ static size_t blocks_span_size(size_t total_size, size_t block_size, size_t star
     }
 }
 
+static size_t sampled_block_index(size_t sample_pos, size_t sample_count, size_t num_blocks) {
+    if (num_blocks == 0) return 0;
+    if (sample_count <= 1 || num_blocks <= 1) return 0;
+    return (sample_pos * (num_blocks - 1)) / (sample_count - 1);
+}
+
+static double choose_adaptive_gpu_ratio(const unsigned char* input,
+                                        size_t input_size,
+                                        size_t num_blocks,
+                                        const hybrid_cfg_t* cfg,
+                                        double* sample_ratio_pct_out) {
+    size_t sample_blocks;
+    size_t sample_bytes = 0;
+    size_t sample_comp_bytes = 0;
+    char* tmp = NULL;
+    double ratio;
+
+    if (sample_ratio_pct_out) *sample_ratio_pct_out = 0.0;
+    if (!input || input_size == 0 || num_blocks == 0 || !cfg) return cfg ? cfg->gpu_ratio : 1.0;
+    if (cfg->cpu_threads <= 0) return 1.0;
+
+    ratio = cfg->gpu_ratio;
+    sample_blocks = cfg->adaptive_sample_blocks ? cfg->adaptive_sample_blocks : 8;
+    if (sample_blocks > num_blocks) sample_blocks = num_blocks;
+    if (sample_blocks == 0) return ratio;
+
+    tmp = (char*)malloc((size_t)LZ4_compressBound((int)cfg->block_size));
+    if (tmp) {
+        size_t prev_block = SIZE_MAX;
+        for (size_t i = 0; i < sample_blocks; ++i) {
+            const size_t blk_idx = sampled_block_index(i, sample_blocks, num_blocks);
+            const size_t blk_sz = block_input_size(input_size, cfg->block_size, blk_idx);
+            const char* src;
+            int comp_sz;
+            if (blk_idx == prev_block) continue;
+            if (blk_sz == 0) continue;
+            src = (const char*)(const void*)(input + blk_idx * cfg->block_size);
+            comp_sz = LZ4_compress_fast(src, tmp, (int)blk_sz,
+                                        LZ4_compressBound((int)cfg->block_size),
+                                        cfg->acceleration > 0 ? cfg->acceleration : 1);
+            if (comp_sz <= 0) continue;
+            sample_bytes += blk_sz;
+            sample_comp_bytes += (size_t)comp_sz;
+            prev_block = blk_idx;
+        }
+        free(tmp);
+    }
+
+    if (sample_bytes > 0) {
+        const double sample_ratio_pct = 100.0 * (double)sample_comp_bytes / (double)sample_bytes;
+        if (sample_ratio_pct_out) *sample_ratio_pct_out = sample_ratio_pct;
+
+        if (input_size < (8ULL * 1024ULL * 1024ULL)) {
+            ratio *= 0.70;
+        }
+        if (sample_blocks < 4) {
+            ratio *= 0.80;
+        }
+        if (sample_ratio_pct < 20.0) {
+            ratio *= 0.65;
+        } else if (sample_ratio_pct < 35.0) {
+            ratio *= 0.85;
+        } else if (sample_ratio_pct > 70.0) {
+            ratio = 0.90 + 0.10 * ratio;
+        } else if (sample_ratio_pct > 55.0) {
+            ratio = 0.75 + 0.25 * ratio;
+        }
+        if (cfg->cpu_threads >= 2 && input_size >= (32ULL * 1024ULL * 1024ULL) && sample_ratio_pct < 35.0) {
+            ratio *= 0.90;
+        }
+    }
+
+    if (ratio < 0.0) ratio = 0.0;
+    if (ratio > 1.0) ratio = 1.0;
+    return ratio;
+}
+
 static int read_entire_file(const char* path, unsigned char** out_buf, size_t* out_size) {
     FILE* f = NULL;
     unsigned char* buf = NULL;
@@ -191,18 +306,33 @@ static int write_entire_file(const char* path, const unsigned char* buf, size_t 
     return 0;
 }
 
+static int create_temp_path(char* path_buf, size_t path_buf_size, const char* templ) {
+    int fd;
+    if (!path_buf || path_buf_size == 0 || !templ) return -1;
+    if (strlen(templ) + 1 > path_buf_size) return -1;
+    memcpy(path_buf, templ, strlen(templ) + 1);
+    fd = mkstemp(path_buf);
+    if (fd < 0) return -1;
+    close(fd);
+    remove(path_buf);
+    return 0;
+}
+
 static int ocl_init(ocl_env_t* ocl, int hash_log) {
     cl_int err;
     cl_platform_id pf = NULL;
+    cl_device_type pref_type = preferred_opencl_device_type();
     if (!ocl) return -1;
     memset(ocl, 0, sizeof(*ocl));
+    lz4_gpu_workspace_init(&ocl->ws);
 
     err = clGetPlatformIDs(1, &pf, NULL);
     if (err != CL_SUCCESS || pf == NULL) return -1;
 
-    err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_GPU, 1, &ocl->dev, NULL);
-    if (err != CL_SUCCESS) err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_DEFAULT, 1, &ocl->dev, NULL);
-    if (err != CL_SUCCESS) err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_ALL, 1, &ocl->dev, NULL);
+    err = clGetDeviceIDs(pf, pref_type, 1, &ocl->dev, NULL);
+    if (err != CL_SUCCESS && pref_type != CL_DEVICE_TYPE_GPU) err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_GPU, 1, &ocl->dev, NULL);
+    if (err != CL_SUCCESS && pref_type != CL_DEVICE_TYPE_DEFAULT) err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_DEFAULT, 1, &ocl->dev, NULL);
+    if (err != CL_SUCCESS && pref_type != CL_DEVICE_TYPE_ALL) err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_ALL, 1, &ocl->dev, NULL);
     if (err != CL_SUCCESS) return -1;
 
     ocl->ctx = clCreateContext(NULL, 1, &ocl->dev, NULL, NULL, &err);
@@ -225,6 +355,7 @@ static int ocl_init(ocl_env_t* ocl, int hash_log) {
 
 static void ocl_free(ocl_env_t* ocl) {
     if (!ocl) return;
+    lz4_gpu_workspace_free(&ocl->ws);
     if (ocl->kdec) clReleaseKernel(ocl->kdec);
     if (ocl->kcomp) clReleaseKernel(ocl->kcomp);
     if (ocl->prog) clReleaseProgram(ocl->prog);
@@ -248,6 +379,102 @@ static size_t sanitize_local_size(cl_command_queue queue, size_t requested, size
     return l;
 }
 
+static size_t round_up_size(size_t v, size_t align) {
+    if (align == 0) return v;
+    return ((v + align - 1) / align) * align;
+}
+
+static size_t parse_wi_per_cu_env(const char* primary_env, const char* fallback_env, size_t defv) {
+    const char* env = NULL;
+    char* end = NULL;
+    unsigned long parsed;
+
+    if (primary_env && *primary_env) env = getenv(primary_env);
+    if ((!env || !*env) && fallback_env && *fallback_env) env = getenv(fallback_env);
+    if (!env || !*env) return defv;
+
+    parsed = strtoul(env, &end, 10);
+    if (end != env && parsed > 0) return (size_t)parsed;
+    return defv;
+}
+
+static size_t choose_comp_worker_count(cl_command_queue queue, size_t num_blocks, size_t local_size) {
+    cl_device_id qdev = NULL;
+    cl_uint cu = 1;
+    size_t default_wi_per_cu;
+    size_t wi_per_cu;
+    size_t target;
+
+    if (num_blocks == 0) return 1;
+    if (clGetCommandQueueInfo(queue, CL_QUEUE_DEVICE, sizeof(qdev), &qdev, NULL) == CL_SUCCESS && qdev) {
+        clGetDeviceInfo(qdev, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cu), &cu, NULL);
+    }
+    if (cu == 0) cu = 1;
+
+    default_wi_per_cu = (num_blocks >= 4096) ? 16 : 24;
+    wi_per_cu = parse_wi_per_cu_env("LZ4_GPU_COMP_WI_PER_CU", "LZ4_GPU_WI_PER_CU", default_wi_per_cu);
+    target = (size_t)cu * wi_per_cu;
+    if (target < local_size) target = local_size;
+    if (target > num_blocks) target = num_blocks;
+    if (target == 0) target = 1;
+    return target;
+}
+
+static size_t choose_decomp_worker_count(cl_command_queue queue, size_t num_blocks, size_t local_size) {
+    cl_device_id qdev = NULL;
+    cl_uint cu = 1;
+    size_t default_wi_per_cu;
+    size_t wi_per_cu;
+    size_t target;
+
+    if (num_blocks == 0) return 1;
+    if (clGetCommandQueueInfo(queue, CL_QUEUE_DEVICE, sizeof(qdev), &qdev, NULL) == CL_SUCCESS && qdev) {
+        clGetDeviceInfo(qdev, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cu), &cu, NULL);
+    }
+    if (cu == 0) cu = 1;
+
+    default_wi_per_cu = (num_blocks >= 4096) ? 48 : 96;
+    wi_per_cu = parse_wi_per_cu_env("LZ4_GPU_DECOMP_WI_PER_CU", "LZ4_GPU_WI_PER_CU", default_wi_per_cu);
+    target = (size_t)cu * wi_per_cu;
+    if (target < local_size) target = local_size;
+    if (target > num_blocks) target = num_blocks;
+    if (target == 0) target = 1;
+    return target;
+}
+
+static int choose_lz4_table_type(size_t block_size) {
+    const char* force = getenv("LZ4_FORCE_TABLETYPE");
+    if (force && *force) {
+        int forced = atoi(force);
+        if (forced == 0 || forced == 1) return forced;
+    }
+    return (block_size <= 65536U) ? 0 : 1;
+}
+
+static int zero_cl_buffer(cl_command_queue queue, cl_mem buf, size_t bytes) {
+    if (!buf || bytes == 0) return 0;
+#if defined(CL_VERSION_1_2)
+    {
+        static const cl_uint z = 0;
+        cl_int err = clEnqueueFillBuffer(queue, buf, &z, sizeof(z), 0, bytes, 0, NULL, NULL);
+        if (err == CL_SUCCESS) {
+            clFinish(queue);
+            return 0;
+        }
+    }
+#endif
+    {
+        cl_int err;
+        void* mapped = clEnqueueMapBuffer(queue, buf, CL_TRUE, CL_MAP_WRITE, 0, bytes, 0, NULL, NULL, &err);
+        if (err != CL_SUCCESS || !mapped) return -1;
+        memset(mapped, 0, bytes);
+        err = clEnqueueUnmapMemObject(queue, buf, mapped, 0, NULL, NULL);
+        if (err != CL_SUCCESS) return -1;
+        clFinish(queue);
+    }
+    return 0;
+}
+
 static void* cpu_comp_worker(void* argp) {
     cpu_comp_worker_arg_t* arg = (cpu_comp_worker_arg_t*)argp;
     cpu_comp_job_t* job = arg->job;
@@ -262,7 +489,11 @@ static void* cpu_comp_worker(void* argp) {
             job->err = 1;
             return NULL;
         }
-        csz = LZ4_compress_default((const char*)src_ptr, (char*)dst_ptr, (int)in_sz, (int)job->out_slot_size);
+        csz = LZ4_compress_fast((const char*)src_ptr,
+                                (char*)dst_ptr,
+                                (int)in_sz,
+                                (int)job->out_slot_size,
+                                (job->acceleration > 0) ? job->acceleration : 1);
         if (csz <= 0) {
             job->err = 1;
             return NULL;
@@ -285,6 +516,13 @@ static void* cpu_comp_top(void* argp) {
     }
     if (tcount <= 0) tcount = 1;
     if ((size_t)tcount > job->num_blocks) tcount = (int)job->num_blocks;
+
+    if (tcount == 1) {
+        cpu_comp_worker_arg_t arg = { .thread_idx = 0, .thread_count = 1, .job = job };
+        cpu_comp_worker(&arg);
+        job->elapsed_us = get_us() - t0;
+        return NULL;
+    }
 
     tids = (pthread_t*)malloc((size_t)tcount * sizeof(pthread_t));
     args = (cpu_comp_worker_arg_t*)malloc((size_t)tcount * sizeof(cpu_comp_worker_arg_t));
@@ -345,6 +583,13 @@ static void* cpu_decomp_top(void* argp) {
     if (tcount <= 0) tcount = 1;
     if ((size_t)tcount > job->num_blocks) tcount = (int)job->num_blocks;
 
+    if (tcount == 1) {
+        cpu_decomp_worker_arg_t arg = { .thread_idx = 0, .thread_count = 1, .job = job };
+        cpu_decomp_worker(&arg);
+        job->elapsed_us = get_us() - t0;
+        return NULL;
+    }
+
     tids = (pthread_t*)malloc((size_t)tcount * sizeof(pthread_t));
     args = (cpu_decomp_worker_arg_t*)malloc((size_t)tcount * sizeof(cpu_decomp_worker_arg_t));
     if (!tids || !args) {
@@ -383,7 +628,6 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
                                size_t* out_slot_size,
                                uint64_t* kernel_us) {
     cl_int err = CL_SUCCESS;
-    cl_mem in_buf = NULL, out_buf = NULL, block_info_buf = NULL, out_offsets_buf = NULL, out_size_buf = NULL, dict_buf = NULL;
     uint32_t* h_block_info = NULL;
     uint32_t* h_out_offsets = NULL;
     uint32_t* h_sizes = NULL;
@@ -396,7 +640,10 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
     int inputSize;
     int totalBlocks;
     int globalIndexBase = 0;
-    uint32_t epoch_base = 1;
+    uint32_t epoch_base;
+    size_t dict_entries_per_worker;
+    size_t dict_bytes;
+    size_t prev_dict_capacity;
 
     if (!ocl || !src || src_size == 0 || block_size == 0 || !out_sizes || !out_slots || !out_slot_size || !kernel_us) return -1;
 
@@ -424,46 +671,66 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
     }
 
     lsz = sanitize_local_size(ocl->queue, (size_t)((local_size > 0) ? local_size : 1), num_blocks);
-    gsz = ((num_blocks + lsz - 1U) / lsz) * lsz;
+    gsz = round_up_size(choose_comp_worker_count(ocl->queue, num_blocks, lsz), lsz);
     if (gsz == 0) gsz = 1;
 
-    in_buf = clCreateBuffer(ocl->ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, src_size, NULL, &err);
-    if (err != CL_SUCCESS || !in_buf) goto fail;
-    out_buf = clCreateBuffer(ocl->ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, num_blocks * single_block_max_out, NULL, &err);
-    if (err != CL_SUCCESS || !out_buf) goto fail;
-    block_info_buf = clCreateBuffer(ocl->ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, num_blocks * 2U * sizeof(uint32_t), NULL, &err);
-    if (err != CL_SUCCESS || !block_info_buf) goto fail;
-    out_offsets_buf = clCreateBuffer(ocl->ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, num_blocks * sizeof(uint32_t), NULL, &err);
-    if (err != CL_SUCCESS || !out_offsets_buf) goto fail;
-    out_size_buf = clCreateBuffer(ocl->ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, num_blocks * sizeof(uint32_t), NULL, &err);
-    if (err != CL_SUCCESS || !out_size_buf) goto fail;
-    dict_buf = clCreateBuffer(ocl->ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR,
-                              ((size_t)1U << hash_log) * sizeof(cl_uint) * gsz,
-                              NULL, &err);
-    if (err != CL_SUCCESS || !dict_buf) goto fail;
+    tableType = choose_lz4_table_type(block_size);
 
-    if (write_buffer_mapped(ocl->queue, in_buf, src, src_size) != 0 ||
-        write_buffer_mapped(ocl->queue, block_info_buf, h_block_info, num_blocks * 2U * sizeof(uint32_t)) != 0 ||
-        write_buffer_mapped(ocl->queue, out_offsets_buf, h_out_offsets, num_blocks * sizeof(uint32_t)) != 0) {
+    ocl->ws.in_buf = ensure_buffer(ocl->ctx, ocl->ws.in_buf, src_size, &ocl->ws.current_in_capacity, &err);
+    if (err != CL_SUCCESS || !ocl->ws.in_buf) goto fail;
+    ocl->ws.out_buf = ensure_buffer(ocl->ctx, ocl->ws.out_buf, num_blocks * single_block_max_out, &ocl->ws.current_out_capacity, &err);
+    if (err != CL_SUCCESS || !ocl->ws.out_buf) goto fail;
+    ocl->ws.block_info_buf = ensure_buffer(ocl->ctx, ocl->ws.block_info_buf, num_blocks * 2U * sizeof(uint32_t), &ocl->ws.current_blocks_capacity, &err);
+    if (err != CL_SUCCESS || !ocl->ws.block_info_buf) goto fail;
+    ocl->ws.out_offsets_buf = ensure_buffer(ocl->ctx, ocl->ws.out_offsets_buf, num_blocks * sizeof(uint32_t), &ocl->ws.current_out_offsets_capacity, &err);
+    if (err != CL_SUCCESS || !ocl->ws.out_offsets_buf) goto fail;
+    ocl->ws.output_size_buf = ensure_buffer(ocl->ctx, ocl->ws.output_size_buf, num_blocks * sizeof(uint32_t), &ocl->ws.current_osize_capacity, &err);
+    if (err != CL_SUCCESS || !ocl->ws.output_size_buf) goto fail;
+
+    dict_entries_per_worker = (size_t)1U << (tableType == 0 ? (hash_log + 1) : hash_log);
+    dict_bytes = dict_entries_per_worker * sizeof(cl_uint) * gsz;
+    prev_dict_capacity = ocl->ws.current_dict_capacity;
+    ocl->ws.dict_buf = ensure_buffer(ocl->ctx, ocl->ws.dict_buf, dict_bytes, &ocl->ws.current_dict_capacity, &err);
+    if (err != CL_SUCCESS || !ocl->ws.dict_buf) goto fail;
+    if (ocl->ws.current_dict_capacity != prev_dict_capacity) {
+        if (zero_cl_buffer(ocl->queue, ocl->ws.dict_buf, ocl->ws.current_dict_capacity) != 0) goto fail;
+    }
+    if (ocl->ws.comp_epoch_base == 0) ocl->ws.comp_epoch_base = 1;
+    {
+        uint32_t blocks_per_worker = (uint32_t)(((size_t)num_blocks + gsz - 1) / gsz);
+        uint32_t epochs_needed = blocks_per_worker + 2U;
+        uint32_t cur_low = ocl->ws.comp_epoch_base & 0xFFU;
+        uint32_t end_low = (ocl->ws.comp_epoch_base + epochs_needed) & 0xFFU;
+        int wraps_8bit = (end_low <= cur_low) || (ocl->ws.comp_epoch_base > (uint32_t)(UINT32_MAX - epochs_needed));
+        if (wraps_8bit) {
+            if (zero_cl_buffer(ocl->queue, ocl->ws.dict_buf, ocl->ws.current_dict_capacity) != 0) goto fail;
+            ocl->ws.comp_epoch_base = 1;
+        }
+    }
+    epoch_base = ocl->ws.comp_epoch_base;
+    ocl->ws.comp_epoch_base += (uint32_t)(((size_t)num_blocks + gsz - 1) / gsz) + 2U;
+
+    if (write_buffer_mapped(ocl->queue, ocl->ws.in_buf, src, src_size) != 0 ||
+        write_buffer_mapped(ocl->queue, ocl->ws.block_info_buf, h_block_info, num_blocks * 2U * sizeof(uint32_t)) != 0 ||
+        write_buffer_mapped(ocl->queue, ocl->ws.out_offsets_buf, h_out_offsets, num_blocks * sizeof(uint32_t)) != 0) {
         goto fail;
     }
 
-    tableType = (block_size <= 65536U) ? 0 : 1;
     inputSize = (int)src_size;
     totalBlocks = (int)num_blocks;
 
     err = CL_SUCCESS;
-    err |= clSetKernelArg(ocl->kcomp, 0, sizeof(cl_mem), &in_buf);
-    err |= clSetKernelArg(ocl->kcomp, 1, sizeof(cl_mem), &out_buf);
-    err |= clSetKernelArg(ocl->kcomp, 2, sizeof(cl_mem), &out_size_buf);
-    err |= clSetKernelArg(ocl->kcomp, 3, sizeof(cl_mem), &block_info_buf);
-    err |= clSetKernelArg(ocl->kcomp, 4, sizeof(cl_mem), &out_offsets_buf);
+    err |= clSetKernelArg(ocl->kcomp, 0, sizeof(cl_mem), &ocl->ws.in_buf);
+    err |= clSetKernelArg(ocl->kcomp, 1, sizeof(cl_mem), &ocl->ws.out_buf);
+    err |= clSetKernelArg(ocl->kcomp, 2, sizeof(cl_mem), &ocl->ws.output_size_buf);
+    err |= clSetKernelArg(ocl->kcomp, 3, sizeof(cl_mem), &ocl->ws.block_info_buf);
+    err |= clSetKernelArg(ocl->kcomp, 4, sizeof(cl_mem), &ocl->ws.out_offsets_buf);
     err |= clSetKernelArg(ocl->kcomp, 5, sizeof(int), &totalBlocks);
     err |= clSetKernelArg(ocl->kcomp, 6, sizeof(int), &inputSize);
     err |= clSetKernelArg(ocl->kcomp, 7, sizeof(int), &tableType);
     err |= clSetKernelArg(ocl->kcomp, 8, sizeof(int), &acceleration);
     err |= clSetKernelArg(ocl->kcomp, 9, sizeof(int), &globalIndexBase);
-    err |= clSetKernelArg(ocl->kcomp, 10, sizeof(cl_mem), &dict_buf);
+    err |= clSetKernelArg(ocl->kcomp, 10, sizeof(cl_mem), &ocl->ws.dict_buf);
     err |= clSetKernelArg(ocl->kcomp, 11, sizeof(uint32_t), &epoch_base);
     if (err != CL_SUCCESS) goto fail;
 
@@ -475,10 +742,30 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
         *kernel_us = get_us() - t0;
     }
 
-    err = clEnqueueReadBuffer(ocl->queue, out_size_buf, CL_TRUE, 0, num_blocks * sizeof(uint32_t), h_sizes, 0, NULL, NULL);
-    if (err != CL_SUCCESS) goto fail;
-    err = clEnqueueReadBuffer(ocl->queue, out_buf, CL_TRUE, 0, num_blocks * single_block_max_out, h_out, 0, NULL, NULL);
-    if (err != CL_SUCCESS) goto fail;
+    {
+        void* mapped_sizes = clEnqueueMapBuffer(ocl->queue, ocl->ws.output_size_buf, CL_TRUE, CL_MAP_READ,
+                                                0, num_blocks * sizeof(uint32_t), 0, NULL, NULL, &err);
+        if (err == CL_SUCCESS && mapped_sizes) {
+            memcpy(h_sizes, mapped_sizes, num_blocks * sizeof(uint32_t));
+            clEnqueueUnmapMemObject(ocl->queue, ocl->ws.output_size_buf, mapped_sizes, 0, NULL, NULL);
+            clFinish(ocl->queue);
+        } else {
+            err = clEnqueueReadBuffer(ocl->queue, ocl->ws.output_size_buf, CL_TRUE, 0, num_blocks * sizeof(uint32_t), h_sizes, 0, NULL, NULL);
+            if (err != CL_SUCCESS) goto fail;
+        }
+    }
+    {
+        void* mapped_out = clEnqueueMapBuffer(ocl->queue, ocl->ws.out_buf, CL_TRUE, CL_MAP_READ,
+                                              0, num_blocks * single_block_max_out, 0, NULL, NULL, &err);
+        if (err == CL_SUCCESS && mapped_out) {
+            memcpy(h_out, mapped_out, num_blocks * single_block_max_out);
+            clEnqueueUnmapMemObject(ocl->queue, ocl->ws.out_buf, mapped_out, 0, NULL, NULL);
+            clFinish(ocl->queue);
+        } else {
+            err = clEnqueueReadBuffer(ocl->queue, ocl->ws.out_buf, CL_TRUE, 0, num_blocks * single_block_max_out, h_out, 0, NULL, NULL);
+            if (err != CL_SUCCESS) goto fail;
+        }
+    }
 
     *out_sizes = h_sizes;
     *out_slots = h_out;
@@ -487,12 +774,6 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
     h_sizes = NULL;
     h_out = NULL;
 
-    if (dict_buf) clReleaseMemObject(dict_buf);
-    if (out_size_buf) clReleaseMemObject(out_size_buf);
-    if (out_offsets_buf) clReleaseMemObject(out_offsets_buf);
-    if (block_info_buf) clReleaseMemObject(block_info_buf);
-    if (out_buf) clReleaseMemObject(out_buf);
-    if (in_buf) clReleaseMemObject(in_buf);
     free(h_block_info);
     free(h_out_offsets);
     free(h_sizes);
@@ -500,12 +781,6 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
     return 0;
 
 fail:
-    if (dict_buf) clReleaseMemObject(dict_buf);
-    if (out_size_buf) clReleaseMemObject(out_size_buf);
-    if (out_offsets_buf) clReleaseMemObject(out_offsets_buf);
-    if (block_info_buf) clReleaseMemObject(block_info_buf);
-    if (out_buf) clReleaseMemObject(out_buf);
-    if (in_buf) clReleaseMemObject(in_buf);
     free(h_block_info);
     free(h_out_offsets);
     free(h_sizes);
@@ -523,7 +798,6 @@ static int gpu_decompress_blocks(ocl_env_t* ocl,
                                  uint32_t* out_sizes,
                                  uint64_t* kernel_us) {
     cl_int err = CL_SUCCESS;
-    cl_mem in_buf = NULL, out_buf = NULL, comp_off_buf = NULL, comp_sz_buf = NULL, out_off_buf = NULL, max_out_buf = NULL, sizes_out_buf = NULL;
     uint32_t* h_comp_off = NULL;
     uint32_t* h_out_off = NULL;
     uint32_t* h_max_out = NULL;
@@ -551,43 +825,43 @@ static int gpu_decompress_blocks(ocl_env_t* ocl,
         comp_total += (size_t)comp_sizes[i];
     }
 
-    in_buf = clCreateBuffer(ocl->ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, comp_total, NULL, &err);
-    if (err != CL_SUCCESS || !in_buf) goto fail;
-    out_buf = clCreateBuffer(ocl->ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, num_blocks * block_size, NULL, &err);
-    if (err != CL_SUCCESS || !out_buf) goto fail;
-    comp_off_buf = clCreateBuffer(ocl->ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, num_blocks * sizeof(uint32_t), NULL, &err);
-    if (err != CL_SUCCESS || !comp_off_buf) goto fail;
-    comp_sz_buf = clCreateBuffer(ocl->ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, num_blocks * sizeof(uint32_t), NULL, &err);
-    if (err != CL_SUCCESS || !comp_sz_buf) goto fail;
-    out_off_buf = clCreateBuffer(ocl->ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, num_blocks * sizeof(uint32_t), NULL, &err);
-    if (err != CL_SUCCESS || !out_off_buf) goto fail;
-    max_out_buf = clCreateBuffer(ocl->ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, num_blocks * sizeof(uint32_t), NULL, &err);
-    if (err != CL_SUCCESS || !max_out_buf) goto fail;
-    sizes_out_buf = clCreateBuffer(ocl->ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, num_blocks * sizeof(uint32_t), NULL, &err);
-    if (err != CL_SUCCESS || !sizes_out_buf) goto fail;
+    ocl->ws.in_buf = ensure_buffer(ocl->ctx, ocl->ws.in_buf, comp_total, &ocl->ws.current_in_capacity, &err);
+    if (err != CL_SUCCESS || !ocl->ws.in_buf) goto fail;
+    ocl->ws.out_buf = ensure_buffer(ocl->ctx, ocl->ws.out_buf, num_blocks * block_size, &ocl->ws.current_out_capacity, &err);
+    if (err != CL_SUCCESS || !ocl->ws.out_buf) goto fail;
+    ocl->ws.decomp_comp_off_buf = ensure_buffer(ocl->ctx, ocl->ws.decomp_comp_off_buf, num_blocks * sizeof(uint32_t), &ocl->ws.current_decomp_comp_off_capacity, &err);
+    if (err != CL_SUCCESS || !ocl->ws.decomp_comp_off_buf) goto fail;
+    ocl->ws.decomp_comp_size_buf = ensure_buffer(ocl->ctx, ocl->ws.decomp_comp_size_buf, num_blocks * sizeof(uint32_t), &ocl->ws.current_decomp_comp_size_capacity, &err);
+    if (err != CL_SUCCESS || !ocl->ws.decomp_comp_size_buf) goto fail;
+    ocl->ws.decomp_out_off_buf = ensure_buffer(ocl->ctx, ocl->ws.decomp_out_off_buf, num_blocks * sizeof(uint32_t), &ocl->ws.current_decomp_out_off_capacity, &err);
+    if (err != CL_SUCCESS || !ocl->ws.decomp_out_off_buf) goto fail;
+    ocl->ws.decomp_max_out_buf = ensure_buffer(ocl->ctx, ocl->ws.decomp_max_out_buf, num_blocks * sizeof(uint32_t), &ocl->ws.current_decomp_max_out_capacity, &err);
+    if (err != CL_SUCCESS || !ocl->ws.decomp_max_out_buf) goto fail;
+    ocl->ws.decomp_sizes_out_buf = ensure_buffer(ocl->ctx, ocl->ws.decomp_sizes_out_buf, num_blocks * sizeof(uint32_t), &ocl->ws.current_decomp_sizes_out_capacity, &err);
+    if (err != CL_SUCCESS || !ocl->ws.decomp_sizes_out_buf) goto fail;
 
-    if (write_buffer_mapped(ocl->queue, in_buf, comp_data, comp_total) != 0 ||
-        write_buffer_mapped(ocl->queue, comp_off_buf, h_comp_off, num_blocks * sizeof(uint32_t)) != 0 ||
-        write_buffer_mapped(ocl->queue, comp_sz_buf, comp_sizes, num_blocks * sizeof(uint32_t)) != 0 ||
-        write_buffer_mapped(ocl->queue, out_off_buf, h_out_off, num_blocks * sizeof(uint32_t)) != 0 ||
-        write_buffer_mapped(ocl->queue, max_out_buf, h_max_out, num_blocks * sizeof(uint32_t)) != 0) {
+    if (write_buffer_mapped(ocl->queue, ocl->ws.in_buf, comp_data, comp_total) != 0 ||
+        write_buffer_mapped(ocl->queue, ocl->ws.decomp_comp_off_buf, h_comp_off, num_blocks * sizeof(uint32_t)) != 0 ||
+        write_buffer_mapped(ocl->queue, ocl->ws.decomp_comp_size_buf, comp_sizes, num_blocks * sizeof(uint32_t)) != 0 ||
+        write_buffer_mapped(ocl->queue, ocl->ws.decomp_out_off_buf, h_out_off, num_blocks * sizeof(uint32_t)) != 0 ||
+        write_buffer_mapped(ocl->queue, ocl->ws.decomp_max_out_buf, h_max_out, num_blocks * sizeof(uint32_t)) != 0) {
         goto fail;
     }
 
     totalBlocks = (uint32_t)num_blocks;
     err = CL_SUCCESS;
-    err |= clSetKernelArg(ocl->kdec, 0, sizeof(cl_mem), &in_buf);
-    err |= clSetKernelArg(ocl->kdec, 1, sizeof(cl_mem), &out_buf);
-    err |= clSetKernelArg(ocl->kdec, 2, sizeof(cl_mem), &comp_off_buf);
-    err |= clSetKernelArg(ocl->kdec, 3, sizeof(cl_mem), &comp_sz_buf);
-    err |= clSetKernelArg(ocl->kdec, 4, sizeof(cl_mem), &out_off_buf);
-    err |= clSetKernelArg(ocl->kdec, 5, sizeof(cl_mem), &max_out_buf);
-    err |= clSetKernelArg(ocl->kdec, 6, sizeof(cl_mem), &sizes_out_buf);
+    err |= clSetKernelArg(ocl->kdec, 0, sizeof(cl_mem), &ocl->ws.in_buf);
+    err |= clSetKernelArg(ocl->kdec, 1, sizeof(cl_mem), &ocl->ws.out_buf);
+    err |= clSetKernelArg(ocl->kdec, 2, sizeof(cl_mem), &ocl->ws.decomp_comp_off_buf);
+    err |= clSetKernelArg(ocl->kdec, 3, sizeof(cl_mem), &ocl->ws.decomp_comp_size_buf);
+    err |= clSetKernelArg(ocl->kdec, 4, sizeof(cl_mem), &ocl->ws.decomp_out_off_buf);
+    err |= clSetKernelArg(ocl->kdec, 5, sizeof(cl_mem), &ocl->ws.decomp_max_out_buf);
+    err |= clSetKernelArg(ocl->kdec, 6, sizeof(cl_mem), &ocl->ws.decomp_sizes_out_buf);
     err |= clSetKernelArg(ocl->kdec, 7, sizeof(uint32_t), &totalBlocks);
     if (err != CL_SUCCESS) goto fail;
 
     lsz = sanitize_local_size(ocl->queue, (size_t)((local_size > 0) ? local_size : 1), num_blocks);
-    gsz = ((num_blocks + lsz - 1U) / lsz) * lsz;
+    gsz = round_up_size(choose_decomp_worker_count(ocl->queue, num_blocks, lsz), lsz);
     if (gsz == 0) gsz = 1;
 
     {
@@ -598,36 +872,41 @@ static int gpu_decompress_blocks(ocl_env_t* ocl,
         *kernel_us = get_us() - t0;
     }
 
-    err = clEnqueueReadBuffer(ocl->queue, sizes_out_buf, CL_TRUE, 0, num_blocks * sizeof(uint32_t), out_sizes, 0, NULL, NULL);
-    if (err != CL_SUCCESS) goto fail;
+    {
+        void* mapped_sizes = clEnqueueMapBuffer(ocl->queue, ocl->ws.decomp_sizes_out_buf, CL_TRUE, CL_MAP_READ,
+                                                0, num_blocks * sizeof(uint32_t), 0, NULL, NULL, &err);
+        if (err == CL_SUCCESS && mapped_sizes) {
+            memcpy(out_sizes, mapped_sizes, num_blocks * sizeof(uint32_t));
+            clEnqueueUnmapMemObject(ocl->queue, ocl->ws.decomp_sizes_out_buf, mapped_sizes, 0, NULL, NULL);
+            clFinish(ocl->queue);
+        } else {
+            err = clEnqueueReadBuffer(ocl->queue, ocl->ws.decomp_sizes_out_buf, CL_TRUE, 0, num_blocks * sizeof(uint32_t), out_sizes, 0, NULL, NULL);
+            if (err != CL_SUCCESS) goto fail;
+        }
+    }
 
     for (size_t i = 0; i < num_blocks; ++i) {
         if (out_sizes[i] == 0xFFFFFFFFU) goto fail;
     }
 
-    err = clEnqueueReadBuffer(ocl->queue, out_buf, CL_TRUE, 0, num_blocks * block_size, out_full, 0, NULL, NULL);
-    if (err != CL_SUCCESS) goto fail;
-
-    if (sizes_out_buf) clReleaseMemObject(sizes_out_buf);
-    if (max_out_buf) clReleaseMemObject(max_out_buf);
-    if (out_off_buf) clReleaseMemObject(out_off_buf);
-    if (comp_sz_buf) clReleaseMemObject(comp_sz_buf);
-    if (comp_off_buf) clReleaseMemObject(comp_off_buf);
-    if (out_buf) clReleaseMemObject(out_buf);
-    if (in_buf) clReleaseMemObject(in_buf);
+    {
+        void* mapped_out = clEnqueueMapBuffer(ocl->queue, ocl->ws.out_buf, CL_TRUE, CL_MAP_READ,
+                                              0, num_blocks * block_size, 0, NULL, NULL, &err);
+        if (err == CL_SUCCESS && mapped_out) {
+            memcpy(out_full, mapped_out, num_blocks * block_size);
+            clEnqueueUnmapMemObject(ocl->queue, ocl->ws.out_buf, mapped_out, 0, NULL, NULL);
+            clFinish(ocl->queue);
+        } else {
+            err = clEnqueueReadBuffer(ocl->queue, ocl->ws.out_buf, CL_TRUE, 0, num_blocks * block_size, out_full, 0, NULL, NULL);
+            if (err != CL_SUCCESS) goto fail;
+        }
+    }
     free(h_comp_off);
     free(h_out_off);
     free(h_max_out);
     return 0;
 
 fail:
-    if (sizes_out_buf) clReleaseMemObject(sizes_out_buf);
-    if (max_out_buf) clReleaseMemObject(max_out_buf);
-    if (out_off_buf) clReleaseMemObject(out_off_buf);
-    if (comp_sz_buf) clReleaseMemObject(comp_sz_buf);
-    if (comp_off_buf) clReleaseMemObject(comp_off_buf);
-    if (out_buf) clReleaseMemObject(out_buf);
-    if (in_buf) clReleaseMemObject(in_buf);
     free(h_comp_off);
     free(h_out_off);
     free(h_max_out);
@@ -646,6 +925,8 @@ static int hybrid_compress_memory(ocl_env_t* ocl,
     size_t cpu_blocks;
     size_t cpu_start;
     size_t cpu_slot_size = 0;
+    double effective_gpu_ratio;
+    double sample_ratio_pct = 0.0;
     uint32_t* all_sizes = NULL;
     unsigned char* final_out = NULL;
     size_t final_sz = 0;
@@ -666,26 +947,48 @@ static int hybrid_compress_memory(ocl_env_t* ocl,
     *out_size = 0;
 
     num_blocks = (input_size + cfg->block_size - 1) / cfg->block_size;
-    gpu_blocks = (size_t)((double)num_blocks * cfg->gpu_ratio);
+    effective_gpu_ratio = cfg->gpu_ratio;
+    if (cfg->cpu_threads <= 0) {
+        effective_gpu_ratio = 1.0;
+    } else if (cfg->adaptive_split) {
+        effective_gpu_ratio = choose_adaptive_gpu_ratio(input, input_size, num_blocks, cfg, &sample_ratio_pct);
+    }
+    gpu_blocks = (size_t)((double)num_blocks * effective_gpu_ratio + 0.5);
     if (gpu_blocks > num_blocks) gpu_blocks = num_blocks;
     cpu_blocks = num_blocks - gpu_blocks;
     cpu_start = gpu_blocks;
+
+    if (cfg->verbose && cfg->adaptive_split) {
+        fprintf(stderr,
+                "Adaptive split: sample_ratio=%.2f%% requested_gpu_ratio=%.2f effective_gpu_ratio=%.2f gpu_blocks=%zu cpu_blocks=%zu\n",
+                sample_ratio_pct,
+                cfg->gpu_ratio,
+                effective_gpu_ratio,
+                gpu_blocks,
+                cpu_blocks);
+    }
 
     all_sizes = (uint32_t*)calloc(num_blocks, sizeof(uint32_t));
     if (!all_sizes) goto fail;
 
     if (cpu_blocks > 0) {
         cpu_slot_size = (size_t)LZ4_compressBound((int)cfg->block_size);
+        {
+            size_t gpu_style_slot = (size_t)((double)cfg->block_size * 1.1 + 64.0);
+            if (gpu_style_slot > cpu_slot_size) cpu_slot_size = gpu_style_slot;
+        }
         cpu_job.src = input;
         cpu_job.src_size = input_size;
         cpu_job.block_size = cfg->block_size;
         cpu_job.global_start_block = cpu_start;
         cpu_job.num_blocks = cpu_blocks;
         cpu_job.num_threads = cfg->cpu_threads;
+        cpu_job.acceleration = cfg->acceleration;
         cpu_job.out_slot_size = cpu_slot_size;
         cpu_job.out_slots = (unsigned char*)malloc(cpu_blocks * cpu_slot_size);
         cpu_job.out_sizes = (uint32_t*)calloc(cpu_blocks, sizeof(uint32_t));
         if (!cpu_job.out_slots || !cpu_job.out_sizes) goto fail;
+
     }
 
     {
@@ -850,6 +1153,7 @@ static int hybrid_decompress_memory(ocl_env_t* ocl,
                 off += (size_t)cpu_comp_sizes[i];
             }
         }
+
     }
 
     {
@@ -890,7 +1194,6 @@ static int hybrid_decompress_memory(ocl_env_t* ocl,
             if (cpu_job.err) goto fail;
             if (m) m->cpu_kernel_us = cpu_job.elapsed_us;
         }
-
         if (m) {
             m->parallel_us = get_us() - parallel_t0;
             if (m->parallel_us < m->cpu_kernel_us) m->parallel_us = m->cpu_kernel_us;
@@ -934,13 +1237,16 @@ static void show_help(const char* prog) {
     fprintf(stderr, "  -H, --hash N             GPU hash log bits (default: 14)\n");
     fprintf(stderr, "  -l, --local N            GPU local work-group size (default: 1)\n");
     fprintf(stderr, "  -T, --cpu-threads N      CPU thread count for CPU portion (default: 1)\n");
+    fprintf(stderr, "  --adaptive               Enable adaptive per-file CPU/GPU split\n");
+    fprintf(stderr, "  --sample-blocks N        Adaptive sample block count (default: 8)\n");
     fprintf(stderr, "  --gpu-ratio F            Fraction of blocks assigned to GPU (default: 0.7)\n");
     fprintf(stderr, "  --bench [SECONDS]        Benchmark mode\n");
+    fprintf(stderr, "  --bench-io               Include file write/read in bench total throughput\n");
     fprintf(stderr, "  --bench-seconds N        Benchmark duration in seconds (default: 3)\n");
     fprintf(stderr, "  -v, --verbose            Verbose output\n");
 }
 
-static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_seconds) {
+static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_seconds, int include_file_io) {
     unsigned char* input = NULL;
     size_t input_size = 0;
     ocl_env_t ocl;
@@ -953,6 +1259,8 @@ static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_sec
     double* dec_t = NULL;
     double* ratio = NULL;
     int verify_ok = 1;
+    char tmp_comp_path[PATH_MAX] = {0};
+    char tmp_dec_path[PATH_MAX] = {0};
 
     if (bench_seconds <= 0.0) bench_seconds = 3.0;
     if (read_entire_file(input_path, &input, &input_size) != 0) {
@@ -964,6 +1272,16 @@ static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_sec
         fprintf(stderr, "bench error: OpenCL init failed\n");
         free(input);
         return 1;
+    }
+
+    if (include_file_io) {
+        if (create_temp_path(tmp_comp_path, sizeof(tmp_comp_path), "/tmp/lz4_hybrid_bench_io_comp_XXXXXX") != 0 ||
+            create_temp_path(tmp_dec_path, sizeof(tmp_dec_path), "/tmp/lz4_hybrid_bench_io_dec_XXXXXX") != 0) {
+            fprintf(stderr, "bench error: failed to create temp paths\n");
+            free(input);
+            ocl_free(&ocl);
+            return 1;
+        }
     }
 
     comp_k = (double*)malloc(cap * sizeof(double));
@@ -982,21 +1300,67 @@ static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_sec
         size_t dec_size = 0;
         hybrid_metrics_t cm, dm;
         double in_mb;
+        uint64_t comp_write_us = 0;
+        uint64_t comp_read_us = 0;
+        uint64_t dec_write_us = 0;
 
         const uint64_t ctot0 = get_us();
         if (hybrid_compress_memory(&ocl, input, input_size, cfg, &comp_buf, &comp_size, &cm) != 0) {
             verify_ok = 0;
             break;
         }
+
+        if (include_file_io) {
+            const uint64_t t_write0 = get_us();
+            if (write_entire_file(tmp_comp_path, comp_buf, comp_size) != 0) {
+                free(comp_buf);
+                verify_ok = 0;
+                break;
+            }
+            comp_write_us = get_us() - t_write0;
+        }
         cm.total_us = get_us() - ctot0;
+        if (include_file_io && cm.total_us < cm.parallel_us + comp_write_us) {
+            cm.total_us = cm.parallel_us + comp_write_us;
+        }
 
         const uint64_t dtot0 = get_us();
+        if (include_file_io) {
+            unsigned char* comp_file_buf = NULL;
+            size_t comp_file_sz = 0;
+            const uint64_t t_read0 = get_us();
+            if (read_entire_file(tmp_comp_path, &comp_file_buf, &comp_file_sz) != 0) {
+                free(comp_buf);
+                verify_ok = 0;
+                break;
+            }
+            comp_read_us = get_us() - t_read0;
+            free(comp_buf);
+            comp_buf = comp_file_buf;
+            comp_size = comp_file_sz;
+            remove(tmp_comp_path);
+        }
         if (hybrid_decompress_memory(&ocl, comp_buf, comp_size, cfg, &dec_buf, &dec_size, &dm) != 0) {
             free(comp_buf);
             verify_ok = 0;
             break;
         }
+
+        if (include_file_io) {
+            const uint64_t t_write0 = get_us();
+            if (write_entire_file(tmp_dec_path, dec_buf, dec_size) != 0) {
+                free(comp_buf);
+                free(dec_buf);
+                verify_ok = 0;
+                break;
+            }
+            dec_write_us = get_us() - t_write0;
+            remove(tmp_dec_path);
+        }
         dm.total_us = get_us() - dtot0;
+        if (include_file_io && dm.total_us < dm.parallel_us + comp_read_us + dec_write_us) {
+            dm.total_us = dm.parallel_us + comp_read_us + dec_write_us;
+        }
 
         if (dec_size != input_size || memcmp(dec_buf, input, input_size) != 0) {
             free(comp_buf);
@@ -1017,9 +1381,17 @@ static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_sec
         }
 
         in_mb = (double)input_size / (1024.0 * 1024.0);
-        comp_k[n] = (cm.parallel_us > 0) ? (in_mb * 1000000.0 / (double)cm.parallel_us) : 0.0;
+        {
+            uint64_t comp_kernel_us = cm.gpu_kernel_us;
+            if (cm.cpu_kernel_us > comp_kernel_us) comp_kernel_us = cm.cpu_kernel_us;
+            comp_k[n] = (comp_kernel_us > 0) ? (in_mb * 1000000.0 / (double)comp_kernel_us) : 0.0;
+        }
         comp_t[n] = (cm.total_us > 0) ? (in_mb * 1000000.0 / (double)cm.total_us) : 0.0;
-        dec_k[n] = (dm.parallel_us > 0) ? (in_mb * 1000000.0 / (double)dm.parallel_us) : 0.0;
+        {
+            uint64_t dec_kernel_us = dm.gpu_kernel_us;
+            if (dm.cpu_kernel_us > dec_kernel_us) dec_kernel_us = dm.cpu_kernel_us;
+            dec_k[n] = (dec_kernel_us > 0) ? (in_mb * 1000000.0 / (double)dec_kernel_us) : 0.0;
+        }
         dec_t[n] = (dm.total_us > 0) ? (in_mb * 1000000.0 / (double)dm.total_us) : 0.0;
         ratio[n] = (input_size > 0) ? (100.0 * (double)comp_size / (double)input_size) : 0.0;
         ++n;
@@ -1049,6 +1421,10 @@ static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_sec
     free(dec_t);
     free(ratio);
     free(input);
+    if (include_file_io) {
+        remove(tmp_comp_path);
+        remove(tmp_dec_path);
+    }
     ocl_free(&ocl);
     return verify_ok ? 0 : 1;
 }
@@ -1056,6 +1432,7 @@ static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_sec
 int main(int argc, char** argv) {
     int mode_decompress = 0;
     int bench_mode = 0;
+    int bench_include_io = 0;
     double bench_seconds = 3.0;
     const char* input_path = NULL;
     char output_path[1024] = {0};
@@ -1068,6 +1445,8 @@ int main(int argc, char** argv) {
     cfg.local_size = 1;
     cfg.cpu_threads = 1;
     cfg.gpu_ratio = 0.7;
+    cfg.adaptive_split = 0;
+    cfg.adaptive_sample_blocks = 8;
     cfg.verbose = 0;
 
     for (int i = 1; i < argc; ++i) {
@@ -1098,6 +1477,13 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "-T") == 0 || strcmp(argv[i], "--cpu-threads") == 0) {
             if (i + 1 < argc) cfg.cpu_threads = atoi(argv[++i]);
             else { fprintf(stderr, "Error: -T requires an argument\n"); return 1; }
+        } else if (strcmp(argv[i], "--adaptive") == 0) {
+            cfg.adaptive_split = 1;
+        } else if (strcmp(argv[i], "--sample-blocks") == 0) {
+            if (i + 1 < argc) cfg.adaptive_sample_blocks = (size_t)strtoull(argv[++i], NULL, 10);
+            else { fprintf(stderr, "Error: --sample-blocks requires an argument\n"); return 1; }
+        } else if (strncmp(argv[i], "--sample-blocks=", 16) == 0) {
+            cfg.adaptive_sample_blocks = (size_t)strtoull(argv[i] + 16, NULL, 10);
         } else if (strcmp(argv[i], "--gpu-ratio") == 0) {
             if (i + 1 < argc) cfg.gpu_ratio = atof(argv[++i]);
             else { fprintf(stderr, "Error: --gpu-ratio requires an argument\n"); return 1; }
@@ -1108,6 +1494,8 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != '-' && is_number_string(argv[i + 1])) {
                 bench_seconds = atof(argv[++i]);
             }
+        } else if (strcmp(argv[i], "--bench-io") == 0) {
+            bench_include_io = 1;
         } else if (strcmp(argv[i], "--bench-seconds") == 0) {
             if (i + 1 < argc) bench_seconds = atof(argv[++i]);
             else { fprintf(stderr, "Error: --bench-seconds requires an argument\n"); return 1; }
@@ -1152,7 +1540,7 @@ int main(int argc, char** argv) {
             fprintf(stderr, "Error: --bench requires compress mode input\n");
             return 1;
         }
-        return run_bench(input_path, &cfg, bench_seconds);
+        return run_bench(input_path, &cfg, bench_seconds, bench_include_io);
     }
 
     if (!output_explicit) {

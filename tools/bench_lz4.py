@@ -298,6 +298,8 @@ def build_summary_record(engine, config_label, avg_stats):
         "ratio": float(avg_stats.get("ratio", 0.0) or 0.0),
         "comp_kernel": kernel_comp(avg_stats, engine),
         "dec_kernel": kernel_dec(avg_stats, engine),
+        "comp_total": float(avg_stats.get("comp_total_mbs", 0.0) or 0.0) if avg_stats.get("comp_total_mbs") is not None else None,
+        "dec_total": float(avg_stats.get("dec_total_mbs", 0.0) or 0.0) if avg_stats.get("dec_total_mbs") is not None else None,
     }
 
 
@@ -311,34 +313,54 @@ def print_and_save_config_summary(summary_records, out_csv):
         key = (rec["engine"], rec["config"])
         grouped.setdefault(key, []).append(rec)
 
+    has_total = any(r.get("comp_total") is not None or r.get("dec_total") is not None for r in summary_records)
     print("\n===== Per-Config Summary Stats (mean/median/p10/p90) =====")
     with open(out_csv, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow([
+        header = [
             "Engine", "Config", "Samples",
             "Ratio_mean", "Ratio_median", "Ratio_p10", "Ratio_p90", "Ratio_min", "Ratio_max",
             "CompMBs_mean", "CompMBs_median", "CompMBs_p10", "CompMBs_p90", "CompMBs_min", "CompMBs_max",
             "DecMBs_mean", "DecMBs_median", "DecMBs_p10", "DecMBs_p90", "DecMBs_min", "DecMBs_max",
-        ])
+        ]
+        if has_total:
+            header.extend([
+                "CompTotalMBs_mean", "CompTotalMBs_median", "CompTotalMBs_p10", "CompTotalMBs_p90", "CompTotalMBs_min", "CompTotalMBs_max",
+                "DecTotalMBs_mean", "DecTotalMBs_median", "DecTotalMBs_p10", "DecTotalMBs_p90", "DecTotalMBs_min", "DecTotalMBs_max",
+            ])
+        writer.writerow(header)
 
         for (engine, config), rows in sorted(grouped.items(), key=lambda x: (x[0][0], x[0][1])):
             ratio_s = summarize_dist([r["ratio"] for r in rows])
             comp_kernel_s = summarize_dist([r["comp_kernel"] for r in rows])
             dec_kernel_s = summarize_dist([r["dec_kernel"] for r in rows])
 
-            print(
+            line = (
                 f"[ConfigSummary] {engine} {config} n={ratio_s['count']} | "
                 f"ratio(mean/med/p10)={fmt_metric(ratio_s['mean'],2)}/{fmt_metric(ratio_s['median'],2)}/{fmt_metric(ratio_s['p10'],2)}% | "
                 f"Cmbs={fmt_metric(comp_kernel_s['mean'],2)}/{fmt_metric(comp_kernel_s['median'],2)}/{fmt_metric(comp_kernel_s['p10'],2)} | "
                 f"Dmbs={fmt_metric(dec_kernel_s['mean'],2)}/{fmt_metric(dec_kernel_s['median'],2)}/{fmt_metric(dec_kernel_s['p10'],2)}"
             )
 
-            writer.writerow([
+            csv_row = [
                 engine, config, ratio_s["count"],
                 fmt_csv_metric(ratio_s["mean"], 4), fmt_csv_metric(ratio_s["median"], 4), fmt_csv_metric(ratio_s["p10"], 4), fmt_csv_metric(ratio_s["p90"], 4), fmt_csv_metric(ratio_s["min"], 4), fmt_csv_metric(ratio_s["max"], 4),
                 fmt_csv_metric(comp_kernel_s["mean"], 4), fmt_csv_metric(comp_kernel_s["median"], 4), fmt_csv_metric(comp_kernel_s["p10"], 4), fmt_csv_metric(comp_kernel_s["p90"], 4), fmt_csv_metric(comp_kernel_s["min"], 4), fmt_csv_metric(comp_kernel_s["max"], 4),
                 fmt_csv_metric(dec_kernel_s["mean"], 4), fmt_csv_metric(dec_kernel_s["median"], 4), fmt_csv_metric(dec_kernel_s["p10"], 4), fmt_csv_metric(dec_kernel_s["p90"], 4), fmt_csv_metric(dec_kernel_s["min"], 4), fmt_csv_metric(dec_kernel_s["max"], 4),
-            ])
+            ]
+            if has_total:
+                comp_total_s = summarize_dist([r["comp_total"] for r in rows])
+                dec_total_s = summarize_dist([r["dec_total"] for r in rows])
+                line += (
+                    f" | CTmbs={fmt_metric(comp_total_s['mean'],2)}/{fmt_metric(comp_total_s['median'],2)}/{fmt_metric(comp_total_s['p10'],2)}"
+                    f" | DTmbs={fmt_metric(dec_total_s['mean'],2)}/{fmt_metric(dec_total_s['median'],2)}/{fmt_metric(dec_total_s['p10'],2)}"
+                )
+                csv_row.extend([
+                    fmt_csv_metric(comp_total_s["mean"], 4), fmt_csv_metric(comp_total_s["median"], 4), fmt_csv_metric(comp_total_s["p10"], 4), fmt_csv_metric(comp_total_s["p90"], 4), fmt_csv_metric(comp_total_s["min"], 4), fmt_csv_metric(comp_total_s["max"], 4),
+                    fmt_csv_metric(dec_total_s["mean"], 4), fmt_csv_metric(dec_total_s["median"], 4), fmt_csv_metric(dec_total_s["p10"], 4), fmt_csv_metric(dec_total_s["p90"], 4), fmt_csv_metric(dec_total_s["min"], 4), fmt_csv_metric(dec_total_s["max"], 4),
+                ])
+            print(line)
+            writer.writerow(csv_row)
 
     print(f"[ConfigSummary] saved: {out_csv}")
 
@@ -479,6 +501,31 @@ def run_command_with_telemetry(cmd, telemetry=None, env=None, sample_interval_s=
     return completed, tel
 
 
+def apply_wall_energy(stats, tel_window, comp_elapsed_s, dec_elapsed_s, energy_source):
+    stats['cpu_freq_avg_mhz'] = float(tel_window.get('cpu_freq_avg_mhz', 0.0) or 0.0)
+    stats['gpu_freq_avg_mhz'] = float(tel_window.get('gpu_freq_avg_mhz', 0.0) or 0.0)
+    elapsed_s = float(tel_window.get('elapsed_s', 0.0) or 0.0)
+    if elapsed_s <= 0.0:
+        stats['cpu_energy_j'] = 0.0
+        stats['gpu_energy_j'] = 0.0
+        stats['comp_cpu_power_w'] = 0.0
+        stats['comp_gpu_power_w'] = 0.0
+        stats['energy_source'] = energy_source
+        return
+
+    total_phase_s = max(0.0, float(comp_elapsed_s or 0.0)) + max(0.0, float(dec_elapsed_s or 0.0))
+    phase_scale = min(1.0, total_phase_s / elapsed_s) if total_phase_s > 0.0 else 0.0
+    comp_share = (float(comp_elapsed_s or 0.0) / total_phase_s) if total_phase_s > 0.0 else 0.0
+    cpu_total_energy = float(tel_window.get('cpu_energy_j', 0.0) or 0.0)
+    gpu_total_energy = float(tel_window.get('gpu_energy_j', 0.0) or 0.0)
+
+    stats['cpu_energy_j'] = cpu_total_energy * phase_scale * comp_share
+    stats['gpu_energy_j'] = gpu_total_energy * phase_scale * comp_share
+    stats['comp_cpu_power_w'] = (stats['cpu_energy_j'] / comp_elapsed_s) if comp_elapsed_s and comp_elapsed_s > 0.0 else 0.0
+    stats['comp_gpu_power_w'] = (stats['gpu_energy_j'] / comp_elapsed_s) if comp_elapsed_s and comp_elapsed_s > 0.0 else 0.0
+    stats['energy_source'] = energy_source
+
+
 def run_control_action(control_script_path, action):
     if not os.path.exists(control_script_path):
         return "missing_script"
@@ -615,6 +662,36 @@ def parse_stable_bench_output(output):
     }
 
 
+def warm_lz4_gpu_daemon(file_path, bs_arg, hl, lsz, accel):
+    warm_out = f"/tmp/lz4_gpu_warm_{os.getpid()}_{int(time.time() * 1000)}.lz4"
+    warm_dec = f"{warm_out}.dec"
+    try:
+        warm_comp_cmd = [
+            LZ4_GPU_BIN,
+            "--use-daemon",
+            "-b", bs_arg,
+            "-H", str(hl),
+            "-l", str(lsz),
+            "-a", str(accel),
+            "-o", warm_out,
+            str(file_path),
+        ]
+        subprocess.run(warm_comp_cmd, capture_output=True, text=True, check=False, env=build_gpu_subprocess_env())
+
+        if os.path.exists(warm_out):
+            warm_dec_cmd = [
+                LZ4_GPU_BIN,
+                "--use-daemon",
+                "-d",
+                "-o", warm_dec,
+                warm_out,
+            ]
+            subprocess.run(warm_dec_cmd, capture_output=True, text=True, check=False, env=build_gpu_subprocess_env())
+    finally:
+        safe_remove(warm_out)
+        safe_remove(warm_dec)
+
+
 def parse_lz4_cpu_bench_output(output, input_size):
     stats = {
         'ratio': 0.0,
@@ -660,6 +737,8 @@ def run_lz4_cpu(file_path, bs, threads, orig_hash, telemetry=None):
         'ratio': 0,
         'comp_mbs': 0,
         'dec_mbs': 0,
+        'comp_total_mbs': 0,
+        'dec_total_mbs': 0,
         'comp_time_s': 0,
         'dec_time_s': 0,
         'throughput_semantics': 'op_time_bench',
@@ -689,8 +768,55 @@ def run_lz4_cpu(file_path, bs, threads, orig_hash, telemetry=None):
             stats['dec_mbs'] = parsed.get('dec_mbs', 0)
             stats['comp_time_s'] = parsed.get('comp_time_s', 0)
             stats['dec_time_s'] = parsed.get('dec_time_s', 0)
-            stats['throughput_semantics'] = 'stable_cpu_bench'
-            stats['roundtrip_verified'] = (bench_res.returncode == 0)
+
+            tmp_comp = f"/tmp/lz4_cpu_total_{os.getpid()}_{int(time.time() * 1000)}.lz4"
+            tmp_dec = f"{tmp_comp}.dec"
+            comp_elapsed_s = 0.0
+            dec_elapsed_s = 0.0
+            total_ok = False
+
+            try:
+                cmd_comp_total = [
+                    LZ4_BIN,
+                    "-q",
+                    "-f",
+                    f"-B{str(bs).upper()}",
+                    f"-T{threads}",
+                    str(file_path),
+                    tmp_comp,
+                ]
+                t0 = time.perf_counter()
+                comp_total_res, _ = run_command_with_telemetry(cmd_comp_total, telemetry=None)
+                comp_elapsed_s = max(0.0, time.perf_counter() - t0)
+
+                cmd_dec_total = [
+                    LZ4_BIN,
+                    "-q",
+                    "-f",
+                    "-d",
+                    tmp_comp,
+                    tmp_dec,
+                ]
+                t1 = time.perf_counter()
+                dec_total_res, _ = run_command_with_telemetry(cmd_dec_total, telemetry=None)
+                dec_elapsed_s = max(0.0, time.perf_counter() - t1)
+
+                total_ok = (
+                    comp_total_res.returncode == 0
+                    and dec_total_res.returncode == 0
+                    and file_matches_hash(tmp_dec, orig_hash)
+                )
+
+                if comp_elapsed_s > 0.0:
+                    stats['comp_total_mbs'] = in_sz / (comp_elapsed_s * 1024.0 * 1024.0)
+                if dec_elapsed_s > 0.0:
+                    stats['dec_total_mbs'] = in_sz / (dec_elapsed_s * 1024.0 * 1024.0)
+            finally:
+                safe_remove(tmp_comp)
+                safe_remove(tmp_dec)
+
+            stats['throughput_semantics'] = 'stable_cpu_bench_with_total_io'
+            stats['roundtrip_verified'] = (bench_res.returncode == 0) and total_ok
         else:
             stats['throughput_semantics'] = 'stable_cpu_bench_parse_failed'
             stats['roundtrip_verified'] = False
@@ -699,24 +825,13 @@ def run_lz4_cpu(file_path, bs, threads, orig_hash, telemetry=None):
         print(f"CPU error: {e}")
 
     if telemetry and tel_window:
-        stats['cpu_freq_avg_mhz'] = float(tel_window.get('cpu_freq_avg_mhz', 0.0) or 0.0)
-        stats['gpu_freq_avg_mhz'] = float(tel_window.get('gpu_freq_avg_mhz', 0.0) or 0.0)
-
-        comp_s = float(stats.get('comp_time_s', 0.0) or 0.0)
-        dec_s = float(stats.get('dec_time_s', 0.0) or 0.0)
-        kernel_total_s = comp_s + dec_s
-        elapsed_s = float(tel_window.get('elapsed_s', 0.0) or 0.0)
-        kernel_scale = min(1.0, (kernel_total_s / elapsed_s)) if (elapsed_s > 0 and kernel_total_s > 0) else 0.0
-
-        cpu_kernel_energy = float(tel_window.get('cpu_energy_j', 0.0) or 0.0) * kernel_scale
-        gpu_kernel_energy = float(tel_window.get('gpu_energy_j', 0.0) or 0.0) * kernel_scale
-        comp_share = (comp_s / kernel_total_s) if kernel_total_s > 0 else 0.0
-
-        stats['cpu_energy_j'] = cpu_kernel_energy * comp_share
-        stats['gpu_energy_j'] = gpu_kernel_energy * comp_share
-        stats['comp_cpu_power_w'] = (cpu_kernel_energy / kernel_total_s) if kernel_total_s > 0 else 0.0
-        stats['comp_gpu_power_w'] = (gpu_kernel_energy / kernel_total_s) if kernel_total_s > 0 else 0.0
-        stats['energy_source'] = telemetry.describe_sources()
+        apply_wall_energy(
+            stats,
+            tel_window,
+            float(stats.get('comp_time_s', 0.0) or 0.0),
+            float(stats.get('dec_time_s', 0.0) or 0.0),
+            telemetry.describe_sources(),
+        )
 
     return stats
 
@@ -760,43 +875,88 @@ def run_lz4_gpu(file_path, bs, hl, lsz, accel, orig_hash, telemetry=None, bench_
         stable = parse_stable_bench_output(bench_output)
 
         if stable:
+            warm_lz4_gpu_daemon(file_path, bs_arg, hl, lsz, accel)
             stats['ratio'] = stable['ratio']
             stats['comp_mbs'] = stable['comp_kernel_tp']
             stats['dec_mbs'] = stable['dec_kernel_tp']
-            stats['comp_total_mbs'] = stable.get('comp_total_tp', 0.0)
-            stats['dec_total_mbs'] = stable.get('dec_total_tp', 0.0)
-            if in_sz > 0 and stats['comp_mbs'] > 0:
-                stats['comp_time_s'] = in_sz / (stats['comp_mbs'] * 1024.0 * 1024.0)
-            if in_sz > 0 and stats['dec_mbs'] > 0:
-                stats['dec_time_s'] = in_sz / (stats['dec_mbs'] * 1024.0 * 1024.0)
-            stats['throughput_semantics'] = 'stable_kernel_bench'
-            stats['roundtrip_verified'] = bool(stable['verify_ok']) and (bench_res.returncode == 0)
+
+            tmp_comp = f"/tmp/lz4_gpu_total_{os.getpid()}_{int(time.time() * 1000)}.lz4"
+            tmp_dec = f"{tmp_comp}.dec"
+            total_tel = {}
+            total_ok = False
+
+            try:
+                cmd_comp_total = [
+                    LZ4_GPU_BIN,
+                    "--use-daemon",
+                    "-v",
+                    "-b", bs_arg,
+                    "-H", str(hl),
+                    "-l", str(lsz),
+                    "-a", str(accel),
+                    "-o", tmp_comp,
+                    str(file_path),
+                ]
+                comp_total_res, comp_total_tel = run_command_with_telemetry(cmd_comp_total, telemetry=telemetry, env=build_gpu_subprocess_env())
+                comp_total_output = (comp_total_res.stdout or "") + (comp_total_res.stderr or "")
+                comp_total_parsed = parse_gpu_output(comp_total_output)
+
+                cmd_dec_total = [
+                    LZ4_GPU_BIN,
+                    "--use-daemon",
+                    "-v",
+                    "-d",
+                    "-o", tmp_dec,
+                    tmp_comp,
+                ]
+                dec_total_res, dec_total_tel = run_command_with_telemetry(cmd_dec_total, telemetry=telemetry, env=build_gpu_subprocess_env())
+                dec_total_output = (dec_total_res.stdout or "") + (dec_total_res.stderr or "")
+                dec_total_parsed = parse_gpu_output(dec_total_output)
+
+                comp_elapsed_s = float(comp_total_tel.get('elapsed_s', 0.0) or 0.0)
+                dec_elapsed_s = float(dec_total_tel.get('elapsed_s', 0.0) or 0.0)
+                total_tel = {
+                    'elapsed_s': comp_elapsed_s + dec_elapsed_s,
+                    'cpu_freq_avg_mhz': float(comp_total_tel.get('cpu_freq_avg_mhz', 0.0) or 0.0),
+                    'gpu_freq_avg_mhz': float(comp_total_tel.get('gpu_freq_avg_mhz', 0.0) or 0.0),
+                    'cpu_energy_j': float(comp_total_tel.get('cpu_energy_j', 0.0) or 0.0) + float(dec_total_tel.get('cpu_energy_j', 0.0) or 0.0),
+                    'gpu_energy_j': float(comp_total_tel.get('gpu_energy_j', 0.0) or 0.0) + float(dec_total_tel.get('gpu_energy_j', 0.0) or 0.0),
+                }
+
+                total_ok = (
+                    comp_total_res.returncode == 0
+                    and dec_total_res.returncode == 0
+                    and file_matches_hash(tmp_dec, orig_hash)
+                )
+
+                if comp_total_parsed.get('inclusive_tp'):
+                    stats['comp_total_mbs'] = comp_total_parsed['inclusive_tp']
+                if dec_total_parsed.get('inclusive_tp'):
+                    stats['dec_total_mbs'] = dec_total_parsed['inclusive_tp']
+                if comp_elapsed_s > 0.0:
+                    stats['comp_time_s'] = comp_elapsed_s
+                if dec_elapsed_s > 0.0:
+                    stats['dec_time_s'] = dec_elapsed_s
+            finally:
+                safe_remove(tmp_comp)
+                safe_remove(tmp_dec)
+
+            stats['throughput_semantics'] = 'stable_kernel_bench_with_daemon_inclusive_total'
+            stats['roundtrip_verified'] = bool(stable['verify_ok']) and (bench_res.returncode == 0) and total_ok
+            if telemetry and total_tel:
+                apply_wall_energy(
+                    stats,
+                    total_tel,
+                    float(stats.get('comp_time_s', 0.0) or 0.0),
+                    float(stats.get('dec_time_s', 0.0) or 0.0),
+                    telemetry.describe_sources(),
+                )
         else:
             stats['throughput_semantics'] = 'stable_kernel_bench_parse_failed'
             stats['roundtrip_verified'] = False
             print(f"  [GPU] stable bench parse failed for {file_path} (BS={bs} HL={hl} LSZ={lsz} A={accel})", flush=True)
     except Exception as exc:
         print(f"GPU error: {exc}")
-
-    if telemetry and tel_window:
-        stats['cpu_freq_avg_mhz'] = float(tel_window.get('cpu_freq_avg_mhz', 0.0) or 0.0)
-        stats['gpu_freq_avg_mhz'] = float(tel_window.get('gpu_freq_avg_mhz', 0.0) or 0.0)
-
-        comp_s = float(stats.get('comp_time_s', 0.0) or 0.0)
-        dec_s = float(stats.get('dec_time_s', 0.0) or 0.0)
-        kernel_total_s = comp_s + dec_s
-        elapsed_s = float(tel_window.get('elapsed_s', 0.0) or 0.0)
-        kernel_scale = min(1.0, (kernel_total_s / elapsed_s)) if (elapsed_s > 0 and kernel_total_s > 0) else 0.0
-
-        cpu_kernel_energy = float(tel_window.get('cpu_energy_j', 0.0) or 0.0) * kernel_scale
-        gpu_kernel_energy = float(tel_window.get('gpu_energy_j', 0.0) or 0.0) * kernel_scale
-        comp_share = (comp_s / kernel_total_s) if kernel_total_s > 0 else 0.0
-
-        stats['cpu_energy_j'] = cpu_kernel_energy * comp_share
-        stats['gpu_energy_j'] = gpu_kernel_energy * comp_share
-        stats['comp_cpu_power_w'] = (cpu_kernel_energy / kernel_total_s) if kernel_total_s > 0 else 0.0
-        stats['comp_gpu_power_w'] = (gpu_kernel_energy / kernel_total_s) if kernel_total_s > 0 else 0.0
-        stats['energy_source'] = telemetry.describe_sources()
 
     return stats
 
@@ -913,7 +1073,8 @@ def main():
                                     "" if gpu_freq_target is None else gpu_freq_target,
                                     "CPU", t, bs, "N/A", "N/A", fmtf(cpu_stats['ratio'], 2),
                                     fmtf(cpu_stats['comp_mbs'], 2), fmtf(cpu_stats['dec_mbs'], 2),
-                                    "", "",
+                                    fmtf(cpu_stats.get('comp_total_mbs', 0), 2),
+                                    fmtf(cpu_stats.get('dec_total_mbs', 0), 2),
                                     fmtf(cpu_stats['comp_time_s'], 6), fmtf(cpu_stats['dec_time_s'], 6),
                                     fmtf(cpu_stats['cpu_freq_avg_mhz'], 2),
                                     fmtf(cpu_stats['gpu_freq_avg_mhz'], 2),

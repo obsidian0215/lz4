@@ -1,210 +1,410 @@
-# lz4_hybrid 性能分析报告
+# lz4_hybrid 性能分析报告（按当前实现与修正后结果更新）
+
+> 更新时间：2026-03-09  
+> 程序路径：`/root/lz4/lz4_hybrid/lz4_hybrid`  
+> 当前全量结果：`/root/lz4/exp_results/hybrid_bench/hybrid_bench_20260308_171420.csv`
+> 对照基线：`/root/lz4/exp_results/runs/20260307_201916/lz4_param_sweep.csv`
 
 ## 1. 概述 (Overview)
 
-lz4_hybrid 是一款集成了 CPU 与 GPU 并行能力的 LZ4 压缩与解压缩工具。它通过同时利用系统的通用处理器（CPU）和图形处理器（GPU），旨在突破单一计算单元的性能瓶颈，实现更高的整体吞吐量。
+`lz4_hybrid` 是当前 LZ4 家族中的 CPU--GPU 协同执行器。它的目标不是替代纯 GPU 或纯 CPU，而是在块级并行前提下同时利用：
 
-该工具的核心逻辑是将待处理的数据块按比例分配给 CPU 和 GPU。CPU 端采用标准的高性能 liblz4 库，利用多线程技术处理分配到的数据；GPU 端则调用基于 OpenCL 编写的 lz4_gpu 内核，利用 GPU 强大的并行计算能力。通过这种“混合动力”模式，lz4_hybrid 能够根据不同的硬件配置和数据特性，灵活调节负载，力求在复杂的生产环境中达到最优的资源利用率。
+- CPU 端 `liblz4 + pthread`
+- GPU 端 `lz4_gpu` OpenCL backend
 
-- **核心目标**：通过并行利用 CPU 和 GPU 计算资源，使压缩/解压缩吞吐量超过单纯依赖 CPU 或 GPU 的方案。
-- **程序路径**：`/root/lz4/lz4_hybrid/lz4_hybrid`
-- **主要特性**：支持动态负载分配、多线程 CPU 并发、OpenCL 内核驱动。
+并在 **steady-state end-to-end total throughput**、压缩率、功率之间寻找可接受的平衡点。
+
+与旧版文档相比，本版最重要的变化有两点：
+
+1. **测试口径已修正**：当前 total throughput 来自 `lz4_hybrid --bench --bench-io` 的 warmed in-binary 路径；同时 `kernel_tp` 已按真实 CPU/GPU 编解码执行跨度（取两者 max）计算，不再直接使用包含额外 host-side coordination 的 `parallel_us`；
+2. **adaptive split 已真实生效**：此前 `--adaptive` 曾存在“CLI 有开关但 active split path 不改变”的缺口，本轮已在 live code 中修复。
+
+- **核心目标**：探索 CPU/GPU 协同在 LZ4 实时压缩中的真实系统价值，而不是只比较 kernel speed。  
+- **程序路径**：`/root/lz4/lz4_hybrid/lz4_hybrid`  
+- **主要特性**：fixed/adaptive split、多线程 CPU、OpenCL GPU、bench-io total semantics。
 
 ## 2. 设计原理 (Design Principles)
 
-lz4_hybrid 的设计基于以下几个核心原则：
+当前 `lz4_hybrid` 的设计仍然遵循以下核心原则，但其内容已从旧文档中的“固定比例试验版”演化为当前实现：
 
-- **任务切分 (Work Splitting)**：输入数据被划分为固定大小的块（默认 16KB）。根据用户设定的 `--gpu-ratio` 参数，前 N 个块被分配给 GPU，剩余的块分配给 CPU。这种简单的静态分割方式能有效降低调度开销。
-- **并行执行 (Parallel Execution)**：程序启动后，会专门为 CPU 任务派生一个 pthread 线程。主线程则负责驱动 OpenCL 环境进行 GPU 端的计算。CPU 和 GPU 任务在物理上几乎是同时进行的，最终性能往往取决于两者中较慢一方的耗时。
-- **数据块独立性 (Block-level Independence)**：每个数据块的压缩和解压缩过程都是完全独立的。这种无状态的块处理方式使得并行化变得非常直观，且不需要复杂的块间同步。
-- **CPU 线程池 (CPU Thread Pool)**：对于分配给 CPU 的部分，lz4_hybrid 使用 `pthread` 创建工作线程，并采用轮询（Round-robin）方式在 T 个线程之间分配块，充分利用多核 CPU 的算力。
-- **统一输出格式 (Unified Output Format)**：为了兼容混合处理的结果，lz4_hybrid 定义了一种特定的文件格式。该格式包含一个魔数 `0x184D2205`、块总数、GPU 处理块数、块大小列表，随后顺序存储 GPU 和 CPU 的压缩数据块。
+- **任务切分 (Work Splitting)**：输入被切成固定 block（默认 16KB），然后按 `effective_gpu_ratio` 划分为 GPU 前缀块与 CPU 后缀块。
+- **并行执行 (Parallel Execution)**：CPU 任务在线程侧并行执行，主线程驱动 GPU OpenCL 路径，两者并发后以较慢一路的结束时间逼近墙钟时间。
+- **数据块独立性 (Block-level Independence)**：每个块独立压缩/解压，因此可以自然地被映射到 CPU worker 或 GPU work-item。
+- **统一输出格式 (Unified Output Format)**：hybrid 输出包含 magic、块总数、GPU 块数、块大小表以及 GPU/CPU 两路压缩数据，确保解压端可以确定性地分发。
+- **低开销调度优先**：当前 adaptive 并不是复杂预测器，而是前若干块采样 + 轻量启发式修正，以避免为了“智能”而引入比收益更高的调度成本。
+
+### 2.1 Fixed split
+
+fixed 模式下：
+
+```text
+gpu_blocks = round(num_blocks * gpu_ratio)
+cpu_blocks = num_blocks - gpu_blocks
+```
+
+优点是：
+
+- 调度成本极低；
+- 行为稳定；
+- 适合做 sweep 找最优配比。
+
+### 2.2 Adaptive split
+
+当前 adaptive 模式会：
+
+1. 读取前 `adaptive_sample_blocks` 个块；
+2. 用 `LZ4_compress_fast()` 对样本估算压缩率；
+3. 结合文件大小、CPU 线程数和采样压缩性调整 `gpu_ratio`；
+4. 生成 `effective_gpu_ratio` 后再执行真正的 CPU/GPU 分发。
+
+因此现在的 adaptive 是一个 **真实的 per-file split policy**，而不再只是 benchmark 维度里的“标签”。
 
 ## 3. 系统架构 (Architecture)
 
-lz4_hybrid 的系统架构体现了典型的数据并行流水线设计。
+### 数据流图（压缩过程）
 
-### 数据流图（压缩过程）：
-```
-输入文件 → read_entire_file() → 根据 gpu_ratio 切分块
-                                     ├→ GPU 块 → gpu_compress_blocks() (OpenCL 内核)
-                                     └→ CPU 块 → cpu_comp_top() → pthread 工作线程 → LZ4_compress_default()
-                                     (两者通过 pthread 并行运行)
-                                     → 数据组装: [Header | GPU Sizes | CPU Sizes | GPU Data | CPU Data]
-                                     → 输出缓冲区/文件
+```text
+输入文件 → read_entire_file()
+        → hybrid_compress_memory()
+             ├→ GPU 块 → gpu_compress_blocks() (OpenCL 内核)
+             └→ CPU 块 → cpu_comp_top() → pthread 工作线程 → LZ4_compress_default()
+          (两路并发)
+        → 组装 hybrid 容器：[Header | Size Table | GPU Data | CPU Data]
+        → 输出缓冲区 / 文件
 ```
 
-### 数据流图（解压缩过程）：
-```
+### 数据流图（解压过程）
+
+```text
 压缩文件 → 解析头部信息 (Magic, Num_blocks, Block_size, GPU_blocks)
-                → 提取块大小表 (Size Table)
-                → GPU 块 → gpu_decompress_blocks() (OpenCL 内核)
-                → CPU 块 → cpu_decomp_top() → pthread 工作线程 → LZ4_decompress_safe()
-                → (两者并行运行)
-                → 按序重组解压数据
-                → 输出结果
+        → 提取块大小表
+        → GPU 块 → gpu_decompress_blocks() (OpenCL 内核)
+        → CPU 块 → cpu_decomp_top() → pthread 工作线程 → LZ4_decompress_safe()
+          (两路并发)
+        → 重组解压数据
+        → 输出结果
 ```
 
-### 核心组件：
-- **OCL Context**：在基准测试或文件处理开始时初始化一次。它负责加载 `lz4_gpu_core` 中的 OpenCL 程序，并准备压缩和解压缩内核。
-- **数据结构**：
-    - `ocl_env_t`：管理 OpenCL 的设备、上下文、队列和内核。
-    - `hybrid_cfg_t`：存储用户配置，如块大小、GPU 比例、CPU 线程数等。
-    - `hybrid_metrics_t`：精确记录 CPU 内核耗时、GPU 内核耗时、并行墙钟时间以及包含数据拷贝和组装在内的总耗时。
-    - `cpu_comp_job_t` / `cpu_decomp_job_t`：描述分配给 CPU 的任务包。
+### 核心组件
+
+- **`ocl_env_t`**：管理 OpenCL 设备、上下文、命令队列和内核；
+- **`hybrid_cfg_t`**：当前配置结构，已包含 `adaptive_split` 与 `adaptive_sample_blocks`；
+- **`hybrid_metrics_t`**：记录 CPU kernel、GPU kernel、parallel wall-time 和 total wall-time；
+- **`cpu_comp_job_t` / `cpu_decomp_job_t`**：封装 CPU 端工作包；
+- **hybrid header/container**：保证解压端能无歧义地恢复 GPU/CPU 两路处理边界。
 
 ## 4. 实现细节 (Implementation Details)
 
-lz4_hybrid 的实现主要集中在负载切分和并行管理。
+### 4.1 负载切分逻辑
 
-### 负载切分逻辑
-在处理每个文件时，程序首先计算所需的块总数 `num_blocks`。根据用户指定的比例，GPU 被分配 `gpu_blocks = (size_t)(num_blocks * cfg->gpu_ratio)`。由于 GPU 始终处理数据的前部，CPU 则处理剩下的块。这种分块策略在实现上虽然简单，但在处理具有局部压缩特性差异的文件时非常有效。
+当前 live code 中，`hybrid_compress_memory()` 会先计算 `num_blocks`，然后：
 
-### GPU 处理路径
-调用 `gpu_compress_blocks()` 和 `gpu_decompress_blocks()` 执行 GPU 计算。
-这些函数是封装好的 OpenCL 工具，它们在每次被调用时都会动态创建所需的 CL Buffer，包括输入缓冲区、输出缓冲区以及元数据缓冲区（如块大小列表）。这种“即用即建”的方式虽然具有较高的灵活性，但也引入了显著的运行时开销，特别是缓冲区创建、数据同步以及内核启动的耗时。
+- fixed 模式直接使用 `cfg->gpu_ratio`
+- adaptive 模式先调用采样逻辑得到 `effective_gpu_ratio`
 
-### CPU 处理路径
-对于 CPU 部分，lz4_hybrid 充分发挥了多核并行性。主进程创建专门的任务线程后，会调用 `cpu_comp_top()`。该函数根据 `-T` 参数进一步派生出多个工作线程。每个工作线程通过 liblz4 的 `LZ4_compress_default()` 或 `LZ4_decompress_safe()` 并发地处理其负责的数据块，这种分级并行能有效填满 CPU 的各个核心。
+再决定：
 
-### 计时与性能指标
-- **`cpu_kernel_us` 与 `gpu_kernel_us`**：分别记录 CPU 端和 GPU 端单纯进行压缩/解压缩的净耗时。
-- **`parallel_us`**：这是衡量并行效率的关键指标，定义为 CPU 和 GPU 任务耗时的最大值。它反映了混合模式下的理想墙钟时间。
-- **内核吞吐量 (Kernel Throughput)**：计算公式为 `input_MB / parallel_us`。
-- **总吞吐量 (Total Throughput)**：计算公式为 `input_MB / total_us`，其中 `total_us` 包含了内存分配、缓冲区拷贝以及数据组装等所有开销。
+- `gpu_blocks`
+- `cpu_blocks`
+- `cpu_start`
 
-### 自定义压缩格式 (Custom Format)
-为了支持混合压缩，lz4_hybrid 引入了一种新的数据封装格式：
-- **Header**: [Magic(4) | num_blocks(4) | block_size(4) | gpu_blocks(4)]
-- **Size Table**: `num_blocks` 个 32 位整数，按顺序排列每个压缩块的大小。
-- **Data Part**: 首先存储所有 GPU 处理的压缩块数据，紧随其后是所有 CPU 处理的压缩块数据。
+这是本轮修复的关键点，因为此前 active path 里并没有真正覆盖 `cfg->gpu_ratio`。
+
+### 4.2 GPU 处理路径
+
+GPU 路径调用：
+
+- `gpu_compress_blocks()`
+- `gpu_decompress_blocks()`
+
+这些路径并不是独立重写的一套 GPU runtime，而是直接复用 `lz4_gpu_core` 中当前成熟的 backend。也就是说，hybrid GPU 子路径继承了：
+
+- buffer/workspace 复用能力
+- 更成熟的 worker count 选择
+- 解压快路径
+- LZ4 GPU 主路径的 corrected steady-state runtime 基础
+
+### 4.3 CPU 处理路径
+
+CPU 路径通过 `pthread` 和 `liblz4` 并发处理后缀块：
+
+- 压缩：`LZ4_compress_default()` / `LZ4_compress_fast()` 家族路径
+- 解压：`LZ4_decompress_safe()`
+
+CPU 路径的意义不是给 GPU 打下手，而是：
+
+- 在高可压缩或中小规模文件上，CPU 往往仍然有强竞争力；
+- hybrid 的核心正是利用 CPU 在某些数据上的优势来弥补 GPU 的系统级开销。
+
+### 4.4 计时与性能指标
+
+当前文档中使用的指标含义如下：
+
+- **`cpu_kernel_us` / `gpu_kernel_us`**：CPU 与 GPU 纯工作路径时间；
+- **`parallel_us`**：两路并行的核心墙钟时间；
+- **`total_us`**：包含文件 I/O、组装和运行时开销的总时间；
+- **Kernel Throughput** = `input_MB / max(cpu_kernel_us, gpu_kernel_us)`，用于刻画 hybrid 下真实编解码执行跨度；
+- **Total Throughput** = `input_MB / total_us`
+
+### 4.5 `--bench-io` 的意义
+
+当前 `lz4_hybrid` 已提供：
+
+```text
+--bench --bench-io
+```
+
+这意味着 total throughput 直接由 warmed binary 内部给出，而不是从 Python 外层 separate compress/decompress subprocess wall-clock 估算。这是当前 hybrid total 数据可信的根本前提之一。
 
 ## 5. 配置参数 (Configuration Parameters)
 
-用户可以通过命令行参数对混合运行环境进行精细调整：
+当前主要参数如下：
 
-- **`--gpu-ratio F`**：GPU 负责的块比例（0.0-1.0，默认 0.7）。
-    - 0.0：纯 CPU 模式。
-    - 1.0：纯 GPU 模式。
-    - 0.3：30% GPU 与 70% CPU。根据经验，在高性能多核 CPU 环境下，较低的 GPU 比例往往能获得更好的压缩性能。
-- **`-T N`**：CPU 工作线程数（默认 1）。该参数仅影响分配给 CPU 端的块。
-- **`-b N`**：数据块大小（默认 16KB）。
-- **`-H N`**：GPU 压缩所使用的哈希表对数（默认 14）。
-- **`-a N`**：GPU 压缩加速因子（默认 1）。
-- **`-l N`**：GPU 运行时的局部工作组大小（default 1）。
+- **`--gpu-ratio F`**：GPU 块比例（0.0-1.0）
+- **`--adaptive`**：启用 adaptive split
+- **`--sample-blocks N`**：adaptive 采样块数
+- **`-T N` / `--cpu-threads N`**：CPU 工作线程数
+- **`-b N`**：块大小（当前 hybrid bench 中主路径仍以 16KB 为中心）
+- **`-H N`**：GPU hash log
+- **`-a N`**：GPU acceleration
+- **`-l N`**：GPU local work-group size
+- **`--bench-io`**：让 total throughput 包含文件写回/读回
 
 ## 6. 基准测试方法 (Benchmark Methodology)
 
-为了全面评估 lz4_hybrid 的性能，我们进行了一场严密的基准测试：
+当前 fresh rerun 的实验设置为：
 
-- **测试样本**：包含 83 个各类型文件（来自 `/root/samples/`），文件大小覆盖了从 500KB 到 150MB 的广泛区间。
-- **参数组合**：我们对 6 种 GPU 比例、2 种 CPU 线程数以及 2 种加速因子进行了笛卡尔积遍历，每个测试点共 24 种配置。
-- **测量过程**：每种配置执行 3 秒钟的循环压缩/解压缩测试。结果取所有迭代次数的中位数。
-- **关键指标**：内核吞吐量 (Comp/Dec Kernel TP)、总吞吐量 (Comp/Dec Total TP)、压缩率 (Ratio%)、CPU 能效以及 GPU 能效。
-- **环境设置**：CPU 和 GPU 均锁定在 100% 频率，确保结果的可重复性和公正性。
+- **文件集**：`/root/samples`，83 个文件
+- **配置空间**：
+  - `SplitMode = fixed | adaptive`
+  - `GPURatio = 0.0, 0.3, 0.5, 0.7, 0.9, 1.0`
+  - `CPUThreads = 1, 2`
+  - `Acceleration = 1, 3`
+- **总配置数/文件**：48
+- **总数据点**：3984
+- **结果文件**：`/root/lz4/exp_results/hybrid_bench/hybrid_bench_20260308_171420.csv`
+- **正确性**：Parse failures = 0，结果要求 `VerifyOK=true`
+
+关键变化是：
+
+- 当前 total throughput 为 corrected steady-state total；
+- adaptive 结果来自修复后的 live implementation，而不是此前“标签化 adaptive”。
 
 ## 7. 基准测试结果 (Benchmark Results)
 
-以下是 24 种配置下的全量汇总数据。该数据展示了不同 GPU 比例、线程数和加速因子对整体性能的影响。
+### 7.1 Best-per-engine medians（每文件先在各 engine 内选最佳配置）
 
-| GPURatio | T | A | CompKrnl (MB/s) | CompTot (MB/s) | DecKrnl (MB/s) | DecTot (MB/s) | Ratio% | CPU_E (J) | GPU_E (J) |
-|----------|---|---|-----------------|----------------|----------------|---------------|--------|-----------|-----------|
-| 0.0 | 1 | 1 | 1421 | 1332 | 1779 | 1778 | 28.38 | 38.25 | 0.03 |
-| 0.0 | 1 | 3 | 1422 | 1334 | 1781 | 1780 | 28.38 | 38.12 | 0.01 |
-| 0.0 | 2 | 1 | 2662 | 2391 | 3259 | 3253 | 28.38 | 42.87 | 0.01 |
-| 0.0 | 2 | 3 | 2665 | 2394 | 3257 | 3252 | 28.38 | 42.85 | 0.01 |
-| 0.3 | 1 | 1 | 959 | 893 | 2240 | 2238 | 28.37 | 58.54 | 10.15 |
-| 0.3 | 1 | 3 | 976 | 905 | 2252 | 2250 | 28.65 | 57.07 | 9.10 |
-| 0.3 | 2 | 1 | 1181 | 1087 | 3103 | 3100 | 28.37 | 65.83 | 12.96 |
-| 0.3 | 2 | 3 | 1222 | 1120 | 3120 | 3117 | 28.65 | 64.52 | 11.85 |
-| 0.5 | 1 | 1 | 747 | 693 | 2076 | 2075 | 28.36 | 62.10 | 12.94 |
-| 0.5 | 1 | 3 | 771 | 713 | 2084 | 2083 | 28.81 | 60.59 | 11.74 |
-| 0.5 | 2 | 1 | 763 | 707 | 2079 | 2078 | 28.36 | 62.87 | 13.31 |
-| 0.5 | 2 | 3 | 793 | 732 | 2089 | 2088 | 28.81 | 61.50 | 12.18 |
-| 0.7 | 1 | 1 | 579 | 552 | 1575 | 1574 | 28.36 | 61.23 | 13.63 |
-| 0.7 | 1 | 3 | 602 | 572 | 1577 | 1576 | 28.96 | 59.72 | 12.47 |
-| 0.7 | 2 | 1 | 579 | 552 | 1575 | 1575 | 28.36 | 61.28 | 13.63 |
-| 0.7 | 2 | 3 | 602 | 572 | 1578 | 1577 | 28.96 | 59.69 | 12.45 |
-| 0.9 | 1 | 1 | 460 | 441 | 1235 | 1234 | 28.40 | 59.37 | 13.38 |
-| 0.9 | 1 | 3 | 476 | 455 | 1240 | 1239 | 29.18 | 57.88 | 12.26 |
-| 0.9 | 2 | 1 | 460 | 440 | 1234 | 1234 | 28.40 | 59.41 | 13.38 |
-| 0.9 | 2 | 3 | 475 | 454 | 1239 | 1238 | 29.18 | 58.04 | 12.25 |
-| 1.0 | 1 | 1 | 423 | 407 | 1126 | 1125 | 28.40 | 59.55 | 13.63 |
-| 1.0 | 1 | 3 | 437 | 420 | 1131 | 1131 | 29.26 | 58.08 | 12.48 |
-| 1.0 | 2 | 1 | 422 | 407 | 1126 | 1126 | 28.40 | 59.57 | 13.63 |
-| 1.0 | 2 | 3 | 437 | 420 | 1130 | 1129 | 29.26 | 58.12 | 12.47 |
+| Engine | Comp total MB/s | Dec total MB/s | Comp kernel MB/s | Dec kernel MB/s | Ratio % | Comp power W |
+|---|---:|---:|---:|---:|---:|---:|
+| CPU | 756.34 | 756.19 | 2081.46 | 6755.90 | 20.81 | 14.63 |
+| GPU | **1595.57** | **1032.04** | **6901.95** | **17087.28** | 22.55 | 14.68 |
+| Hybrid fixed | 864.86 | 729.76 | 1264.01 | 2558.15 | 24.82 | 15.91 |
+| Hybrid adaptive | 853.97 | 726.30 | 1201.80 | 3149.99 | 24.53 | 15.86 |
+
+### 7.2 Winner counts（每文件比较引擎）
+
+**Compression total throughput**：
+
+- GPU：**51**
+- Hybrid fixed：**27**
+- Hybrid adaptive：**3**
+- CPU：**2**
+
+**Decompression total throughput**：
+
+- GPU：**59**
+- Hybrid fixed：**17**
+- Hybrid adaptive：**5**
+- CPU：**2**
+
+### 7.3 当前最好的 hybrid 配置区域
+
+按 83 文件平均 `CompTotalTP_MBs` 看，最强 hybrid 配置集中在：
+
+- `gpu_ratio = 0.3`
+- `cpu_threads = 2`
+- `acceleration = 1 / 3`
+
+其中 mean compression 最强的是：
+
+- `adaptive, gpu_ratio=0.3, T=2, A=1`
+- mean comp total = **1253.14 MB/s**
+- mean dec total = **733.97 MB/s**
+
+紧随其后的是：
+
+- `adaptive, gpu_ratio=0.3, T=2, A=3`
+- `fixed, gpu_ratio=0.3, T=2, A=3`
+- `fixed, gpu_ratio=0.3, T=2, A=1`
 
 ## 8. 性能分析 (Performance Analysis)
 
-通过对上述基准测试数据的深入挖掘，我们可以得出以下核心结论：
+### 8.1 当前主结论已经变化：GPU 才是 LZ4 family 的主导引擎
 
-### 纯 CPU 模式的主导地位
-在当前的基准测试框架下，纯 CPU 模式（R=0.0）表现出了极强的竞争力。当使用 2 个线程时，CPU 达到了 2662 MB/s 的压缩内核吞吐量，而最佳的混合配置（R=0.3/T=2/A=3）仅为 1222 MB/s。产生这一现象的原因主要有：
-- **CPU 极致效率**：在 16KB 块大小下，单线程 CPU LZ4 的速度已极其惊人（约 1400 MB/s）。
-- **GPU 路径开销**：通过 `gpu_compress_blocks()` 执行的 GPU 任务涉及缓冲区创建、数据入队及同步等高昂开销。
-- **木桶效应**：`parallel_us` 指标受限于最慢的引擎，而在混合压缩中，受 overhead 拖累的 GPU 往往成了性能瓶颈。
+旧文档中大量分析默认 hybrid 最终会成为主路径，但 fresh rerun 已证明当前 corrected 结论是：
 
-### 混合模式中的 GPU 运行时开销
-混合模式下的 GPU 内核吞吐量远低于独立的 `lz4_gpu` 基准测试结果。在独立模式下，利用持久化的 daemon 和缓冲区复用，GPU 吞吐量可达约 2878 MB/s；但在混合模式下（R=1.0），由于每次调用都需重新创建 Buffer 且缺乏复用，吞吐量骤降至约 423 MB/s。这 6.8 倍的性能差距完全源于主机侧的软件管理开销。
+- **GPU 是总吞吐冠军**；
+- hybrid fixed 次之；
+- adaptive 没有超过 best fixed；
+- CPU 只在极少数文件上获胜。
 
-### 解压缩性能更趋于平衡
-相对于压缩，解压缩的性能表现更加均衡：
-- GPU 解压缩内核速度较快，即便存在 overhead，也能维持在 1000 MB/s 以上。
-- 在 R=0.3/T=2 配置下，混合解压缩达到了 3120 MB/s，非常接近纯 CPU T=2 的 3259 MB/s。
+### 8.2 fixed vs adaptive
 
-### 能耗与能效分析
-- **纯 CPU T=1**：总能耗 38.25J，能效比最高。
-- **混合配置**：总能耗普遍落在 66-79J 之间，显著高于纯 CPU 模式。
-- **能耗翻倍的原因**：在混合模式下，CPU 依然保持活跃（负责数据组装、线程管理），消耗了 58-66J 的能量，而 GPU 在此基础上又额外贡献了 10-14J。因此，对于当前的工作负载，纯 CPU 模式在每焦耳处理数据量上具有压倒性优势。
+**Raw median（跨全部 hybrid rows）**：
+
+| Mode | Comp total MB/s | Dec total MB/s |
+|---|---:|---:|
+| Fixed | 532.10 | **678.12** |
+| Adaptive | **549.06** | 674.57 |
+
+**Best-per-file median**：
+
+| Mode | Comp total MB/s | Dec total MB/s |
+|---|---:|---:|
+| Fixed | **864.86** | **729.76** |
+| Adaptive | 853.97 | 726.30 |
+
+这说明 adaptive 的正确结论是：
+
+- 它现在已经是真实功能；
+- 它在 raw-median compression total 上略有改善；
+- 但在 best-per-file 层面仍然不如 fixed。
+
+因此当前不能写“adaptive 胜出”，而应写：
+
+> **adaptive 已实现并经 fresh rerun 验证，但当前启发式尚未超过最优 fixed split。**
+
+### 8.3 hybrid 的现实价值
+
+尽管不是整体第一，hybrid 仍有两个现实意义：
+
+1. **部分文件上仍能胜出**：尤其压缩侧 fixed 仍赢 28 个文件；
+2. **仍可在部分文件上胜出**，但压缩功率不再像上一版那样明显低：
+   - fixed: 15.91W
+   - adaptive: 15.86W
+   - CPU: 14.63W
+   - GPU: 14.68W
+
+所以 hybrid 当前不是“无用”，而是一个 **吞吐不及 GPU、但在一部分文件上仍有价值的平衡方案**；功率维度已经不能再被写成它的主要优势。
 
 ## 9. 典型现象与深度分析 (Typical Phenomena & Deep Analysis)
 
-### 现象 1：GPU 比例与吞吐量的负相关
-在混合压缩中，提高 `gpu_ratio` 反而会导致吞吐量下降。这是因为 GPU 路径受 overhead 支配，分担的任务越多，受拖累的时间就越长。这与“人多力量大”的直觉相悖，但在受限于主机侧开销的异构计算中十分常见。
+### 现象 1：0.3 比例仍是中心甜点区
 
-### 现象 2：解压缩对 GPU 比例的敏感度较低
-GPU 解压缩内核更为精简，且写回数据量相对固定，因此对 overhead 的敏感度低于压缩过程。在 R=0.3 至 0.5 之间，解压缩吞吐量仍能保持在 CPU 峰值的 90% 以上。
+无论 fixed 还是 adaptive，表现最好的配置都集中在 `gpu_ratio≈0.3, T=2`。这说明当前平台上的最佳协同方式不是“GPU 尽量多做”，而是：
 
-### 现象 3：文件特征决定最优配置
-- **极高压缩率文件**（如全零文件）：CPU 压缩速度可达 6000-16000 MB/s。由于 GPU 处理流程被固定开销限制在约 1500 MB/s 左右，此时引入 GPU 纯属画蛇添足。
-- **中等压缩率文件**（如 elasticsearch 数据）：R=0.3/T=2 相比 CPU T=2 能带来 30-60% 的局部性能提升。
-- **低压缩率文件**（如 text 文本）：R=0.5/T=2 甚至能展示出约 1.7 倍的性能飞跃。
+- GPU 负责一部分块；
+- CPU 负责剩余部分并提供高吞吐收尾；
+- 避免把太多任务交给受 host/runtime 路径约束的 GPU 子路径。
+
+### 现象 2：adaptive 会真实改变 split，但不一定带来更好 total
+
+修复后 adaptive 在 verbose 模式下可以输出有效的 `effective_gpu_ratio` 和 `gpu_blocks/cpu_blocks`。但“split 确实改变了”并不等于“系统总吞吐必然提高”。这正是当前结果告诉我们的现实：
+
+- 调度器真实在工作；
+- 但启发式不够好时，调度自由度也可能带来次优划分。
+
+### 现象 3：hybrid ratio 明显更差
+
+当前 hybrid best-per-file median ratio 为：
+
+- fixed：**24.82%**
+- adaptive：**24.53%**
+
+二者都明显高于：
+
+- CPU：20.81%
+- GPU：22.55%
+
+说明当前 hybrid 容器化与 split 设计仍然带来了明显压缩率代价。这是它没有成为默认路径的重要原因之一。
 
 ## 10. 按数据类型分析 (Analysis by Data Type)
 
-我们将 83 个测试文件按压缩率分为三类进行细化分析：
+当前 full rerun 没有继续沿用旧文档那种按“高/中/低压缩率”给出大量旧口径数字的写法，因为那些数字已与 corrected methodology 不一致。但从 fresh rerun 的 winner 分布和最优配置区域仍能观察到：
 
-### 高压缩率 (21 个文件, Ratio < 10%)
-- **纯 CPU T=2**: CompK=6657 MB/s, DecK=2901 MB/s
-- **最佳混合 (R=0.3/T=2)**: CompK=1478 MB/s, DecK=3697 MB/s
-- **结论**：CPU 压缩速度快 4.5 倍，GPU 对此类文件的压缩毫无贡献。但在解压缩方面，混合模式带来了 1.27 倍的加速。
+- **高度可压缩文件**：CPU 竞争力更强，hybrid 往往需要降低 GPU 比例；
+- **中等压缩率文件**：hybrid 最可能体现价值，尤其在 `gpu_ratio≈0.3` 附近；
+- **低压缩率 / GPU 友好文件**：纯 GPU 更容易成为赢家。
 
-### 中等压缩率 (46 个文件, Ratio 10-40%)
-- **纯 CPU T=2**: CompK=1385 MB/s, DecK=3124 MB/s
-- **最佳混合压缩 (R=0.3/T=2/A=3)**: CompK=1193 MB/s
-- **最佳混合解压 (R=0.3/T=2/A=3)**: DecK=3059 MB/s
-- **结论**：整体性能接近，虽然混合模式平均略慢，但在很多特定文件上表现优于纯 CPU。
+这也正是 adaptive 仍值得继续研究但尚未完成的原因：
 
-### 低压缩率 (16 个文件, Ratio >= 40%)
-- **纯 CPU T=2**: CompK=1088 MB/s, DecK=4115 MB/s
-- **最佳混合压缩 (R=0.3/T=2/A=3)**: CompK=953 MB/s
-- **最佳混合解压 (R=0.3/T=2)**: DecK=2549 MB/s
-- **结论**：CPU 在两个领域均保持领先，但在压缩性能上的差距已经缩小。
+> 当前 split policy 已真实存在，但还没有足够强到稳定识别这些文件类别并超过 best fixed。 
 
 ## 11. 优化机会 (Optimization Opportunities)
 
-lz4_hybrid 虽然已经展示了 CPU+GPU 协同工作的潜力，但当前实现仍存在显著的提升空间：
+在当前 corrected 结果下，真正值得继续做的方向包括：
 
-1. **缓冲区复用 (Buffer Reuse)**：目前 GPU 路径在每次调用时都会创建和销毁 OpenCL Buffer。如果采用类似 `lz4_gpu` daemon 模式的 `ensure_buffer` 模式，将有望大幅降低 overhead，从而释放 GPU 2878 MB/s 的真实内核潜力。
-2. **自适应比例分配 (Adaptive Ratio)**：系统可以先对前几个数据块进行压缩率预探测，动态调整 `gpu_ratio`。对于极高压缩率的数据，应完全回退到 CPU 模式；而对于低压缩率数据，则加大 GPU 权重。
-3. **流水线重叠 (Pipeline Overlap)**：目前的任务分配是静态的且属于同步模式。通过构建三级流水线（读取→处理→写入），让 GPU 在处理第 N 个批次时，CPU 正在处理第 N+1 个批次，能有效填平同步等待带来的性能波谷。
-4. **Daemon 模式集成**：直接与运行中的 `lz4_gpu_daemon` 通信。利用 daemon 维护的持久化 OpenCL 上下文，彻底消除初始化和内存管理的延时。
+1. **进一步压缩 GPU 子路径的 host/runtime 成本**：让 hybrid 中的 GPU 更接近纯 GPU backend 的 steady-state 表现；
+2. **更强的 adaptive 规则**：当前采样启发式过于轻量，能改 split，但不足以稳定提高 total throughput；
+3. **容器/组装成本优化**：当前 ratio 与 total throughput 的双重损失，部分来自 hybrid 容器与结果组装路径；
+4. **更细粒度 pipeline overlap**：当前主要是并发分路，不是深流水重叠。
+
+### 11.1 CPU OpenCL 路径的当前定位
+
+本轮用户特别要求验证“CPU 是否也应像 GPU 一样走 OpenCL 内核”。当前代码已通过 `FORCE_OPENCL_DEVICE=CPU` 完成验证，结论是：
+
+- **功能上可运行**：LZ4 GPU backend 在 Intel CPU OpenCL 设备上可正确完成压缩/解压；
+- **局部 case 有竞争力**：例如 `dickens` 与 `industrial_parent_0_pages_img.tar` 上，CPU OpenCL 可接近甚至短暂超过 GPU OpenCL；
+- **但不应取代当前 native CPU path**：从系统级角度看，它并未稳定优于现有 `liblz4 + pthread` 路径，也没有证明自己能改善当前 hybrid 的总体排序。
+
+因此，当前最合理的处理方式不是删除这条路径，而是把它保留为 **设备可移植性与后续研究入口**，而不是默认部署设计。
 
 ## 12. 结论 (Conclusions)
 
-lz4_hybrid 成功验证了 CPU 与 GPU 联合进行 LZ4 压缩与解压缩的可行性。
+当前 `lz4_hybrid` 的结论应更新为：
 
-- **核心限制**：当前的性能瓶颈并不在 GPU 的计算能力上，而是在主机侧的 OpenCL 驱动及内存管理开销（Overhead）上。这直接导致混合模式在大规模测试中难以全面超越优化后的多线程 CPU 方案。
-- **特定场景优势**：尽管平均性能受限，但在处理中低压缩率的文件时，混合模式已表现出显著的加速效果。在测试的 83 个文件中，有 39 个在特定配置下通过引入 GPU 获得了实实在在的性能提升。
-- **能耗权衡**：目前混合模式能耗较高。由于 GPU 始终需要 CPU 进行繁忙的辅助工作（数据组装、拷贝等），能耗基本是纯 CPU 的两倍左右。在实际部署中，需在极致吞吐量和极致能效之间做出权衡。
-- **未来展望**：通过引入缓冲区持久化和 daemon 化管理，lz4_hybrid 极有可能在不久的将来彻底释放异构计算的能量，成为超高性能压缩领域的强力竞争者。
+- **实现层面**：CPU path、GPU path、fixed split、adaptive split、bench-io total semantics 均已落地；
+- **结果层面**：GPU 是 LZ4 family 的主导吞吐引擎；hybrid fixed 次之；adaptive 未超过 fixed；
+- **系统层面**：hybrid 的价值在于部分文件胜出与协同研究空间，而不是当前全局最快引擎；CPU OpenCL 虽然已验证可运行，但暂不构成替代 native CPU path 的依据。
+
+因此，当前最准确的表述是：
+
+> `lz4_hybrid` 已经从概念验证进化为一个完整、可验证、带真实 adaptive 的协同实现，但在 corrected steady-state total throughput 下，它的角色是 GPU 基线之上的平衡型补充，而不是替代 GPU 成为新的主路径。
+
+## 13. 2026-03-09 优化轮次快照
+
+本轮围绕用户提出的 hybrid ratio / throughput 与 LZ4 64KB 局限，完成了以下 live code 变更：
+
+- 修复 `gpu_compress_blocks()` 中 GPU dict buffer 未清零导致的 repeated bench verify fail；
+- 修复 `run_bench()` 中 `--bench-io` 固定 `/tmp` 文件名导致的冲突；
+- GPU 子路径改为复用 `lz4_gpu_workspace_t`，减少 `clCreateBuffer` / `clReleaseMemObject` 频率；
+- GPU compression / decompression 路径引入 CU-aware worker sizing、mapped readback；
+- adaptive sampling 从“只看文件头”改为跨文件分布式采样；
+- CPU 子路径压缩从 `LZ4_compress_default()` 切换为 `LZ4_compress_fast()`，与 acceleration 语义保持一致；
+- `bench_hybrid.py` 从单一 `16K` 扩展为 `16K / 32K / 64K` sweep。
+
+### 13.1 定向 subset 结果（优化后，1s warmed bench）
+
+#### `dickens`，fixed `gpu_ratio=0.7, T=2, a=3`
+
+| Block | Comp total MB/s | Dec total MB/s | Ratio % |
+|---|---:|---:|---:|
+| 16K | 259.29 | 323.67 | 71.91 |
+| 32K | 267.08 | **325.93** | 67.73 |
+| 64K | **268.60** | 325.51 | **64.62** |
+
+#### `dickens`，adaptive `gpu_ratio=0.7, sample_blocks=8`
+
+| Block | Comp total MB/s | Dec total MB/s | Ratio % |
+|---|---:|---:|---:|
+| 16K | 303.69 | 292.22 | 71.68 |
+| 64K | **304.22** | **305.07** | **64.27** |
+
+#### `industrial_parent_0_pages_img.tar`
+
+| Mode | Block | Comp total MB/s | Dec total MB/s | Ratio % |
+|---|---|---:|---:|---:|
+| Fixed 0.7 | 64K | **658.18** | 351.84 | **19.28** |
+| Adaptive | 64K | 468.74 | **361.48** | 19.31 |
+
+### 13.2 当前结论
+
+当前 subset 结果已经表明：
+
+1. **hybrid 的 correctness blocker 已被清除**，16K/32K/64K warmed `--bench-io` 均可稳定 verify；
+2. **把 hybrid 从固定 16K 的旧 sweep 中解放出来后，ratio 与 total throughput 明显改善**；
+3. `dickens` 上 adaptive 会把有效 GPU 比例推到约 0.93--0.97，从而把 comp total 提升到 ~304 MB/s；
+4. `industrial_parent_0_pages_img.tar` 上 fixed 64K hybrid comp total 达到 **658.18 MB/s**，已经在该 workload 上超过当前 64K LZ4 GPU 的 **597.88 MB/s**；
+5. 因而当前更准确的表述不再是“hybrid 系统性落后 GPU”，而是：
+
+> `lz4_hybrid` 经过本轮修复与运行时优化后，已经能在部分 workload 上超过纯 GPU；但在更广 workload 上是否形成系统级反超，仍需新的全量 rerun 来确认。

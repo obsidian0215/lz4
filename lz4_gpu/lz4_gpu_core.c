@@ -343,6 +343,16 @@ static int lz4_write_blocks_direct(FILE* fout,
     return 0;
 }
 
+static void lz4_set_stream_buffer(FILE* f) {
+    char* vbuf;
+    if (!f) return;
+    vbuf = (char*)malloc(2U * 1024U * 1024U);
+    if (!vbuf) return;
+    if (setvbuf(f, vbuf, _IOFBF, 2U * 1024U * 1024U) != 0) {
+        free(vbuf);
+    }
+}
+
 int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kernel,
                     const char* input_path, const char* output_path,
                     size_t block_size, int acceleration, lz4_gpu_workspace_t* ws,
@@ -350,14 +360,11 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
     cl_int err;
     uint64_t t1, t2;
 
-    t1 = get_us();
     FILE* fin = fopen(input_path, "rb"); if (!fin) return -1;
+    lz4_set_stream_buffer(fin);
     fseek(fin, 0, SEEK_END); size_t file_size = ftell(fin); fseek(fin, 0, SEEK_SET);
     if (file_size == 0) { fclose(fin); return -1; }
     t->in_size = (unsigned long)file_size;
-
-    t2 = get_us();
-    t->file_read_us = (unsigned long)(t2 - t1);
 
     t1 = get_us();
     int num_blocks = (file_size + block_size - 1) / block_size;
@@ -379,6 +386,7 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
         fprintf(stderr, "[LZ4-DBG][COMP] warning: kernel has no debug args, debug counters disabled\n");
     }
     uint32_t single_block_max_out = (uint32_t)(block_size * 1.1 + 64);
+    int tableType = (block_size <= 65536) ? 0 : 1;
     for (int i = 0; i < num_blocks; i++) {
         h_block_info[i*2] = i * block_size;
         h_block_info[i*2+1] = (i == num_blocks - 1) ? (file_size - i * block_size) : (uint32_t)block_size;
@@ -391,6 +399,7 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
     ws->in_buf = ensure_buffer(context, ws->in_buf, file_size, &ws->current_in_capacity, &err);
     ws->out_buf = ensure_buffer(context, ws->out_buf, (size_t)num_blocks * single_block_max_out, &ws->current_out_capacity, &err);
 
+    t2 = get_us();
     /* Zero-copy file read: map in_buf and read directly */
     void* mapped_in = clEnqueueMapBuffer(queue, ws->in_buf, CL_TRUE, CL_MAP_WRITE, 0, file_size, 0, NULL, NULL, &err);
     if (err == CL_SUCCESS) {
@@ -398,6 +407,7 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
         clEnqueueUnmapMemObject(queue, ws->in_buf, mapped_in, 0, NULL, NULL);
     }
     fclose(fin);
+    t->file_read_us = (unsigned long)(get_us() - t2);
 
     size_t out_offsets_cap = num_blocks * sizeof(uint32_t);
     size_t block_info_cap = num_blocks * 2 * sizeof(uint32_t);
@@ -434,7 +444,8 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
             fprintf(stderr, "[LZ4-DBG][COMP] warning: failed to enable debug counters, continuing without them\n");
         }
     }
-    size_t dict_size_per_worker = (1ULL << hash_log) * sizeof(cl_uint);  /* 32-bit compact entries */
+    size_t dict_entries_per_worker = (size_t)1U << (tableType == 0 ? (hash_log + 1) : hash_log);
+    size_t dict_size_per_worker = dict_entries_per_worker * sizeof(cl_uint);  /* 32-bit compact entries */
     size_t prev_dict_capacity = ws->current_dict_capacity;
     ws->dict_buf = ensure_buffer(context, ws->dict_buf, g_ws * dict_size_per_worker, &ws->current_dict_capacity, &err);
     if (ws->current_dict_capacity != prev_dict_capacity) {
@@ -463,7 +474,6 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
     t->data_upload_us = (unsigned long)(get_us() - t1);
 
     t1 = get_us();
-    int tableType = (block_size <= 65536) ? 0 : 1;
     int globalIndexBase = 0;
     int inputSize = (int)file_size;
     cl_mem dbg_comp_arg = dbg_comp_enabled ? dbg_comp_buf : ws->output_size_buf;
@@ -525,6 +535,7 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
     t1 = get_us();
     FILE* fout = fopen(output_path, "wb");
     if (fout) {
+        lz4_set_stream_buffer(fout);
         uint32_t magic = 0x184D2204;
         fwrite(&magic, 1, 4, fout);
         fwrite(&num_blocks, 1, 4, fout);
@@ -578,6 +589,7 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
 
     t1 = get_us();
     FILE* fin = fopen(input_path, "rb"); if (!fin) return -1;
+    lz4_set_stream_buffer(fin);
     uint32_t magic, num_blocks, block_size_val;
     if (fread(&magic, 1, 4, fin) != 4 || magic != 0x184D2204) { fclose(fin); return -1; }
     if (fread(&num_blocks, 1, 4, fin) != 4) { fclose(fin); return -1; }
@@ -591,7 +603,7 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
     size_t file_size = ftell(fin);
     size_t data_size = file_size - header_size;
     fseek(fin, header_size, SEEK_SET);
-    t->file_read_us = (unsigned long)(get_us() - t1);
+    t->file_read_us = 0;
 
     t1 = get_us();
     uint32_t* h_comp_offsets = malloc(num_blocks * sizeof(uint32_t));
@@ -648,6 +660,8 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
         return -1;
     }
 
+    {
+        uint64_t file_read_t0 = get_us();
     /* Zero-copy style: map and read directly */
     void* mapped_in = clEnqueueMapBuffer(queue, ws->in_buf, CL_TRUE, CL_MAP_WRITE, 0, data_size, 0, NULL, NULL, &err);
     if (err == CL_SUCCESS && mapped_in) {
@@ -688,6 +702,8 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
         free(h_in);
     }
     fclose(fin);
+    t->file_read_us = (unsigned long)(get_us() - file_read_t0);
+    }
 
     ws->decomp_comp_off_buf = ensure_buffer(context, ws->decomp_comp_off_buf, num_blocks * 4,
                                             &ws->current_decomp_comp_off_capacity, &err);
@@ -834,6 +850,7 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
     t1 = get_us();
     FILE* fout = fopen(output_path, "wb");
     if (fout) {
+        lz4_set_stream_buffer(fout);
         void* mapped_out = clEnqueueMapBuffer(queue, ws->out_buf, CL_TRUE, CL_MAP_READ,
                                               0, num_blocks * block_max, 0, NULL, NULL, &err);
         if (err == CL_SUCCESS && mapped_out) {

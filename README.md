@@ -126,3 +126,96 @@ and the `lz4` command line interface.
 ### Special Thanks
 
 - Takayuki Matsuoka, aka @t-mat, for exceptional first-class support throughout the lifetime of this project
+
+# lz4 repository with GPU and hybrid extensions
+
+This tree contains the upstream LZ4 code plus local GPU and CPU+GPU hybrid implementations used for heterogeneous compression experiments.
+
+## Main subprojects
+
+- `programs/`, `lib/`: upstream CPU LZ4 implementation
+- `lz4_gpu/`: OpenCL GPU execution path
+- `lz4_hybrid/`: CPU+GPU collaborative path
+- `tools/`: benchmark drivers and analysis helpers
+
+## Build
+
+### Linux
+
+CPU LZ4:
+
+```bash
+make -C programs lz4
+```
+
+GPU path:
+
+```bash
+make -C lz4_gpu
+```
+
+Hybrid path:
+
+```bash
+make -C lz4_hybrid
+```
+
+Typical Linux packages:
+
+- Debian/Ubuntu: `build-essential opencl-headers ocl-icd-opencl-dev`
+- Fedora: `gcc make opencl-headers ocl-icd-devel`
+
+### Windows
+
+Supported Windows build target is **MSYS2 / MinGW-w64**.
+
+This is the supported path because:
+
+- `lz4_hybrid` depends on pthreads
+- the benchmark and runtime code are GCC/Make oriented
+- it provides the least invasive portability story for the current codebase
+
+Install MSYS2 packages first:
+
+```bash
+pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-make mingw-w64-ucrt-x86_64-winpthreads
+```
+
+Then build with CUDA-provided OpenCL headers/libs (example path):
+
+```bash
+make -C lz4_gpu OS=Windows_NT CC=gcc \
+  OPENCL_INCLUDE_DIR="/c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/include" \
+  OPENCL_LIB_DIR="/c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/lib/x64"
+
+make -C lz4_hybrid OS=Windows_NT CC=gcc \
+  OPENCL_INCLUDE_DIR="/c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/include" \
+  OPENCL_LIB_DIR="/c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/lib/x64"
+```
+
+Notes:
+
+- NVIDIA CUDA on Windows includes OpenCL headers and import libraries.
+- The runtime `OpenCL.dll` is supplied by the installed GPU driver.
+- If you use a different SDK/vendor, set `OPENCL_INCLUDE_DIR`, `OPENCL_LIB_DIR`, and optionally `OPENCL_LIB_NAME` accordingly.
+- Daemon/client mode in `lz4_gpu` is Linux-only today.
+
+## Benchmarks
+
+Representative runners:
+
+- `tools/bench_lz4.py`: CPU vs GPU benchmark driver
+- `tools/bench_hybrid.py`: hybrid parameter sweeps across 16K/32K/64K
+
+Examples:
+
+```bash
+python3 tools/bench_lz4.py --samples-dir /root/samples_subset --gpu-only
+python3 tools/bench_hybrid.py --samples-dir /root/samples_subset --bench-seconds 1
+```
+
+## Current status
+
+- `lz4_gpu` is the default throughput leader in the current full verified corpus.
+- `lz4_hybrid` now has corrected benchmark semantics, fixed repeated-bench validation, wider block-size coverage, and improved runtime reuse.
+- On targeted workloads, `lz4_hybrid` can now exceed `lz4_gpu`, but a new full rerun is still needed before claiming a system-wide ranking change.

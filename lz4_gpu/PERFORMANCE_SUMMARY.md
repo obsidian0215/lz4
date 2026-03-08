@@ -1,8 +1,10 @@
 # LZ4 GPU 性能总结
 
-> 更新时间：2026-03-07  
-> 硬件平台：Intel Core (Tiger Lake) + Intel Iris Xe Graphics (96 EU, 1500 MHz, 共享内存)  
-> 测试文件集：83 个真实文件 (/root/samples)，涵盖数据库页面、日志、二进制、文本、图像归档等
+> 更新时间：2026-03-09  
+> 硬件平台：Intel Core + Intel Iris Xe Graphics（iGPU，共享内存）  
+> 当前基线结果：`/root/lz4/exp_results/runs/20260307_201916/lz4_param_sweep.csv`  
+> 当前 hybrid 对照结果：`/root/lz4/exp_results/hybrid_bench/hybrid_bench_20260308_171420.csv`  
+> 测试文件集：83 个真实文件（/root/samples）
 
 ---
 
@@ -12,10 +14,10 @@
 2. [系统架构](#2-系统架构)
 3. [核心设计与优化](#3-核心设计与优化)
 4. [HashLog 参数分析与 HL=13 退化深入分析](#4-hashlog-参数分析与-hl13-退化深入分析)
-5. [CPU vs GPU 全量基准测试结果](#5-cpu-vs-gpu-全量基准测试结果)
-6. [能效分析](#6-能效分析)
+5. [修正后的测试口径与最新 CPU vs GPU 全量结果](#5-修正后的测试口径与最新-cpu-vs-gpu-全量结果)
+6. [修正后的功耗/能效分析](#6-修正后的功耗能效分析)
 7. [优化历程中的失败实验](#7-优化历程中的失败实验)
-8. [结论与展望](#8-结论与展望)
+8. [当前结论与展望](#8-当前结论与展望)
 
 ---
 
@@ -138,6 +140,10 @@ lz4_gpu 自 2025-12-08 创建以来，经历了 10 次核心提交，从原型�
 - `ensure_buffer` / `write_buffer_mapped`：缓冲区重用机制，避免 bench 模式下每次迭代重新分配
 - 零拷贝传输：利用 `CL_MEM_ALLOC_HOST_PTR` + `clEnqueueMapBuffer` 实现真正的零拷贝
 - 暴露缓冲区管理 API 供 bench 模式复用
+
+**设备选择与 CPU OpenCL 验证入口**：
+- 新增 `FORCE_OPENCL_DEVICE=CPU|GPU|DEFAULT|ALL`，可显式指定 OpenCL 设备类型；
+- 该开关一方面用于当前 Intel 平台上的 CPU OpenCL 可行性验证，另一方面也便于后续跨设备对比时复用同一套 OpenCL backend。
 
 **总吞吐量指标**：
 - 新增 `comp_total_tp` 和 `dec_total_tp` 输出，包含主机端所有开销（文件读写、内存分配、内核调度）
@@ -356,113 +362,133 @@ HL=15 的更大哈希表在压缩率上仅有微小改善 (~0.17pp)，但吞吐�
 
 ---
 
-## 5. CPU vs GPU 全量基准测试结果
+## 5. 修正后的测试口径与最新 CPU vs GPU 全量结果
 
-### 测试方法
+### 5.1 为什么必须重写这一节
 
-- **文件集**：83 个真实文件（/root/samples，排除 sample_ 前缀用于子集测试）
-- **GPU 参数**：BS=16K, HL=14, A=1/3, LocalSize=1
-- **CPU 参数**：BS=64K, T=1/2/3 线程
-- **频率点**：GPU 40%/70%/100% 频率，CPU 40%/70%/100% 频率
-- **能量测量**：RAPL 能量计（GPU 仅计算内核执行期间，CPU 仅计算核心函数执行期间）
-- **数据量**：5976 行测试数据
+旧版本这一节中的部分“总吞吐量”数据仍混入了早期外层 harness / subprocess / lazy OpenCL 初始化的影响，因此不能继续作为当前结论依据。当前生效的 CPU/GPU 对比应以修正后的 steady-state total semantics 为准：
 
-### 5.1 内核吞吐量（100% 频率，83 文件均值）
+- **kernel throughput**：只反映内核主体执行速度；
+- **total throughput**：包含真实文件路径和主机端运行时开销，但排除被重复摊销的冷启动污染；
+- GPU total 不再用“每个文件都像第一次启动一样”的方式测量。
 
-| 配置 | 压缩内核 (MB/s) | 解压内核 (MB/s) | 压缩率 |
-|------|----------------|----------------|--------|
-| **GPU BS=16K HL=14 A=1** | **2,878** | **7,923** | 28.32% |
-| **GPU BS=16K HL=14 A=3** | **3,159** | **8,064** | 29.18% |
-| CPU T=1 BS=64K | 2,280 | 3,298 | 26.46% |
-| CPU T=2 BS=64K | 4,043 | 5,952 | 26.46% |
-| CPU T=3 BS=64K | 5,704 | 8,326 | 26.46% |
+### 5.2 当前基线实验设置
 
-### 5.2 GPU vs CPU 加速比（内核吞吐）
+- **结果文件**：`/root/lz4/exp_results/runs/20260307_201916/lz4_param_sweep.csv`
+- **文件集**：`/root/samples`，83 个真实文件
+- **GPU 参数空间**：BlockSize=16K/32K/64K，HashLog=14/15，Acceleration=1/2/3，LocalSize=1
+- **CPU 参数空间**：Threads=1/2/3，BlockSize=64K/256K
+- **频率点**：100%（当前文档仅保留最终 corrected 结果）
+- **正确性**：所有纳入汇总的结果均要求 roundtrip 通过
 
-| 对比 | 压缩加速比 | 解压加速比 |
-|------|----------|----------|
-| GPU A=1 vs CPU T=1 | **1.26x** ✅ | **2.40x** ✅ |
-| GPU A=3 vs CPU T=1 | **1.39x** ✅ | **2.45x** ✅ |
-| GPU A=1 vs CPU T=2 | 0.71x ❌ | **1.33x** ✅ |
-| GPU A=3 vs CPU T=2 | 0.78x ❌ | **1.35x** ✅ |
-| GPU A=1 vs CPU T=3 | 0.50x ❌ | 0.95x ❌ |
-| GPU A=3 vs CPU T=3 | 0.55x ❌ | 0.97x ❌ |
+### 5.3 当前可信汇总方式
 
-**解读**：
-- GPU 在**单线程 CPU** 对比中全面胜出（压缩 1.26-1.39x，解压 2.40-2.45x）
-- GPU 解压在**双线程 CPU** 对比中仍然胜出（1.33-1.35x）
-- GPU 压缩在双线程 CPU 面前劣势明显，因为 LZ4 压缩是串行依赖度高的算法
-- CPU 三线程以上 GPU 已无法竞争（这在预期之内——96 EU 集成 GPU 的计算能力有限）
+当前摘要采用：
 
-### 5.3 总吞吐量（含主机端开销）
+1. 对每个文件、每个 engine（CPU / GPU）在其自身配置空间中选出最佳 `CompTotalMBs` 配置；
+2. 再对所有文件做 best-per-file median 汇总；
+3. 同时保留 kernel throughput、ratio 和 active compression power 作为辅助解释指标。
 
-| 配置 | 压缩总吞吐 (MB/s) | 解压总吞吐 (MB/s) |
-|------|------------------|------------------|
-| GPU A=1 | 1,658 | 3,208 |
-| GPU A=3 | 1,778 | 3,218 |
+### 5.4 当前 best-per-engine 中位数（最终应引用这组）
 
-总吞吐量相比内核吞吐量的损耗来源：
-- OpenCL 内核调度开销（enqueue + wait）
-- 缓冲区映射/解映射
-- 块大小/偏移计算
-- 结果收集与拼接
+| Engine | Comp total MB/s | Dec total MB/s | Comp kernel MB/s | Dec kernel MB/s | Ratio % | Comp power W |
+|------|----------------:|---------------:|-----------------:|----------------:|--------:|-------------:|
+| CPU | 756.34 | 756.19 | 2081.46 | 6755.90 | 20.81 | 14.63 |
+| **GPU** | **1595.57** | **1032.04** | **6901.95** | **17087.28** | 22.55 | 14.68 |
 
-通过 Phase 4 的缓冲区重用和零拷贝优化，总吞吐已接近内核吞吐的 58%-61%（压缩）和 40%（解压）。
+### 5.5 修正后 CPU vs GPU 结论
 
-### 5.4 压缩率对比
+#### 5.5.1 端到端总吞吐量
 
-| 配置 | 平均压缩率 | 说明 |
-|------|----------|------|
-| GPU HL=14 A=1 | 28.32% | GPU 16KB 块 |
-| GPU HL=14 A=3 | 29.18% | 更高加速 → 略低压缩率 |
-| CPU BS=64K | 26.46% | CPU 64KB 块 |
+- 压缩 total throughput：GPU / CPU = **2.11x**
+- 解压 total throughput：GPU / CPU = **1.36x**
 
-GPU 压缩率略高于 CPU（~2pp），原因：
-1. GPU 使用 16KB 块大小（CPU 用 64KB），更小的块 = 更少的跨块匹配机会
-2. GPU 的 epoch 字典机制在块边界处有少量匹配损失
+也就是说，当前在 Intel Iris Xe 平台上，**LZ4 GPU 是明确的 steady-state total throughput 主导引擎**。
 
-这 ~2pp 的差距在大多数应用场景中可以接受。
+#### 5.5.2 kernel throughput 与 total throughput 的差距
 
----
+GPU 当前 best-per-file medians：
 
-## 6. 能效分析
+- compression: **6901.95 MB/s kernel** vs **1595.57 MB/s total**
+- decompression: **17087.28 MB/s kernel** vs **1032.04 MB/s total**
 
-### 6.1 GPU 频率扫描（能量 vs 性能）
+这说明内核本体已经足够快，而真正决定交付性能的是：
 
-| 频率点 | 压缩内核 (MB/s) | 解压内核 (MB/s) | 压缩能量 (J/file) | 解压能量 (J/file) |
-|--------|----------------|----------------|-------------------|-------------------|
-| 40% (~600 MHz) | ~1,850 | ~5,100 | ~0.30 | ~0.14 |
-| 70% (~1050 MHz) | ~2,450 | ~6,800 | ~0.34 | ~0.12 |
-| 100% (1500 MHz) | ~2,878 | ~7,923 | ~0.38 | ~0.11 |
+- host 侧 buffer / queue / metadata 开销
+- 文件读写
+- 守护进程 / steady-state 与冷启动语义差异
 
-**观察**：
-- 吞吐量随频率近似线性增长
-- 能量随频率轻微增长（电压随频率提升）
-- 40% 频率的能效比最佳，但绝对性能下降约 36%
+因此论文和总结都必须把 **total throughput** 放在主位置，把 kernel throughput 当作“解释上限”的辅助指标。
 
-### 6.2 GPU vs CPU 能效对比（100% 频率）
+#### 5.5.3 压缩率
 
-| 配置 | 平均压缩能量 (J/file) | 平均解压能量 (J/file) |
-|------|---------------------|---------------------|
-| **GPU** | **~0.38** | **~0.11** |
-| CPU T=1 | ~1.05 | ~0.34 |
-| CPU T=2 | ~0.67 | ~0.22 |
-| CPU T=3 | ~0.55 | ~0.17 |
+当前 GPU ratio 为 22.55%，CPU 为 20.81%。这表明 GPU 的实时吞吐优势并不是“零代价”的：
 
-**能效加速比**：
+- GPU 当前主路径仍以 16KB block 为中心；
+- 更高并行性会牺牲部分跨块匹配机会；
+- 但这种 ratio 代价相对于 2.11x 压缩总吞吐提升，在实时迁移/传输场景下通常是可接受的。
 
-| 对比 | 压缩能效 | 解压能效 |
-|------|---------|---------|
-| GPU vs CPU T=1 | **2.76x** ✅ | **3.09x** ✅ |
-| GPU vs CPU T=2 | **1.76x** ✅ | **2.00x** ✅ |
-| GPU vs CPU T=3 | **1.45x** ✅ | **1.55x** ✅ |
+### 5.6 与旧结论的差异
 
-**GPU 在所有对比中均展现出更优的能效**。即使在 CPU 三线程（吞吐量已超越 GPU）的情况下，GPU 的能量消耗仍然更低，这是因为：
-1. 集成 GPU 执行单元的功耗远低于 CPU 核心
-2. GPU 的大规模并行架构在处理独立块时更高效
-3. CPU 多线程的线程调度和同步开销额外消耗能量
+这一轮最大的结论修正不是“GPU 变快了”，而是：
 
----
+> **我们终于把 GPU 的真实 steady-state total throughput 和被 cold-start 污染的假 total throughput 区分开了。**
+
+旧文档里关于 GPU total-throughput “灾难性下降”的印象，主要来自错误口径，而不是 GPU 主路径本身真的变差。
+
+### 5.7 与 hybrid 的关系
+
+用 fresh hybrid rerun (`hybrid_bench_20260308_171420.csv`) 与 corrected CPU/GPU baseline 对照后，LZ4 family 当前关系已经很清楚：
+
+- **GPU**：整体吞吐最强
+- **Hybrid fixed**：部分文件上有价值，但吞吐、ratio 和功率都没有形成对 GPU 的系统级反超
+- **Hybrid adaptive**：已真实实现，但当前启发式未超过 best fixed
+
+因此本节中的 GPU 结果，不再是“等待 hybrid 证明是否值得保留”的中间状态，而是当前 LZ4 家族的主基线结果。
+
+## 6. 修正后的功耗/能效分析
+
+### 6.1 当前应采用的功率解释方式
+
+本轮之前，功耗归因曾部分建立在 kernel-time scaling 上，这会让 CPU/GPU/hybrid 的能量比较出现口径偏差。当前文档采用的解释原则是：
+
+- **功率/能量尽量绑定到 total semantics 的 wall-time 窗口**；
+- 不再用早期那种仅按 kernel 执行窗口推导整个引擎的系统级能效结论；
+- 因此功率数据主要用于比较趋势，而不是夸大绝对值。
+
+### 6.2 当前可信压缩功率对比
+
+| 引擎 | Comp power W |
+|------|-------------:|
+| CPU | 14.63 |
+| GPU | 14.68 |
+
+这个结果非常关键：
+
+- GPU 并不是靠“明显更高功耗”换来吞吐；
+- 在当前平台上，CPU 与 GPU 的 active compression power 几乎同一量级；
+- 因而 LZ4 GPU 的 corrected 结论应描述为：
+
+> **在几乎不增加压缩阶段功率的情况下，GPU 提供了显著更高的 steady-state total throughput。**
+
+### 6.3 为什么这比旧文档更可信
+
+旧版本的能效分析更多反映了“内核有多快”或“内核窗口里消耗了多少能量”；
+当前版本更接近系统层面的实际问题：
+
+- 用户关心的是一次 steady-state 请求最终交付速度；
+- 也关心这个交付过程中的 active power；
+- 因此 corrected total semantics + corrected wall-time power 比旧方法更接近真实系统结论。
+
+### 6.4 当前能效结论
+
+LZ4 GPU 目前的能效结论不能再写成极端口号式的“GPU 绝对最省电”或“LZ4 功耗异常偏高”，而应写成：
+
+1. **GPU 的 active compression power 与 CPU 非常接近**；
+2. **GPU 的交付吞吐显著更高**；
+3. 因此在当前平台上，GPU 具有更好的吞吐/功率平衡。
+
+也就是说，LZ4 power story 在 corrected methodology 下已经“正常化”了。
 
 ## 7. 优化历程中的失败实验
 
@@ -492,35 +518,63 @@ GPU 压缩率略高于 CPU（~2pp），原因：
 
 ---
 
-## 8. 结论与展望
+## 8. 当前结论与展望
 
-### 8.1 当前实现总结
+### 8.1 当前结论
 
-| 指标 | GPU (最优配置) | CPU T=1 | GPU 优势 |
-|------|--------------|---------|---------|
-| 压缩内核吞吐 | 3,159 MB/s (A=3) | 2,280 MB/s | **1.39x** |
-| 解压内核吞吐 | 8,064 MB/s (A=3) | 3,298 MB/s | **2.45x** |
-| 压缩总吞吐 | 1,778 MB/s (A=3) | — | — |
-| 解压总吞吐 | 3,218 MB/s (A=3) | — | — |
-| 压缩能效 | 0.38 J/file | 1.05 J/file | **2.76x** |
-| 解压能效 | 0.11 J/file | 0.34 J/file | **3.09x** |
-| 压缩率 | 28.32% (A=1) | 26.46% | +1.86pp |
+1. **LZ4 GPU 的系统架构已经稳定**：daemon/client、workspace、buffer 复用、zero-copy 风格传输、内核调度逻辑都已成型。  
+2. **HashLog=14 仍是当前最优折中点**：HL=13 的压缩率灾难性退化结论仍然成立，因此不能作为当前推荐配置。  
+3. **当前 corrected baseline 已经明确证明 GPU 是主导吞吐引擎**：压缩 total 2.11x 于 CPU，解压 total 1.36x 于 CPU。  
+4. **功率结论已经被修正**：GPU 并不是靠更高功耗换取性能，而是在接近 CPU 的 active power 下提供更高 steady-state total throughput。  
+5. **LZ4 GPU 现在应作为整个项目的正式主路径之一来写**：不再是实验性附属分支，也不应再被旧 total semantics 的结论压制。
 
-### 8.2 适用场景
+### 8.2 展望
 
-**GPU 优势明显的场景**：
-- 单线程/低线程 CPU 环境下的加速
-- 批量文件处理（守护进程模式消除初始化开销）
-- 能效敏感场景（GPU 能效全面优于 CPU）
-- 解压密集型工作负载（GPU 解压加速比最高达 2.45x）
+后续真正值得继续做的，不再是简单重复旧参数扫描，而是：
 
-**CPU 更优的场景**：
-- 多核 CPU（≥3 线程）且对延迟不敏感
-- 极小文件（GPU 调度开销占比过大）
-- 对压缩率要求极高（CPU 64KB 块大小压缩率略优）
+1. 继续压缩 host/runtime 开销，让 total throughput 更接近 kernel throughput；
+2. 在 matched-corpus 条件下与 LZO GPU 做更严格的 family-to-family 对比；
+3. 继续把 GPU steady-state 基线作为 hybrid 调度设计的上限参考；
+4. 继续保留 `FORCE_OPENCL_DEVICE` 作为验证入口，但当前 Intel 平台上的 **CPU OpenCL 结果应定位为功能可用的 portability check，而不是默认推荐路径**——fresh subset bench 表明它在部分 case 上能接近甚至短暂超过 GPU OpenCL，但没有稳定优于 native pthread CPU path 的系统级证据。
 
-### 8.3 展望
+简言之：
 
-1. **CPU+GPU 混合执行**（lz4_hybrid）：将 CPU 和 GPU 纳入统一调度，根据文件特征动态分配工作负载
-2. **更大块大小支持**：探索 32KB/64KB GPU 块大小以缩小与 CPU 的压缩率差距
-3. **自适应参数选择**：根据文件特征自动选择最优 HL/A/BS 组合
+> 当前 `lz4_gpu` 已经是一条经过架构重构、实现收敛、方法学校正和全量基线验证后的成熟结果路径。
+
+## 9. 2026-03-09 定向优化快照
+
+本轮针对用户提出的两个具体问题做了定向修复与 subset 验证：
+
+- **LZ4 GPU 64KB 路径的真实实现问题**：修复了 `tableType==0` 时 kernel / host 侧 dict mask 与 dict buffer sizing 不匹配的问题；
+- **LZ4 hybrid 的 bench correctness 问题**：修复了 GPU dict buffer 未清零导致的 in-process repeated bench 校验失败，以及 `--bench-io` 使用固定 `/tmp` 文件名带来的冲突；
+- **LZ4 hybrid host/runtime 路径**：引入 GPU workspace 复用、CU-aware worker sizing、mapped buffer readback、distributed sampling，以及 CPU 子路径 `LZ4_compress_fast()` 对齐 acceleration 语义。
+
+### 9.1 当前 subset 结果（优化后，1s warmed bench）
+
+#### `dickens`
+
+| Engine | Block | Comp total MB/s | Dec total MB/s | Ratio % |
+|---|---|---:|---:|---:|
+| GPU | 16K | 369.92 | 816.66 | 67.51 |
+| GPU | 32K | 389.75 | 741.50 | 64.59 |
+| GPU | 64K | **409.40** | 793.66 | **62.35** |
+
+#### `industrial_parent_0_pages_img.tar`
+
+| Engine | Block | Comp total MB/s | Dec total MB/s | Ratio % |
+|---|---|---:|---:|---:|
+| GPU | 16K | 545.57 | 1162.99 | 19.98 |
+| GPU | 64K | **597.88** | **1246.33** | **18.85** |
+
+### 9.2 当前解释
+
+当前 subset 结果说明：
+
+1. **修复后已经看不到“LZ4 GPU 在 64KB 下必然严重崩塌”的普遍现象**；
+2. 在 `dickens` 和 `industrial_parent_0_pages_img.tar` 上，64KB 的 total throughput 与 ratio 都优于 16KB；
+3. 因而当前更准确的结论是：此前观察到的 64KB 异常下降，至少有一部分来自 dict sizing/mask bug 与 hybrid runtime / bench artifact，而不是 LZ4 GPU 结构上必然不适合 64KB。
+
+### 9.3 仍需继续观察的点
+
+- `LZ4_FORCE_TABLETYPE=0/1` 的 64KB A/B 仅带来小幅差异（industrial subset 下约 609.70 → 619.95 MB/s），说明当前剩余的 64KB 行为主要还是 host/runtime 与 workload interaction 问题；
+- 后续若继续扩大到 matched-corpus rerun，应重点观察 page-image / migration-image 类 workload。

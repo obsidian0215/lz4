@@ -337,7 +337,8 @@ inline U32 LZ4_hashPosition(const __global BYTE* p, int tableType, U32* sequence
 }
 
 inline void LZ4_putIndexOnHash(U32 idx, U32 h, __global U32* tableBase, int tableType, U32 sequence, U32 epoch) __attribute__((always_inline)) {
-    U32 const mask = (1 << LZ4_HASHLOG) - 1;
+    U32 const hashLog = (tableType == 0) ? (LZ4_HASHLOG + 1) : LZ4_HASHLOG;
+    U32 const mask = (1U << hashLog) - 1U;
     /* Compact 32-bit entry: [8-bit epoch | 8-bit fingerprint | 16-bit index]
      * Halves hash table memory bandwidth vs 64-bit entries.
      * 8-bit epoch sufficient: each WI processes ceil(totalBlocks/total_wi) blocks,
@@ -347,7 +348,8 @@ inline void LZ4_putIndexOnHash(U32 idx, U32 h, __global U32* tableBase, int tabl
 }
 
 inline U32 LZ4_getIndexOnHash(U32 h, __global U32* tableBase, int tableType, U32 sequence, int* fp_match, U32 epoch) __attribute__((always_inline)) {
-    U32 const mask = (1 << LZ4_HASHLOG) - 1;
+    U32 const hashLog = (tableType == 0) ? (LZ4_HASHLOG + 1) : LZ4_HASHLOG;
+    U32 const mask = (1U << hashLog) - 1U;
     U32 const packed = tableBase[h & mask];
     U32 const tag = (packed >> 24);
     if (tag != (epoch & 0xFF)) {
@@ -676,7 +678,7 @@ __kernel void lz4_compress_block(
 ) {
     const uint wi = get_global_id(0);
     const uint total_wi = get_global_size(0);
-    const uint dict_entries = (1U << LZ4_HASHLOG);
+    const uint dict_entries = (tableType == 0) ? (1U << (LZ4_HASHLOG + 1)) : (1U << LZ4_HASHLOG);
 
     __global U32* dict = globalHashTablePool + (size_t)wi * dict_entries;
     U32 epoch = epoch_base + 1U;
@@ -740,4 +742,3 @@ __kernel void lz4_decompress_blocks(
 }
 
 #endif /* LZ4_GPU_NO_ENTRY_KERNELS */
-

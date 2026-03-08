@@ -1,12 +1,23 @@
+#if !defined(_WIN32)
 #define _POSIX_C_SOURCE 200809L
+#endif
 #include <CL/cl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#include <direct.h>
+#include <io.h>
+#define access _access
+#define F_OK 0
+#define strcasecmp _stricmp
+#else
+#include <strings.h>
 #include <unistd.h>
+#include <signal.h>
+#endif
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <signal.h>
 #include <errno.h>
 #include <time.h>
 #include "lz4_gpu_core.h"
@@ -15,8 +26,20 @@
 #include "timing.h"
 
 /* Forward declarations */
-int run_daemon();
+#if defined(_WIN32)
+static int run_daemon(void) {
+    fprintf(stderr, "Daemon mode is not supported in Windows builds. Use standalone or bench mode.\n");
+    return 1;
+}
+static int run_lz4_client(int mode, const char* input_path, const char* output_path, int block_size, int acceleration, int local_size, int hash_log) {
+    (void)mode; (void)input_path; (void)output_path; (void)block_size; (void)acceleration; (void)local_size; (void)hash_log;
+    fprintf(stderr, "--use-daemon is not supported in Windows builds. Use standalone mode.\n");
+    return 1;
+}
+#else
+int run_daemon(void);
 int run_lz4_client(int mode, const char* input_path, const char* output_path, int block_size, int acceleration, int local_size, int hash_log);
+#endif
 
 int g_verbose = 0;
 static size_t g_cli_local_size = 1;
@@ -28,22 +51,30 @@ static cl_context ctx;
 static cl_command_queue queue;
 static cl_device_id dev;
 
+static cl_device_type preferred_opencl_device_type(void) {
+    const char* pref = getenv("FORCE_OPENCL_DEVICE");
+    if (!pref || !*pref) return CL_DEVICE_TYPE_GPU;
+    if (strcasecmp(pref, "CPU") == 0) return CL_DEVICE_TYPE_CPU;
+    if (strcasecmp(pref, "GPU") == 0) return CL_DEVICE_TYPE_GPU;
+    if (strcasecmp(pref, "DEFAULT") == 0) return CL_DEVICE_TYPE_DEFAULT;
+    if (strcasecmp(pref, "ALL") == 0) return CL_DEVICE_TYPE_ALL;
+    return CL_DEVICE_TYPE_GPU;
+}
+
 static void ocl_init() {
     cl_int err;
     cl_platform_id pf = NULL;
+    cl_device_type pref_type = preferred_opencl_device_type();
     err = clGetPlatformIDs(1, &pf, NULL);
     if (err != CL_SUCCESS || pf == NULL) {
         fprintf(stderr, "OpenCL init failed: clGetPlatformIDs err=%d\n", err);
         return;
     }
 
-    err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_GPU, 1, &dev, NULL);
-    if (err != CL_SUCCESS) {
-        err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_DEFAULT, 1, &dev, NULL);
-    }
-    if (err != CL_SUCCESS) {
-        err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_ALL, 1, &dev, NULL);
-    }
+    err = clGetDeviceIDs(pf, pref_type, 1, &dev, NULL);
+    if (err != CL_SUCCESS && pref_type != CL_DEVICE_TYPE_GPU) err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_GPU, 1, &dev, NULL);
+    if (err != CL_SUCCESS && pref_type != CL_DEVICE_TYPE_DEFAULT) err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_DEFAULT, 1, &dev, NULL);
+    if (err != CL_SUCCESS && pref_type != CL_DEVICE_TYPE_ALL) err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_ALL, 1, &dev, NULL);
     if (err != CL_SUCCESS) {
         fprintf(stderr, "OpenCL init failed: clGetDeviceIDs err=%d\n", err);
         return;
@@ -86,6 +117,10 @@ static void show_help(const char* prog_name) {
 }
 
 static int stop_daemon_cmd() {
+#if defined(_WIN32)
+    fprintf(stderr, "--stop-daemon is not supported in Windows builds.\n");
+    return 1;
+#else
     const char* pid_path = "/tmp/lz4_gpu_daemon.pid";
     FILE* f = fopen(pid_path, "r");
     if (!f) {
@@ -103,6 +138,7 @@ static int stop_daemon_cmd() {
     unlink(pid_path);
     unlink(SOCKET_PATH);
     return 0;
+#endif
 }
 
 static size_t parse_size_bytes(const char* s) {
