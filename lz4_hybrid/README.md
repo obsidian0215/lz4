@@ -77,3 +77,21 @@ Notes:
 - The current file format records the total block count, block size, GPU block count, and per-block compressed sizes.
 - The current LZ4 hybrid container still assumes a GPU-first front segment in the compressed payload layout, so arbitrary GPU block permutations are not yet a format-compatible optimization.
 - Recent fixes include repeated-bench correctness, GPU workspace reuse, distributed adaptive sampling, and broader 16K/32K/64K benchmark coverage.
+
+## 2026-03 benchmark refresh
+
+The latest full-corpus hybrid result is:
+
+- `exp_results/hybrid_bench/hybrid_bench_20260309_180949.csv`
+
+Recommended companion baseline for endpoint comparison:
+
+- `../exp_results/runs/20260309_merged_full_83/lz4_param_sweep_merged.csv`
+
+Current matched 83-file highlights:
+
+- raw medians: fixed `919.72 / 675.42 MB/s`, adaptive `889.91 / 674.58 MB/s`
+- best-per-file medians: fixed `1425.90 / 802.90 MB/s`, adaptive `1302.24 / 813.20 MB/s`
+- winner counts: fixed wins `48/83` files on compression total, while GPU still dominates decompression with `62/83`
+
+Interpretation: fixed hybrid is now a real compression competitor on the full corpus, but GPU remains the safer default endpoint, especially for decompression.

@@ -219,3 +219,20 @@ python3 tools/bench_hybrid.py --samples-dir /root/samples_subset --bench-seconds
 - `lz4_gpu` is the default throughput leader in the current full verified corpus.
 - `lz4_hybrid` now has corrected benchmark semantics, fixed repeated-bench validation, wider block-size coverage, and improved runtime reuse.
 - On targeted workloads, `lz4_hybrid` can now exceed `lz4_gpu`, but a new full rerun is still needed before claiming a system-wide ranking change.
+
+## 2026-03 full-corpus refresh
+
+Fresh artifacts now exist for the full 83-file `/root/samples` corpus and should be preferred over older summaries:
+
+- CPU/GPU stitched artifact: `exp_results/runs/20260309_merged_full_83/lz4_param_sweep_merged.csv`
+- Hybrid full sweep: `exp_results/hybrid_bench/hybrid_bench_20260309_180949.csv`
+- Cross-family analysis bundle: `/root/analysis/20260309_full_refresh/`
+
+Current matched-corpus best-per-file medians:
+
+- `LZ4 CPU`: `698.71 MB/s` compress total, `755.68 MB/s` decompress total
+- `LZ4 GPU`: `1497.76 MB/s` compress total, `1085.39 MB/s` decompress total
+- `LZ4 Hybrid fixed`: `1425.90 MB/s` compress total, `802.90 MB/s` decompress total
+- `LZ4 Hybrid adaptive`: `1302.24 MB/s` compress total, `813.20 MB/s` decompress total
+
+Important scope note: cross-algorithm claims in this repository now refer to the **matched 83-file corpus** and the stated parameter matrices only; they do not imply that LZ4 settings are semantically equivalent to LZO settings.
