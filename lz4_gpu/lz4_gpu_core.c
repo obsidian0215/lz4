@@ -854,8 +854,7 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
         void* mapped_out = clEnqueueMapBuffer(queue, ws->out_buf, CL_TRUE, CL_MAP_READ,
                                               0, num_blocks * block_max, 0, NULL, NULL, &err);
         if (err == CL_SUCCESS && mapped_out) {
-            const uint8_t* out_ptr = (const uint8_t*)mapped_out;
-            if (lz4_write_blocks_direct(fout, out_ptr, h_out_offsets, h_final_sizes, (size_t)num_blocks) != 0) {
+            if (fwrite(mapped_out, 1, total_decomp_sz, fout) != total_decomp_sz) {
                 clEnqueueUnmapMemObject(queue, ws->out_buf, mapped_out, 0, NULL, NULL);
                 clFinish(queue);
                 fclose(fout);
@@ -867,10 +866,10 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
             clEnqueueUnmapMemObject(queue, ws->out_buf, mapped_out, 0, NULL, NULL);
             clFinish(queue);
         } else {
-            uint8_t* h_out = malloc(num_blocks * block_max);
+            uint8_t* h_out = malloc(total_decomp_sz);
             if (h_out) {
-                clEnqueueReadBuffer(queue, ws->out_buf, CL_TRUE, 0, num_blocks * block_max, h_out, 0, NULL, NULL);
-                if (lz4_write_blocks_direct(fout, h_out, h_out_offsets, h_final_sizes, (size_t)num_blocks) != 0) {
+                clEnqueueReadBuffer(queue, ws->out_buf, CL_TRUE, 0, total_decomp_sz, h_out, 0, NULL, NULL);
+                if (fwrite(h_out, 1, total_decomp_sz, fout) != total_decomp_sz) {
                     free(h_out);
                     fclose(fout);
                     if (dbg_dec_buf) clReleaseMemObject(dbg_dec_buf);

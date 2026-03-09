@@ -244,9 +244,7 @@ static int run_lz4_bench(const char* input_path,
     double* ratio_pct = (double*)malloc(cap * sizeof(double));
     int verify_ok = 1;
 
-    cl_mem d_comp = NULL;
     cl_mem d_out = NULL;
-    size_t d_comp_capacity = 0;
     size_t d_out_capacity = 0;
 
     cl_uint* h_sizes = NULL;
@@ -254,9 +252,6 @@ static int run_lz4_bench(const char* input_path,
     cl_uint* h_out_off = NULL;
     cl_uint* h_max_out = NULL;
     size_t h_blocks_capacity = 0;
-
-    unsigned char* packed = NULL;
-    size_t packed_capacity = 0;
 
     cl_uint kernel_num_args_dec = 0;
     int kernel_has_dbg_dec = 0;
@@ -356,16 +351,6 @@ static int run_lz4_bench(const char* input_path,
 
             h_blocks_capacity = nblk;
         }
-        if (packed_capacity < comp_total) {
-            unsigned char* npacked = (unsigned char*)realloc(packed, comp_total);
-            if (!npacked) {
-                verify_ok = 0;
-                break;
-            }
-            packed = npacked;
-            packed_capacity = comp_total;
-        }
-
         uint64_t tdec_total0 = get_us();
 
         void* map_sizes = clEnqueueMapBuffer(queue, ws.output_size_buf, CL_TRUE, CL_MAP_READ,
@@ -378,38 +363,21 @@ static int run_lz4_bench(const char* input_path,
         clEnqueueUnmapMemObject(queue, ws.output_size_buf, map_sizes, 0, NULL, NULL);
         clFinish(queue);
 
-        void* map_comp = clEnqueueMapBuffer(queue, ws.out_buf, CL_TRUE, CL_MAP_READ,
-                                            0, nblk * worst_blk, 0, NULL, NULL, &err);
-        if (err != CL_SUCCESS || !map_comp) {
-            verify_ok = 0;
-            break;
-        }
-
-        size_t co = 0;
         for (size_t i = 0; i < nblk; ++i) {
             size_t csz = (size_t)h_sizes[i];
-            h_comp_off[i] = (cl_uint)co;
+            h_comp_off[i] = (cl_uint)(i * worst_blk);
             h_out_off[i] = (cl_uint)(i * blk);
             h_max_out[i] = (cl_uint)((i + 1 == nblk) ? (tc.in_size - i * blk) : blk);
-            if (co + csz > comp_total) {
+            if (csz > worst_blk) {
                 verify_ok = 0;
                 break;
             }
-            memcpy(packed + co, ((unsigned char*)map_comp) + i * worst_blk, csz);
-            co += csz;
         }
-        clEnqueueUnmapMemObject(queue, ws.out_buf, map_comp, 0, NULL, NULL);
-        clFinish(queue);
-        if (!verify_ok || co != comp_total) {
+        if (!verify_ok) {
             verify_ok = 0;
             break;
         }
 
-        d_comp = ensure_buffer(ctx, d_comp, comp_total, &d_comp_capacity, &err);
-        if (!d_comp || err != CL_SUCCESS) {
-            verify_ok = 0;
-            break;
-        }
         d_out = ensure_buffer(ctx, d_out, (size_t)tc.in_size, &d_out_capacity, &err);
         if (!d_out || err != CL_SUCCESS) {
             verify_ok = 0;
@@ -454,8 +422,7 @@ static int run_lz4_bench(const char* input_path,
             }
         }
 
-        if (write_buffer_mapped(queue, d_comp, packed, comp_total) != 0 ||
-            write_buffer_mapped(queue, d_comp_off, h_comp_off, nblk * sizeof(cl_uint)) != 0 ||
+        if (write_buffer_mapped(queue, d_comp_off, h_comp_off, nblk * sizeof(cl_uint)) != 0 ||
             write_buffer_mapped(queue, d_comp_sz, h_sizes, nblk * sizeof(cl_uint)) != 0 ||
             write_buffer_mapped(queue, d_out_off, h_out_off, nblk * sizeof(cl_uint)) != 0 ||
             write_buffer_mapped(queue, d_max_out, h_max_out, nblk * sizeof(cl_uint)) != 0) {
@@ -465,7 +432,7 @@ static int run_lz4_bench(const char* input_path,
         }
 
         cl_uint totalBlocks = (cl_uint)nblk;
-        err  = clSetKernelArg(kdec, 0, sizeof(cl_mem), &d_comp);
+        err  = clSetKernelArg(kdec, 0, sizeof(cl_mem), &ws.out_buf);
         err |= clSetKernelArg(kdec, 1, sizeof(cl_mem), &d_out);
         err |= clSetKernelArg(kdec, 2, sizeof(cl_mem), &d_comp_off);
         err |= clSetKernelArg(kdec, 3, sizeof(cl_mem), &d_comp_sz);
@@ -612,8 +579,6 @@ static int run_lz4_bench(const char* input_path,
     free(h_comp_off);
     free(h_out_off);
     free(h_max_out);
-    free(packed);
-    if (d_comp) clReleaseMemObject(d_comp);
     if (d_out) clReleaseMemObject(d_out);
     free(input_ref);
     lz4_gpu_workspace_free(&ws);
@@ -634,7 +599,10 @@ int run_lz4_standalone(int argc, char** argv) {
     int output_explicit = 0;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--decompress") == 0) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            show_help(argv[0]);
+            return 0;
+        } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--decompress") == 0) {
             mode = mode_decompress;
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             g_verbose = 1;
@@ -781,17 +749,43 @@ int run_lz4_standalone(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
+    if (argc < 2) {
+        show_help(argv[0]);
+        return 0;
+    }
     if (argc >= 2) {
         if (strcmp(argv[1], "--daemon") == 0) return run_daemon();
         if (strcmp(argv[1], "--stop-daemon") == 0) return stop_daemon_cmd();
         if (strcmp(argv[1], "--use-daemon") == 0) {
             int mode = mode_compress;
+            int bench_mode = 0;
+            double bench_seconds = 3.0;
             const char* input = NULL;
             char output[512] = {0};
             int output_explicit = 0;
             for (int i = 2; i < argc; i++) {
-                if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--decompress") == 0) mode = mode_decompress;
+                if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+                    show_help(argv[0]);
+                    return 0;
+                }
+                else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--decompress") == 0) mode = mode_decompress;
                 else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) g_verbose = 1;
+                else if (strcmp(argv[i], "--bench") == 0) {
+                    bench_mode = 1;
+                    if (i + 1 < argc && argv[i + 1][0] != '-') {
+                        bench_seconds = atof(argv[++i]);
+                    }
+                }
+                else if (strcmp(argv[i], "--bench-seconds") == 0) {
+                    if (i + 1 < argc) bench_seconds = atof(argv[++i]);
+                    else {
+                        fprintf(stderr, "Error: --bench-seconds requires an argument\n");
+                        return 1;
+                    }
+                }
+                else if (strncmp(argv[i], "--bench-seconds=", 16) == 0) {
+                    bench_seconds = atof(argv[i] + 16);
+                }
                 else if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) && i + 1 < argc) {
                     strncpy(output, argv[++i], sizeof(output)-1);
                     output_explicit = 1;
@@ -820,6 +814,18 @@ int main(int argc, char** argv) {
             if (!input) {
                 fprintf(stderr, "Error: No input file specified\n");
                 return 1;
+            }
+            if (bench_mode) {
+                if (mode != mode_compress) {
+                    fprintf(stderr, "Error: --bench only supports compress mode input (it runs compress+decompress internally)\n");
+                    return 1;
+                }
+                return run_lz4_bench(input,
+                                    (int)g_cli_fixed_block_bytes,
+                                    g_cli_acceleration,
+                                    (int)g_cli_local_size,
+                                    g_cli_hash_log,
+                                    bench_seconds);
             }
             if (!output_explicit) {
                 if (mode == mode_compress) snprintf(output, sizeof(output), "%s.lz4", input);

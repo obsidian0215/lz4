@@ -2,8 +2,8 @@
 
 > 更新时间：2026-03-09  
 > 硬件平台：Intel Core + Intel Iris Xe Graphics（iGPU，共享内存）  
-> 当前基线结果：`/root/lz4/exp_results/runs/20260307_201916/lz4_param_sweep.csv`  
-> 当前 hybrid 对照结果：`/root/lz4/exp_results/hybrid_bench/hybrid_bench_20260308_171420.csv`  
+> 当前基线结果：`/root/lz4/exp_results/runs/20260309_merged_full_83/lz4_param_sweep_merged.csv`  
+> 当前 hybrid 对照结果：`/root/lz4/exp_results/hybrid_bench/hybrid_bench_20260309_180949.csv`  
 > 测试文件集：83 个真实文件（/root/samples）
 
 ---
@@ -374,12 +374,13 @@ HL=15 的更大哈希表在压缩率上仅有微小改善 (~0.17pp)，但吞吐�
 
 ### 5.2 当前基线实验设置
 
-- **结果文件**：`/root/lz4/exp_results/runs/20260307_201916/lz4_param_sweep.csv`
+- **结果文件**：`/root/lz4/exp_results/runs/20260309_merged_full_83/lz4_param_sweep_merged.csv`
+- **工件说明**：当前基线是对 full-corpus rerun 与后续 verify patch run 做 provenance-preserving stitched 视图，manifest 位于 `20260309_merged_full_83/merge_manifest.json`
 - **文件集**：`/root/samples`，83 个真实文件
 - **GPU 参数空间**：BlockSize=16K/32K/64K，HashLog=14/15，Acceleration=1/2/3，LocalSize=1
 - **CPU 参数空间**：Threads=1/2/3，BlockSize=64K/256K
 - **频率点**：100%（当前文档仅保留最终 corrected 结果）
-- **正确性**：所有纳入汇总的结果均要求 roundtrip 通过
+- **正确性**：所有纳入汇总的结果均要求 roundtrip 通过；其中 `sample_43mb_structured_4.txt.lz4` 的 CPU total-verification 误判由 `bench_lz4.py` 补上 `-z` 后重新验证并纳入 stitched artifact
 
 ### 5.3 当前可信汇总方式
 
@@ -393,15 +394,15 @@ HL=15 的更大哈希表在压缩率上仅有微小改善 (~0.17pp)，但吞吐�
 
 | Engine | Comp total MB/s | Dec total MB/s | Comp kernel MB/s | Dec kernel MB/s | Ratio % | Comp power W |
 |------|----------------:|---------------:|-----------------:|----------------:|--------:|-------------:|
-| CPU | 756.34 | 756.19 | 2081.46 | 6755.90 | 20.81 | 14.63 |
-| **GPU** | **1595.57** | **1032.04** | **6901.95** | **17087.28** | 22.55 | 14.68 |
+| CPU | 698.71 | 755.68 | 1853.29 | 5347.40 | 22.38 | 19.63 |
+| **GPU** | **1497.76** | **1085.39** | **5952.21** | **14772.52** | **25.23** | **18.72** |
 
 ### 5.5 修正后 CPU vs GPU 结论
 
 #### 5.5.1 端到端总吞吐量
 
-- 压缩 total throughput：GPU / CPU = **2.11x**
-- 解压 total throughput：GPU / CPU = **1.36x**
+- 压缩 total throughput：GPU / CPU = **2.14x**
+- 解压 total throughput：GPU / CPU = **1.44x**
 
 也就是说，当前在 Intel Iris Xe 平台上，**LZ4 GPU 是明确的 steady-state total throughput 主导引擎**。
 
@@ -409,8 +410,8 @@ HL=15 的更大哈希表在压缩率上仅有微小改善 (~0.17pp)，但吞吐�
 
 GPU 当前 best-per-file medians：
 
-- compression: **6901.95 MB/s kernel** vs **1595.57 MB/s total**
-- decompression: **17087.28 MB/s kernel** vs **1032.04 MB/s total**
+- compression: **5952.21 MB/s kernel** vs **1497.76 MB/s total**
+- decompression: **14772.52 MB/s kernel** vs **1085.39 MB/s total**
 
 这说明内核本体已经足够快，而真正决定交付性能的是：
 
@@ -422,7 +423,7 @@ GPU 当前 best-per-file medians：
 
 #### 5.5.3 压缩率
 
-当前 GPU ratio 为 22.55%，CPU 为 20.81%。这表明 GPU 的实时吞吐优势并不是“零代价”的：
+当前 GPU ratio 为 25.23%，CPU 为 22.38%。这表明 GPU 的实时吞吐优势并不是“零代价”的：
 
 - GPU 当前主路径仍以 16KB block 为中心；
 - 更高并行性会牺牲部分跨块匹配机会；
@@ -438,7 +439,7 @@ GPU 当前 best-per-file medians：
 
 ### 5.7 与 hybrid 的关系
 
-用 fresh hybrid rerun (`hybrid_bench_20260308_171420.csv`) 与 corrected CPU/GPU baseline 对照后，LZ4 family 当前关系已经很清楚：
+用 fresh hybrid rerun (`hybrid_bench_20260309_180949.csv`) 与 corrected CPU/GPU baseline 对照后，LZ4 family 当前关系已经很清楚：
 
 - **GPU**：整体吞吐最强
 - **Hybrid fixed**：部分文件上有价值，但吞吐、ratio 和功率都没有形成对 GPU 的系统级反超
@@ -460,8 +461,8 @@ GPU 当前 best-per-file medians：
 
 | 引擎 | Comp power W |
 |------|-------------:|
-| CPU | 14.63 |
-| GPU | 14.68 |
+| CPU | 19.63 |
+| GPU | 18.72 |
 
 这个结果非常关键：
 
@@ -524,8 +525,8 @@ LZ4 GPU 目前的能效结论不能再写成极端口号式的“GPU 绝对最�
 
 1. **LZ4 GPU 的系统架构已经稳定**：daemon/client、workspace、buffer 复用、zero-copy 风格传输、内核调度逻辑都已成型。  
 2. **HashLog=14 仍是当前最优折中点**：HL=13 的压缩率灾难性退化结论仍然成立，因此不能作为当前推荐配置。  
-3. **当前 corrected baseline 已经明确证明 GPU 是主导吞吐引擎**：压缩 total 2.11x 于 CPU，解压 total 1.36x 于 CPU。  
-4. **功率结论已经被修正**：GPU 并不是靠更高功耗换取性能，而是在接近 CPU 的 active power 下提供更高 steady-state total throughput。  
+3. **当前 corrected baseline 已经明确证明 GPU 是主导吞吐引擎**：压缩 total 2.14x 于 CPU，解压 total 1.44x 于 CPU。  
+4. **功率结论已经被修正**：GPU 并不是靠更高功耗换取性能，而是在略低于 CPU 的 active power 下提供更高 steady-state total throughput。  
 5. **LZ4 GPU 现在应作为整个项目的正式主路径之一来写**：不再是实验性附属分支，也不应再被旧 total semantics 的结论压制。
 
 ### 8.2 展望
@@ -543,11 +544,12 @@ LZ4 GPU 目前的能效结论不能再写成极端口号式的“GPU 绝对最�
 
 ## 9. 2026-03-09 定向优化快照
 
-本轮针对用户提出的两个具体问题做了定向修复与 subset 验证：
+本轮针对用户提出的几个具体问题做了定向修复与 full-corpus 回补：
 
 - **LZ4 GPU 64KB 路径的真实实现问题**：修复了 `tableType==0` 时 kernel / host 侧 dict mask 与 dict buffer sizing 不匹配的问题；
 - **LZ4 hybrid 的 bench correctness 问题**：修复了 GPU dict buffer 未清零导致的 in-process repeated bench 校验失败，以及 `--bench-io` 使用固定 `/tmp` 文件名带来的冲突；
-- **LZ4 hybrid host/runtime 路径**：引入 GPU workspace 复用、CU-aware worker sizing、mapped buffer readback、distributed sampling，以及 CPU 子路径 `LZ4_compress_fast()` 对齐 acceleration 语义。
+- **LZ4 hybrid host/runtime 路径**：引入 GPU workspace 复用、CU-aware worker sizing、mapped buffer readback、distributed sampling，以及 CPU 子路径 `LZ4_compress_fast()` 对齐 acceleration 语义；
+- **LZ4 GPU CLI/bench 路径可移植性**：修复 `--help` 正常返回、`--use-daemon --bench` 真实生效，以及 Linux 非 Windows 构建显式使用 `-pthread` 的兼容性问题。
 
 ### 9.1 当前 subset 结果（优化后，1s warmed bench）
 
@@ -577,4 +579,4 @@ LZ4 GPU 目前的能效结论不能再写成极端口号式的“GPU 绝对最�
 ### 9.3 仍需继续观察的点
 
 - `LZ4_FORCE_TABLETYPE=0/1` 的 64KB A/B 仅带来小幅差异（industrial subset 下约 609.70 → 619.95 MB/s），说明当前剩余的 64KB 行为主要还是 host/runtime 与 workload interaction 问题；
-- 后续若继续扩大到 matched-corpus rerun，应重点观察 page-image / migration-image 类 workload。
+- 后续若继续扩大到 matched-corpus rerun，应重点观察 page-image / migration-image 类 workload。当前 full-corpus stitched artifact 已经完成，并应优先作为正式引用结果。

@@ -93,6 +93,13 @@ typedef struct {
     cpu_decomp_job_t* job;
 } cpu_decomp_worker_arg_t;
 
+typedef struct {
+    size_t sample_count;
+    double mean_ratio_pct;
+    size_t low_ratio_blocks;
+    size_t high_ratio_blocks;
+} lz4_sample_stats_t;
+
 static cl_device_type preferred_opencl_device_type(void) {
     const char* pref = getenv("FORCE_OPENCL_DEVICE");
     if (!pref || !*pref) return CL_DEVICE_TYPE_GPU;
@@ -191,66 +198,100 @@ static size_t sampled_block_index(size_t sample_pos, size_t sample_count, size_t
     return (sample_pos * (num_blocks - 1)) / (sample_count - 1);
 }
 
+static int collect_lz4_sample_stats(const unsigned char* input,
+                                    size_t input_size,
+                                    size_t num_blocks,
+                                    const hybrid_cfg_t* cfg,
+                                    lz4_sample_stats_t* stats,
+                                    double* sample_ratio_pct_out) {
+    size_t sample_blocks;
+    size_t sample_bytes = 0;
+    size_t sample_comp_bytes = 0;
+    char* tmp = NULL;
+    size_t prev_block = SIZE_MAX;
+
+    if (sample_ratio_pct_out) *sample_ratio_pct_out = 0.0;
+    if (!input || !cfg || !stats || input_size == 0 || num_blocks == 0) return -1;
+    memset(stats, 0, sizeof(*stats));
+
+    sample_blocks = cfg->adaptive_sample_blocks ? cfg->adaptive_sample_blocks : 8;
+    if (sample_blocks > num_blocks) sample_blocks = num_blocks;
+    if (sample_blocks == 0) return -1;
+
+    tmp = (char*)malloc((size_t)LZ4_compressBound((int)cfg->block_size));
+    if (!tmp) return -1;
+
+    for (size_t i = 0; i < sample_blocks; ++i) {
+        const size_t blk_idx = sampled_block_index(i, sample_blocks, num_blocks);
+        const size_t blk_sz = block_input_size(input_size, cfg->block_size, blk_idx);
+        const char* src;
+        int comp_sz;
+        double blk_ratio_pct;
+
+        if (blk_idx == prev_block || blk_sz == 0) continue;
+        src = (const char*)(const void*)(input + blk_idx * cfg->block_size);
+        comp_sz = LZ4_compress_fast(src,
+                                    tmp,
+                                    (int)blk_sz,
+                                    LZ4_compressBound((int)cfg->block_size),
+                                    cfg->acceleration > 0 ? cfg->acceleration : 1);
+        if (comp_sz <= 0) continue;
+
+        blk_ratio_pct = 100.0 * (double)comp_sz / (double)blk_sz;
+        if (blk_ratio_pct < 35.0) stats->low_ratio_blocks++;
+        else if (blk_ratio_pct > 70.0) stats->high_ratio_blocks++;
+
+        sample_bytes += blk_sz;
+        sample_comp_bytes += (size_t)comp_sz;
+        stats->sample_count++;
+        prev_block = blk_idx;
+    }
+
+    free(tmp);
+    if (stats->sample_count == 0 || sample_bytes == 0) return -1;
+
+    stats->mean_ratio_pct = 100.0 * (double)sample_comp_bytes / (double)sample_bytes;
+    if (sample_ratio_pct_out) *sample_ratio_pct_out = stats->mean_ratio_pct;
+    return 0;
+}
+
 static double choose_adaptive_gpu_ratio(const unsigned char* input,
                                         size_t input_size,
                                         size_t num_blocks,
                                         const hybrid_cfg_t* cfg,
                                         double* sample_ratio_pct_out) {
-    size_t sample_blocks;
-    size_t sample_bytes = 0;
-    size_t sample_comp_bytes = 0;
-    char* tmp = NULL;
     double ratio;
+    lz4_sample_stats_t stats;
 
     if (sample_ratio_pct_out) *sample_ratio_pct_out = 0.0;
     if (!input || input_size == 0 || num_blocks == 0 || !cfg) return cfg ? cfg->gpu_ratio : 1.0;
     if (cfg->cpu_threads <= 0) return 1.0;
 
     ratio = cfg->gpu_ratio;
-    sample_blocks = cfg->adaptive_sample_blocks ? cfg->adaptive_sample_blocks : 8;
-    if (sample_blocks > num_blocks) sample_blocks = num_blocks;
-    if (sample_blocks == 0) return ratio;
-
-    tmp = (char*)malloc((size_t)LZ4_compressBound((int)cfg->block_size));
-    if (tmp) {
-        size_t prev_block = SIZE_MAX;
-        for (size_t i = 0; i < sample_blocks; ++i) {
-            const size_t blk_idx = sampled_block_index(i, sample_blocks, num_blocks);
-            const size_t blk_sz = block_input_size(input_size, cfg->block_size, blk_idx);
-            const char* src;
-            int comp_sz;
-            if (blk_idx == prev_block) continue;
-            if (blk_sz == 0) continue;
-            src = (const char*)(const void*)(input + blk_idx * cfg->block_size);
-            comp_sz = LZ4_compress_fast(src, tmp, (int)blk_sz,
-                                        LZ4_compressBound((int)cfg->block_size),
-                                        cfg->acceleration > 0 ? cfg->acceleration : 1);
-            if (comp_sz <= 0) continue;
-            sample_bytes += blk_sz;
-            sample_comp_bytes += (size_t)comp_sz;
-            prev_block = blk_idx;
-        }
-        free(tmp);
-    }
-
-    if (sample_bytes > 0) {
-        const double sample_ratio_pct = 100.0 * (double)sample_comp_bytes / (double)sample_bytes;
+    if (collect_lz4_sample_stats(input, input_size, num_blocks, cfg, &stats, sample_ratio_pct_out) == 0) {
+        const double sample_ratio_pct = stats.mean_ratio_pct;
         if (sample_ratio_pct_out) *sample_ratio_pct_out = sample_ratio_pct;
 
         if (input_size < (8ULL * 1024ULL * 1024ULL)) {
             ratio *= 0.70;
         }
-        if (sample_blocks < 4) {
+        if (stats.sample_count < 4) {
             ratio *= 0.80;
         }
         if (sample_ratio_pct < 20.0) {
-            ratio *= 0.65;
+            ratio *= 1.00;
         } else if (sample_ratio_pct < 35.0) {
-            ratio *= 0.85;
+            ratio *= 0.95;
         } else if (sample_ratio_pct > 70.0) {
             ratio = 0.90 + 0.10 * ratio;
         } else if (sample_ratio_pct > 55.0) {
             ratio = 0.75 + 0.25 * ratio;
+        }
+        if (stats.low_ratio_blocks * 2 >= stats.sample_count) {
+            ratio *= 1.00;
+        }
+        if (stats.high_ratio_blocks * 2 >= stats.sample_count) {
+            ratio = 0.88 + 0.12 * ratio;
         }
         if (cfg->cpu_threads >= 2 && input_size >= (32ULL * 1024ULL * 1024ULL) && sample_ratio_pct < 35.0) {
             ratio *= 0.90;
@@ -893,12 +934,24 @@ static int gpu_decompress_blocks(ocl_env_t* ocl,
         void* mapped_out = clEnqueueMapBuffer(ocl->queue, ocl->ws.out_buf, CL_TRUE, CL_MAP_READ,
                                               0, num_blocks * block_size, 0, NULL, NULL, &err);
         if (err == CL_SUCCESS && mapped_out) {
-            memcpy(out_full, mapped_out, num_blocks * block_size);
+            const unsigned char* out_ptr = (const unsigned char*)mapped_out;
+            for (size_t i = 0; i < num_blocks; ++i) {
+                memcpy(out_full + i * block_size, out_ptr + i * block_size, out_sizes[i]);
+            }
             clEnqueueUnmapMemObject(ocl->queue, ocl->ws.out_buf, mapped_out, 0, NULL, NULL);
             clFinish(ocl->queue);
         } else {
-            err = clEnqueueReadBuffer(ocl->queue, ocl->ws.out_buf, CL_TRUE, 0, num_blocks * block_size, out_full, 0, NULL, NULL);
-            if (err != CL_SUCCESS) goto fail;
+            unsigned char* tmp_out = (unsigned char*)malloc(num_blocks * block_size);
+            if (!tmp_out) goto fail;
+            err = clEnqueueReadBuffer(ocl->queue, ocl->ws.out_buf, CL_TRUE, 0, num_blocks * block_size, tmp_out, 0, NULL, NULL);
+            if (err != CL_SUCCESS) {
+                free(tmp_out);
+                goto fail;
+            }
+            for (size_t i = 0; i < num_blocks; ++i) {
+                memcpy(out_full + i * block_size, tmp_out + i * block_size, out_sizes[i]);
+            }
+            free(tmp_out);
         }
     }
     free(h_comp_off);
@@ -1449,8 +1502,16 @@ int main(int argc, char** argv) {
     cfg.adaptive_sample_blocks = 8;
     cfg.verbose = 0;
 
+    if (argc < 2) {
+        show_help(argv[0]);
+        return 0;
+    }
+
     for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "-c") == 0) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            show_help(argv[0]);
+            return 0;
+        } else if (strcmp(argv[i], "-c") == 0) {
             mode_decompress = 0;
         } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--decompress") == 0) {
             mode_decompress = 1;
@@ -1522,7 +1583,7 @@ int main(int argc, char** argv) {
 
     if (!input_path) {
         show_help(argv[0]);
-        return 1;
+        return 0;
     }
     if (cfg.block_size == 0) {
         fprintf(stderr, "Error: block size must be > 0\n");

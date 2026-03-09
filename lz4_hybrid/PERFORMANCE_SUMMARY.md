@@ -2,8 +2,8 @@
 
 > 更新时间：2026-03-09  
 > 程序路径：`/root/lz4/lz4_hybrid/lz4_hybrid`  
-> 当前全量结果：`/root/lz4/exp_results/hybrid_bench/hybrid_bench_20260308_171420.csv`
-> 对照基线：`/root/lz4/exp_results/runs/20260307_201916/lz4_param_sweep.csv`
+> 当前全量结果：`/root/lz4/exp_results/hybrid_bench/hybrid_bench_20260309_180949.csv`
+> 对照基线：`/root/lz4/exp_results/runs/20260309_merged_full_83/lz4_param_sweep_merged.csv`
 
 ## 1. 概述 (Overview)
 
@@ -182,7 +182,7 @@ CPU 路径的意义不是给 GPU 打下手，而是：
   - `Acceleration = 1, 3`
 - **总配置数/文件**：48
 - **总数据点**：3984
-- **结果文件**：`/root/lz4/exp_results/hybrid_bench/hybrid_bench_20260308_171420.csv`
+- **结果文件**：`/root/lz4/exp_results/hybrid_bench/hybrid_bench_20260309_180949.csv`
 - **正确性**：Parse failures = 0，结果要求 `VerifyOK=true`
 
 关键变化是：
@@ -196,46 +196,35 @@ CPU 路径的意义不是给 GPU 打下手，而是：
 
 | Engine | Comp total MB/s | Dec total MB/s | Comp kernel MB/s | Dec kernel MB/s | Ratio % | Comp power W |
 |---|---:|---:|---:|---:|---:|---:|
-| CPU | 756.34 | 756.19 | 2081.46 | 6755.90 | 20.81 | 14.63 |
-| GPU | **1595.57** | **1032.04** | **6901.95** | **17087.28** | 22.55 | 14.68 |
-| Hybrid fixed | 864.86 | 729.76 | 1264.01 | 2558.15 | 24.82 | 15.91 |
-| Hybrid adaptive | 853.97 | 726.30 | 1201.80 | 3149.99 | 24.53 | 15.86 |
+| CPU | 698.71 | 755.68 | 1853.29 | 5347.40 | 22.38 | 19.63 |
+| GPU | **1497.76** | **1085.39** | **5952.21** | **14772.52** | 25.23 | 18.72 |
+| Hybrid fixed | 1425.90 | 802.90 | 2725.26 | 3402.44 | 25.32 | 16.06 |
+| Hybrid adaptive | 1302.24 | 813.20 | 2654.46 | 3968.56 | 25.32 | 16.17 |
 
 ### 7.2 Winner counts（每文件比较引擎）
 
 **Compression total throughput**：
 
-- GPU：**51**
-- Hybrid fixed：**27**
-- Hybrid adaptive：**3**
-- CPU：**2**
+- Hybrid fixed：**48**
+- GPU：**28**
+- Hybrid adaptive：**4**
+- CPU：**3**
 
 **Decompression total throughput**：
 
-- GPU：**59**
-- Hybrid fixed：**17**
-- Hybrid adaptive：**5**
-- CPU：**2**
+- GPU：**62**
+- Hybrid fixed：**14**
+- Hybrid adaptive：**4**
+- CPU：**3**
 
 ### 7.3 当前最好的 hybrid 配置区域
 
-按 83 文件平均 `CompTotalTP_MBs` 看，最强 hybrid 配置集中在：
+按 fresh full-corpus artifact 看，当前更可信的判断是：
 
-- `gpu_ratio = 0.3`
-- `cpu_threads = 2`
-- `acceleration = 1 / 3`
+- raw median：fixed `919.72 / 675.42 MB/s`，adaptive `889.91 / 674.58 MB/s`
+- best-per-file median：fixed `1425.90 / 802.90 MB/s`，adaptive `1302.24 / 813.20 MB/s`
 
-其中 mean compression 最强的是：
-
-- `adaptive, gpu_ratio=0.3, T=2, A=1`
-- mean comp total = **1253.14 MB/s**
-- mean dec total = **733.97 MB/s**
-
-紧随其后的是：
-
-- `adaptive, gpu_ratio=0.3, T=2, A=3`
-- `fixed, gpu_ratio=0.3, T=2, A=3`
-- `fixed, gpu_ratio=0.3, T=2, A=1`
+因此本节后续讨论以 file-level best-per-engine 与 winner-count 为主，而不再把旧的 mean-config 排序当作主结论来源。
 
 ## 8. 性能分析 (Performance Analysis)
 
@@ -243,9 +232,9 @@ CPU 路径的意义不是给 GPU 打下手，而是：
 
 旧文档中大量分析默认 hybrid 最终会成为主路径，但 fresh rerun 已证明当前 corrected 结论是：
 
-- **GPU 是总吞吐冠军**；
-- hybrid fixed 次之；
-- adaptive 没有超过 best fixed；
+- **GPU 仍是默认总吞吐主路径**；
+- hybrid fixed 已经成为压缩侧的强竞争者；
+- adaptive 在解压侧略优于 fixed，但仍未成为整体最优；
 - CPU 只在极少数文件上获胜。
 
 ### 8.2 fixed vs adaptive
@@ -254,21 +243,21 @@ CPU 路径的意义不是给 GPU 打下手，而是：
 
 | Mode | Comp total MB/s | Dec total MB/s |
 |---|---:|---:|
-| Fixed | 532.10 | **678.12** |
-| Adaptive | **549.06** | 674.57 |
+| Fixed | **919.72** | **675.42** |
+| Adaptive | 889.91 | 674.58 |
 
 **Best-per-file median**：
 
 | Mode | Comp total MB/s | Dec total MB/s |
 |---|---:|---:|
-| Fixed | **864.86** | **729.76** |
-| Adaptive | 853.97 | 726.30 |
+| Fixed | **1425.90** | 802.90 |
+| Adaptive | 1302.24 | **813.20** |
 
 这说明 adaptive 的正确结论是：
 
 - 它现在已经是真实功能；
-- 它在 raw-median compression total 上略有改善；
-- 但在 best-per-file 层面仍然不如 fixed。
+- 它在当前 fresh run 中已经形成真实的解压侧优势；
+- 但在 compression 和 winner count 层面仍然不如 fixed。
 
 因此当前不能写“adaptive 胜出”，而应写：
 
@@ -278,12 +267,12 @@ CPU 路径的意义不是给 GPU 打下手，而是：
 
 尽管不是整体第一，hybrid 仍有两个现实意义：
 
-1. **部分文件上仍能胜出**：尤其压缩侧 fixed 仍赢 28 个文件；
+1. **部分文件上仍能大规模胜出**：尤其压缩侧 fixed 已赢 48 个文件；
 2. **仍可在部分文件上胜出**，但压缩功率不再像上一版那样明显低：
-   - fixed: 15.91W
-   - adaptive: 15.86W
-   - CPU: 14.63W
-   - GPU: 14.68W
+   - fixed: 16.06W
+   - adaptive: 16.17W
+   - CPU: 19.63W
+   - GPU: 18.72W
 
 所以 hybrid 当前不是“无用”，而是一个 **吞吐不及 GPU、但在一部分文件上仍有价值的平衡方案**；功率维度已经不能再被写成它的主要优势。
 
@@ -308,13 +297,13 @@ CPU 路径的意义不是给 GPU 打下手，而是：
 
 当前 hybrid best-per-file median ratio 为：
 
-- fixed：**24.82%**
-- adaptive：**24.53%**
+- fixed：**25.32%**
+- adaptive：**25.32%**
 
 二者都明显高于：
 
-- CPU：20.81%
-- GPU：22.55%
+- CPU：22.38%
+- GPU：25.23%
 
 说明当前 hybrid 容器化与 split 设计仍然带来了明显压缩率代价。这是它没有成为默认路径的重要原因之一。
 
@@ -354,12 +343,12 @@ CPU 路径的意义不是给 GPU 打下手，而是：
 当前 `lz4_hybrid` 的结论应更新为：
 
 - **实现层面**：CPU path、GPU path、fixed split、adaptive split、bench-io total semantics 均已落地；
-- **结果层面**：GPU 是 LZ4 family 的主导吞吐引擎；hybrid fixed 次之；adaptive 未超过 fixed；
+- **结果层面**：GPU 仍是 LZ4 family 的主导总吞吐引擎；hybrid fixed 已成为压缩侧强竞争者；adaptive 在解压侧更有价值；
 - **系统层面**：hybrid 的价值在于部分文件胜出与协同研究空间，而不是当前全局最快引擎；CPU OpenCL 虽然已验证可运行，但暂不构成替代 native CPU path 的依据。
 
 因此，当前最准确的表述是：
 
-> `lz4_hybrid` 已经从概念验证进化为一个完整、可验证、带真实 adaptive 的协同实现，但在 corrected steady-state total throughput 下，它的角色是 GPU 基线之上的平衡型补充，而不是替代 GPU 成为新的主路径。
+> `lz4_hybrid` 已经从概念验证进化为一个完整、可验证、带真实 adaptive 的协同实现；在 fresh 83-file full-corpus 结果中，fixed hybrid 已经成为压缩侧的强竞争者，但 GPU 仍然是更稳的默认主路径，尤其在解压侧仍保持明显优势。
 
 ## 13. 2026-03-09 优化轮次快照
 

@@ -34,6 +34,48 @@ ACCELS = [1, 3]
 SPLIT_MODES = ["fixed", "adaptive"]
 
 
+def parse_str_list(value, default_list):
+    if value is None:
+        return list(default_list)
+    s = str(value).strip()
+    if not s:
+        return list(default_list)
+    out = []
+    for tok in s.split(','):
+        tok = tok.strip()
+        if tok:
+            out.append(tok)
+    return out if out else list(default_list)
+
+
+def parse_int_list(value, default_list):
+    if value is None:
+        return list(default_list)
+    s = str(value).strip()
+    if not s:
+        return list(default_list)
+    out = []
+    for tok in s.split(','):
+        tok = tok.strip()
+        if tok:
+            out.append(int(tok))
+    return out if out else list(default_list)
+
+
+def parse_float_list(value, default_list):
+    if value is None:
+        return list(default_list)
+    s = str(value).strip()
+    if not s:
+        return list(default_list)
+    out = []
+    for tok in s.split(','):
+        tok = tok.strip()
+        if tok:
+            out.append(float(tok))
+    return out if out else list(default_list)
+
+
 def compute_sha256(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -198,6 +240,11 @@ def main():
     parser = argparse.ArgumentParser(description="Benchmark lz4_hybrid fixed/adaptive split modes")
     parser.add_argument("--samples", default=DEFAULT_SAMPLES_DIR, help=f"Samples directory (default: {DEFAULT_SAMPLES_DIR})")
     parser.add_argument("--bench-seconds", type=float, default=BENCH_SECONDS, help=f"Benchmark seconds per config (default: {BENCH_SECONDS})")
+    parser.add_argument("--block-sizes", default=','.join(BLOCK_SIZES), help="Comma-separated block sizes")
+    parser.add_argument("--split-modes", default=','.join(SPLIT_MODES), help="Comma-separated split modes")
+    parser.add_argument("--gpu-ratios", default=','.join(str(x) for x in GPU_RATIOS), help="Comma-separated GPU ratios")
+    parser.add_argument("--cpu-threads", default=','.join(str(x) for x in CPU_THREADS), help="Comma-separated CPU thread counts")
+    parser.add_argument("--accels", default=','.join(str(x) for x in ACCELS), help="Comma-separated acceleration values")
     args = parser.parse_args()
 
     if not (os.path.isfile(LZ4_HYBRID_BIN) and os.access(LZ4_HYBRID_BIN, os.X_OK)):
@@ -208,7 +255,13 @@ def main():
     if not samples:
         raise SystemExit(f"No sample files found in {samples_dir}")
 
-    configs = list(itertools.product(BLOCK_SIZES, SPLIT_MODES, GPU_RATIOS, CPU_THREADS, ACCELS))
+    block_sizes = parse_str_list(args.block_sizes, BLOCK_SIZES)
+    split_modes = parse_str_list(args.split_modes, SPLIT_MODES)
+    gpu_ratios = parse_float_list(args.gpu_ratios, GPU_RATIOS)
+    cpu_threads = parse_int_list(args.cpu_threads, CPU_THREADS)
+    accels = parse_int_list(args.accels, ACCELS)
+
+    configs = list(itertools.product(block_sizes, split_modes, gpu_ratios, cpu_threads, accels))
     expected_rows = len(samples) * len(configs)
 
     Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
