@@ -779,6 +779,7 @@ def run_lz4_cpu(file_path, bs, threads, orig_hash, telemetry=None):
                 cmd_comp_total = [
                     LZ4_BIN,
                     "-q",
+                    "-z",
                     "-f",
                     f"-B{str(bs).upper()}",
                     f"-T{threads}",
