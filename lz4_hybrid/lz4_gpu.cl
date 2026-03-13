@@ -741,22 +741,4 @@ __kernel void lz4_decompress_blocks(
     }
 }
 
-__kernel void lz4_pack_blocks(
-    const __global BYTE* sparse_output,
-    __global BYTE* packed_output,
-    __global const U32* sparse_offsets,
-    __global const U32* packed_offsets,
-    __global const U32* block_sizes,
-    U32 totalBlocks
-) {
-    uint gid = get_global_id(0);
-    uint gsz = get_global_size(0);
-
-    for (uint idx = gid; idx < totalBlocks; idx += gsz) {
-        U32 sz = block_sizes[idx];
-        if (sz == 0) continue;
-        LZ4_UA_COPYN(packed_output + packed_offsets[idx], sparse_output + sparse_offsets[idx], sz);
-    }
-}
-
 #endif /* LZ4_GPU_NO_ENTRY_KERNELS */

@@ -1,9 +1,13 @@
 # lz4_hybrid 性能分析报告（按当前实现与修正后结果更新）
 
-> 更新时间：2026-03-09  
-> 程序路径：`/root/lz4/lz4_hybrid/lz4_hybrid`  
+> 更新时间：2026-03-13
+> 程序路径：`/root/lz4/lz4_hybrid/lz4_hybrid`
 > 当前全量结果：`/root/lz4/exp_results/hybrid_bench/hybrid_bench_20260309_180949.csv`
 > 对照基线：`/root/lz4/exp_results/runs/20260309_merged_full_83/lz4_param_sweep_merged.csv`
+
+## Intel 平台（保留原文）
+
+以下现有章节保留为 Intel Core + Iris Xe 平台的原始分析；Windows + NVIDIA 的新增结果见文末章节。
 
 ## 1. 概述 (Overview)
 
@@ -19,8 +23,8 @@
 1. **测试口径已修正**：当前 total throughput 来自 `lz4_hybrid --bench --bench-io` 的 warmed in-binary 路径；同时 `kernel_tp` 已按真实 CPU/GPU 编解码执行跨度（取两者 max）计算，不再直接使用包含额外 host-side coordination 的 `parallel_us`；
 2. **adaptive split 已真实生效**：此前 `--adaptive` 曾存在“CLI 有开关但 active split path 不改变”的缺口，本轮已在 live code 中修复。
 
-- **核心目标**：探索 CPU/GPU 协同在 LZ4 实时压缩中的真实系统价值，而不是只比较 kernel speed。  
-- **程序路径**：`/root/lz4/lz4_hybrid/lz4_hybrid`  
+- **核心目标**：探索 CPU/GPU 协同在 LZ4 实时压缩中的真实系统价值，而不是只比较 kernel speed。
+- **程序路径**：`/root/lz4/lz4_hybrid/lz4_hybrid`
 - **主要特性**：fixed/adaptive split、多线程 CPU、OpenCL GPU、bench-io total semantics。
 
 ## 2. 设计原理 (Design Principles)
@@ -317,7 +321,7 @@ CPU 路径的意义不是给 GPU 打下手，而是：
 
 这也正是 adaptive 仍值得继续研究但尚未完成的原因：
 
-> 当前 split policy 已真实存在，但还没有足够强到稳定识别这些文件类别并超过 best fixed。 
+> 当前 split policy 已真实存在，但还没有足够强到稳定识别这些文件类别并超过 best fixed。
 
 ## 11. 优化机会 (Optimization Opportunities)
 
@@ -397,3 +401,95 @@ CPU 路径的意义不是给 GPU 打下手，而是：
 5. 因而当前更准确的表述不再是“hybrid 系统性落后 GPU”，而是：
 
 > `lz4_hybrid` 经过本轮修复与运行时优化后，已经能在部分 workload 上超过纯 GPU；但在更广 workload 上是否形成系统级反超，仍需新的全量 rerun 来确认。
+
+## Nvidia 平台（Windows + GeForce RTX 4070 Ti 系列，按 full 结果重写）
+
+正式工件（仅 full-corpus）：
+
+- CPU baseline：`exp_results/formal_full_lz4_cpu_baseline_t123468_energy/runs/20260311_161022/`
+- Hybrid pre-mod：`exp_results/formal_full_lz4_hybrid_baseline_unmodified_energy/hybrid_bench_20260312_100106.csv`
+- Hybrid post-mod（final r2）：`exp_results/formal_full_lz4_hybrid_final_energy_r2/hybrid_bench_20260313_015326.csv`
+
+### 1) Nvidia dGPU 与 Intel iGPU 的关键差异
+
+| 维度 | Intel Iris Xe（iGPU） | Nvidia RTX 4070 Ti（dGPU） | 对 hybrid 的影响 |
+| --- | --- | --- | --- |
+| 内存模型 | 统一内存，CPU/GPU 高耦合 | 显存与主存分离 | 分路后的 gather/scatter 与回传更敏感 |
+| 调度容错 | 传输开销相对可隐藏 | 传输与同步成本更容易放大 | split policy 不仅影响 kernel，还直接影响 total |
+| 设备功耗 | 包级统计为主 | GPU 板卡功耗独立 | 混合引擎需要分别解释 CPU/GPU 能耗变化 |
+
+### 2) Nvidia 下 hybrid 压缩/解压设计
+
+```mermaid
+flowchart LR
+  A[Block Partition] --> B[GPU-assigned Blocks]
+  A --> C[CPU-assigned Blocks]
+  B --> D[GPU Core Compress/Decompress]
+  C --> E[liblz4 + pthread]
+  D --> F[Hybrid Container Merge]
+  E --> F
+  F --> G[Decode: same split metadata]
+```
+
+设计说明：
+
+- 当前正式配置为 `64K / fixed / gpu_ratio=0.3 / T=2 / A=1 / LSZ=1`；
+- GPU 路径继承 `lz4_gpu_core`，CPU 路径保持 `liblz4 + pthread`；
+- 容器记录分路元信息，保证解压阶段可确定性回放。
+
+### 3) Nvidia 侧优化（动机 / 原理 / 实现）
+
+1. **分布式块分配与兼容解码**
+   - 动机：避免单纯前缀分配导致内容偏置；
+   - 原理：压缩端分布式 assignment，解压端按 header flag 区分新旧布局；
+   - 实现：`lz4_hybrid.c` 新增 striped flag 与双路径解码逻辑。
+
+2. **GPU 子路径同步开销收敛**
+   - 动机：阻塞式调用后重复 `clFinish` 会放大 host 等待；
+   - 原理：移除冗余同步点，仅保留语义必需同步；
+   - 实现：`lz4_gpu_core.c` 读回路径同步精简。
+
+3. **bench 与遥测口径修正**
+   - 动机：避免旧口径把外层流程噪声混入 total；
+   - 原理：固定使用 warmed `--bench-io` + Windows CPU/GPU 能耗字段；
+   - 实现：bench 脚本与 telemetry fallback 联动更新。
+
+### 4) Full 结果分析（CPU baseline / pre-mod / post-mod）
+
+#### 4.1 统计表（均值 / 中位数）
+
+| 组别 | Ratio mean / median % | Comp kernel mean / median | Dec kernel mean / median | Comp total mean / median | Dec total mean / median |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CPU baseline (`FP=1;BS=64K;T=3`) | 26.4609 / 22.3810 | 12323.4841 / 5928.4400 | 19047.2108 / 17515.7000 | 956.6926 / 982.4543 | 562.1856 / 546.6486 |
+| Hybrid pre-mod | 26.3954 / 23.3700 | 7940.4533 / 3952.4500 | 5907.6836 / 6568.8900 | 1899.5330 / 1902.6700 | 1238.3454 / 1295.4300 |
+| Hybrid post-mod r2 | 26.4063 / 23.3800 | 6918.8016 / 3581.4400 | 5748.2465 / 6320.3500 | 2138.8427 / 1949.7300 | 1141.7533 / 1182.1800 |
+
+#### 4.2 pre-mod → post-mod 变化
+
+- Comp total mean：`1899.5330 → 2138.8427`（约 **+12.6%**）
+- Dec total mean：`1238.3454 → 1141.7533`（约 **-7.8%**）
+- Comp kernel mean：`7940.4533 → 6918.8016`（约 **-12.9%**）
+- Dec kernel mean：`5907.6836 → 5748.2465`（约 **-2.7%**）
+- Ratio 基本不变（`26.3954 → 26.4063`）
+
+功耗侧（均值）：
+
+- CPU energy：`0.9654 → 0.8536 J`（下降）
+- GPU energy：`1.9828 → 2.1039 J`（上升）
+- CPU power：`19.4316 → 23.6521 W`（上升）
+- GPU power：`46.3486 → 56.2695 W`（上升）
+
+#### 4.3 结果模式与例外
+
+1. **压缩 total 提升但 kernel 下滑**：说明收益主要来自调度/路径层优化，而非单纯核函数提速；
+2. **解压 total 回退**：当前 merge/readback 路径仍是瓶颈热点；
+3. **能耗不对称**：CPU energy 降而 GPU energy 升，体现了“把更多有效工作前移到 GPU”的代价转移。
+
+### 5) 局限、结论与下一步
+
+- 局限：当前 post-mod r2 仍是单主配置对比，不覆盖全 split-policy 参数面。
+- 结论：`lz4_hybrid` 在 Nvidia 上仍是高吞吐路径，但当前优化呈现“压缩收益、解压回退、GPU 侧能耗上升”的明确 trade-off。
+- 下一步：
+  1. 单独优化解压侧 gather/scatter 与同步链路；
+  2. 做 fixed vs adaptive 的 Nvidia 全参复扫；
+  3. 增加按文件类型分层阈值，避免一刀切 split。

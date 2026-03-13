@@ -8,6 +8,7 @@ import socket
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -18,12 +19,18 @@ if str(SCRIPT_DIR) not in sys.path:
 from hw_telemetry import TelemetryProbe, apply_freq_percent
 
 # Paths
-LZ4_BIN = os.environ.get("LZ4_CPU_BIN", "/root/lz4/programs/lz4")
-LZ4_GPU_BIN = "/root/lz4/lz4_gpu/lz4_gpu"
-SAMPLES_DIR = "/root/samples"
-RESULTS_DIR = "/root/lz4/exp_results"
-LZ4_DAEMON_SOCKET_PATH = "/tmp/lz4_gpu_daemon.sock"
-LZ4_DAEMON_PID_PATH = "/tmp/lz4_gpu_daemon.pid"
+IS_WINDOWS = os.name == "nt"
+EXEEXT = ".exe" if IS_WINDOWS else ""
+REPO_ROOT = SCRIPT_DIR.parent
+TEMP_DIR = Path(tempfile.gettempdir())
+LZ4_BIN = os.environ.get("LZ4_CPU_BIN", str(REPO_ROOT / "programs" / f"lz4{EXEEXT}"))
+LZ4_GPU_BIN = os.environ.get("LZ4_GPU_BIN", str(REPO_ROOT / "lz4_gpu" / f"lz4_gpu{EXEEXT}"))
+SAMPLES_DIR = os.environ.get("LZ4_SAMPLES_DIR", str(REPO_ROOT / "samples"))
+RESULTS_DIR = os.environ.get("LZ4_RESULTS_DIR", str(REPO_ROOT / "exp_results"))
+LZ4_DAEMON_SOCKET_PATH = str(TEMP_DIR / "lz4_gpu_daemon.sock")
+LZ4_DAEMON_PID_PATH = str(TEMP_DIR / "lz4_gpu_daemon.pid")
+CPU_CONTROL_SCRIPT = str(REPO_ROOT / "tools" / "cpu_control.sh")
+GPU_CONTROL_SCRIPT = str(REPO_ROOT / "tools" / "gpu_control.sh")
 
 # Configuration Space
 CPU_BLOCK_SIZES = ["64K", "256K"]
@@ -60,6 +67,9 @@ def resolve_lz4_cpu_binary():
     if env_bin:
         candidates.append(env_bin)
     candidates.extend([
+        LZ4_BIN,
+        str(REPO_ROOT / "programs" / f"lz4{EXEEXT}"),
+        str(REPO_ROOT / f"lz4{EXEEXT}"),
         "/root/lz4/programs/lz4",
         "/root/lz4/lz4",
     ])
@@ -73,7 +83,7 @@ def resolve_lz4_cpu_binary():
         return built
 
     raise FileNotFoundError(
-        "Cannot find/build LZ4 CPU binary. Tried env LZ4_CPU_BIN, /root/lz4/programs/lz4, /root/lz4/lz4 and PATH."
+        f"Cannot find/build LZ4 CPU binary. Tried {candidates} and PATH."
     )
 
 
@@ -397,6 +407,24 @@ def resolve_single_sample(single_file, samples_root, discovered_samples):
     raise SystemExit(f"--single-file not found: {single_file}")
 
 
+def resolve_samples_root(samples_arg):
+    root = Path(samples_arg)
+    if not root.exists():
+        raise SystemExit(f"Samples directory not found: {samples_arg}")
+
+    direct_files = sorted([p for p in root.glob("*") if p.is_file()])
+    if direct_files:
+        return root, direct_files
+
+    child_dirs = sorted([p for p in root.glob("*") if p.is_dir()])
+    if len(child_dirs) == 1:
+        nested_files = sorted([p for p in child_dirs[0].glob("*") if p.is_file()])
+        if nested_files:
+            return child_dirs[0], nested_files
+
+    return root, direct_files
+
+
 def build_freq_points(shared_points, shared_single):
     targets = shared_points if shared_points else [shared_single]
     if not targets:
@@ -431,6 +459,10 @@ def safe_remove(path):
             os.remove(path)
     except OSError:
         pass
+
+
+def make_temp_file_path(prefix, suffix):
+    return str(TEMP_DIR / f"{prefix}_{os.getpid()}_{int(time.time() * 1000)}{suffix}")
 
 
 def compute_sha256(path):
@@ -501,6 +533,41 @@ def run_command_with_telemetry(cmd, telemetry=None, env=None, sample_interval_s=
     return completed, tel
 
 
+def run_command_with_telemetry_cwd(cmd, cwd=None, telemetry=None, env=None, sample_interval_s=0.05):
+    if telemetry is None:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env, cwd=cwd)
+        return res, {}
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=cwd)
+    samples = []
+    start_snap = telemetry.snapshot()
+    samples.append(start_snap)
+
+    while True:
+        try:
+            out, err = proc.communicate(timeout=sample_interval_s)
+            break
+        except subprocess.TimeoutExpired:
+            samples.append(telemetry.snapshot())
+
+    end_snap = telemetry.snapshot()
+    samples.append(end_snap)
+    delta = telemetry.diff(start_snap, end_snap)
+
+    cpu_avg = safe_mean([s.get("cpu_freq_mhz") for s in samples])
+    gpu_avg = safe_mean([s.get("gpu_freq_mhz") for s in samples])
+
+    tel = {
+        "elapsed_s": float(delta.get("elapsed_s", 0.0) or 0.0),
+        "cpu_freq_avg_mhz": float(cpu_avg),
+        "gpu_freq_avg_mhz": float(gpu_avg),
+        "cpu_energy_j": float(delta.get("cpu_energy_j", 0.0) or 0.0),
+        "gpu_energy_j": float(delta.get("gpu_energy_j", 0.0) or 0.0),
+    }
+    completed = subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    return completed, tel
+
+
 def apply_wall_energy(stats, tel_window, comp_elapsed_s, dec_elapsed_s, energy_source):
     stats['cpu_freq_avg_mhz'] = float(tel_window.get('cpu_freq_avg_mhz', 0.0) or 0.0)
     stats['gpu_freq_avg_mhz'] = float(tel_window.get('gpu_freq_avg_mhz', 0.0) or 0.0)
@@ -529,6 +596,8 @@ def apply_wall_energy(stats, tel_window, comp_elapsed_s, dec_elapsed_s, energy_s
 def run_control_action(control_script_path, action):
     if not os.path.exists(control_script_path):
         return "missing_script"
+    if IS_WINDOWS:
+        return "unsupported_on_windows"
 
     cmd = [control_script_path, action]
     if os.geteuid() != 0:
@@ -663,7 +732,10 @@ def parse_stable_bench_output(output):
 
 
 def warm_lz4_gpu_daemon(file_path, bs_arg, hl, lsz, accel):
-    warm_out = f"/tmp/lz4_gpu_warm_{os.getpid()}_{int(time.time() * 1000)}.lz4"
+    if IS_WINDOWS:
+        return
+
+    warm_out = make_temp_file_path("lz4_gpu_warm", ".lz4")
     warm_dec = f"{warm_out}.dec"
     try:
         warm_comp_cmd = [
@@ -769,7 +841,7 @@ def run_lz4_cpu(file_path, bs, threads, orig_hash, telemetry=None):
             stats['comp_time_s'] = parsed.get('comp_time_s', 0)
             stats['dec_time_s'] = parsed.get('dec_time_s', 0)
 
-            tmp_comp = f"/tmp/lz4_cpu_total_{os.getpid()}_{int(time.time() * 1000)}.lz4"
+            tmp_comp = make_temp_file_path("lz4_cpu_total", ".lz4")
             tmp_dec = f"{tmp_comp}.dec"
             comp_elapsed_s = 0.0
             dec_elapsed_s = 0.0
@@ -837,7 +909,7 @@ def run_lz4_cpu(file_path, bs, threads, orig_hash, telemetry=None):
     return stats
 
 
-def run_lz4_gpu(file_path, bs, hl, lsz, accel, orig_hash, telemetry=None, bench_seconds=3.0):
+def run_lz4_gpu(file_path, bs, hl, lsz, accel, orig_hash, telemetry=None, bench_seconds=3.0, use_daemon=False):
     print(f"Bench_GPU: {file_path.name} BS={bs} HL={hl} LSZ={lsz} A={accel}")
     bs_arg = str(bs).lower()
     stats = {
@@ -861,6 +933,7 @@ def run_lz4_gpu(file_path, bs, hl, lsz, accel, orig_hash, telemetry=None, bench_
     tel_window = {}
     try:
         in_sz = file_path.stat().st_size
+        gpu_dir = str(Path(LZ4_GPU_BIN).resolve().parent)
 
         bench_cmd = [
             LZ4_GPU_BIN,
@@ -871,25 +944,27 @@ def run_lz4_gpu(file_path, bs, hl, lsz, accel, orig_hash, telemetry=None, bench_
             "-a", str(accel),
             str(file_path),
         ]
-        bench_res, tel_window = run_command_with_telemetry(bench_cmd, telemetry=telemetry, env=build_gpu_subprocess_env())
+        bench_res, tel_window = run_command_with_telemetry_cwd(bench_cmd, cwd=gpu_dir, telemetry=telemetry, env=build_gpu_subprocess_env())
         bench_output = (bench_res.stdout or "") + (bench_res.stderr or "")
         stable = parse_stable_bench_output(bench_output)
 
         if stable:
-            warm_lz4_gpu_daemon(file_path, bs_arg, hl, lsz, accel)
+            if use_daemon:
+                warm_lz4_gpu_daemon(file_path, bs_arg, hl, lsz, accel)
             stats['ratio'] = stable['ratio']
             stats['comp_mbs'] = stable['comp_kernel_tp']
             stats['dec_mbs'] = stable['dec_kernel_tp']
 
-            tmp_comp = f"/tmp/lz4_gpu_total_{os.getpid()}_{int(time.time() * 1000)}.lz4"
+            tmp_comp = make_temp_file_path("lz4_gpu_total", ".lz4")
             tmp_dec = f"{tmp_comp}.dec"
             total_tel = {}
             total_ok = False
 
             try:
-                cmd_comp_total = [
-                    LZ4_GPU_BIN,
-                    "--use-daemon",
+                cmd_comp_total = [LZ4_GPU_BIN]
+                if use_daemon:
+                    cmd_comp_total.append("--use-daemon")
+                cmd_comp_total.extend([
                     "-v",
                     "-b", bs_arg,
                     "-H", str(hl),
@@ -897,20 +972,21 @@ def run_lz4_gpu(file_path, bs, hl, lsz, accel, orig_hash, telemetry=None, bench_
                     "-a", str(accel),
                     "-o", tmp_comp,
                     str(file_path),
-                ]
-                comp_total_res, comp_total_tel = run_command_with_telemetry(cmd_comp_total, telemetry=telemetry, env=build_gpu_subprocess_env())
+                ])
+                comp_total_res, comp_total_tel = run_command_with_telemetry_cwd(cmd_comp_total, cwd=gpu_dir, telemetry=telemetry, env=build_gpu_subprocess_env())
                 comp_total_output = (comp_total_res.stdout or "") + (comp_total_res.stderr or "")
                 comp_total_parsed = parse_gpu_output(comp_total_output)
 
-                cmd_dec_total = [
-                    LZ4_GPU_BIN,
-                    "--use-daemon",
+                cmd_dec_total = [LZ4_GPU_BIN]
+                if use_daemon:
+                    cmd_dec_total.append("--use-daemon")
+                cmd_dec_total.extend([
                     "-v",
                     "-d",
                     "-o", tmp_dec,
                     tmp_comp,
-                ]
-                dec_total_res, dec_total_tel = run_command_with_telemetry(cmd_dec_total, telemetry=telemetry, env=build_gpu_subprocess_env())
+                ])
+                dec_total_res, dec_total_tel = run_command_with_telemetry_cwd(cmd_dec_total, cwd=gpu_dir, telemetry=telemetry, env=build_gpu_subprocess_env())
                 dec_total_output = (dec_total_res.stdout or "") + (dec_total_res.stderr or "")
                 dec_total_parsed = parse_gpu_output(dec_total_output)
 
@@ -942,7 +1018,7 @@ def run_lz4_gpu(file_path, bs, hl, lsz, accel, orig_hash, telemetry=None, bench_
                 safe_remove(tmp_comp)
                 safe_remove(tmp_dec)
 
-            stats['throughput_semantics'] = 'stable_kernel_bench_with_daemon_inclusive_total'
+            stats['throughput_semantics'] = 'stable_kernel_bench_with_inclusive_total'
             stats['roundtrip_verified'] = bool(stable['verify_ok']) and (bench_res.returncode == 0) and total_ok
             if telemetry and total_tel:
                 apply_wall_energy(
@@ -979,6 +1055,7 @@ def main():
     parser.add_argument('--single-file', default='', help='Only benchmark one file (path or basename under samples dir)')
     parser.add_argument('--no-telemetry', action='store_true', help='Disable freq/energy telemetry collection')
     parser.add_argument('--bench-seconds', type=float, default=3.0, help='Benchmark duration in seconds for timed bench paths (default: 3.0)')
+    parser.add_argument('--results-dir', default=RESULTS_DIR, help='Directory for benchmark outputs')
     args = parser.parse_args()
 
     if args.cpu_only and args.gpu_only:
@@ -994,30 +1071,30 @@ def main():
     hash_logs = parse_int_list(args.hash_logs, HASH_LOGS)
     local_sizes = parse_int_list(args.local_sizes, LOCAL_SIZES)
     gpu_accels = parse_int_list(args.gpu_accels, GPU_ACCELS)
-    use_gpu_daemon = (not args.cpu_only)
+    use_gpu_daemon = (not args.cpu_only) and (not IS_WINDOWS)
     freq_points = build_freq_points(parse_optional_int_list(args.freq_points), args.freq_percent)
 
     telemetry = None if args.no_telemetry else TelemetryProbe()
     if telemetry is not None:
         print(f"Telemetry sources: {telemetry.describe_sources()}")
 
-    os.makedirs(RESULTS_DIR, exist_ok=True)
+    os.makedirs(args.results_dir, exist_ok=True)
     run_dir, results_csv, results_summary_csv = prepare_results_paths(
-        RESULTS_DIR,
+        args.results_dir,
         "lz4_param_sweep.csv",
         "lz4_param_sweep_config_summary.csv",
     )
     print(f"[Results] run_dir={run_dir}")
+    samples_root, samples = resolve_samples_root(args.samples)
     with open(run_dir / "run_meta.txt", "w", encoding="utf-8") as mf:
         mf.write(f"argv={' '.join(sys.argv)}\n")
         mf.write(f"cwd={os.getcwd()}\n")
         mf.write(f"bench_seconds={args.bench_seconds}\n")
         mf.write(f"samples={args.samples}\n")
-
-    samples = sorted([p for p in Path(args.samples).glob("*") if p.is_file()])
+        mf.write(f"resolved_samples={samples_root}\n")
 
     if args.single_file:
-        samples = resolve_single_sample(args.single_file, args.samples, samples)
+        samples = resolve_single_sample(args.single_file, str(samples_root), samples)
 
     if not samples:
         print(f"No samples found in {args.samples}")
@@ -1052,8 +1129,8 @@ def main():
             for point_idx, freq_target in enumerate(freq_points, start=1):
                 cpu_freq_target = freq_target
                 gpu_freq_target = freq_target
-                cpu_freq_apply = apply_freq_percent('/root/lz4/tools/cpu_control.sh', cpu_freq_target)
-                gpu_freq_apply = apply_freq_percent('/root/lz4/tools/gpu_control.sh', gpu_freq_target)
+                cpu_freq_apply = apply_freq_percent(CPU_CONTROL_SCRIPT, cpu_freq_target)
+                gpu_freq_apply = apply_freq_percent(GPU_CONTROL_SCRIPT, gpu_freq_target)
                 print(f"[FreqPoint {point_idx}] CPU={cpu_freq_target} apply={cpu_freq_apply}; GPU={gpu_freq_target} apply={gpu_freq_apply}")
 
                 for sample in samples:
@@ -1098,7 +1175,7 @@ def main():
                             for hl in hash_logs:
                                 for lsz in local_sizes:
                                     for accel in gpu_accels:
-                                        gpu_stats = run_lz4_gpu(sample, bs, hl, lsz, accel, orig_hash, telemetry=telemetry, bench_seconds=args.bench_seconds)
+                                        gpu_stats = run_lz4_gpu(sample, bs, hl, lsz, accel, orig_hash, telemetry=telemetry, bench_seconds=args.bench_seconds, use_daemon=use_gpu_daemon)
                                         writer.writerow([
                                             sample.name,
                                             point_idx,
@@ -1135,8 +1212,8 @@ def main():
                 except subprocess.TimeoutExpired:
                     daemon_proc.kill()
 
-        cpu_reset = run_control_action('/root/lz4/tools/cpu_control.sh', 'reset')
-        gpu_reset = run_control_action('/root/lz4/tools/gpu_control.sh', 'reset')
+        cpu_reset = run_control_action(CPU_CONTROL_SCRIPT, 'reset')
+        gpu_reset = run_control_action(GPU_CONTROL_SCRIPT, 'reset')
         print(f"[Cleanup] CPU reset={cpu_reset}; GPU reset={gpu_reset}")
 
 if __name__ == "__main__":

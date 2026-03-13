@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import glob
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -13,6 +14,8 @@ class RAPLDomain:
     name: str
     energy_path: str
     max_j: float
+    source: str = "sysfs"
+    energy_scale: float = 1.0
 
 
 class TelemetryProbe:
@@ -21,6 +24,7 @@ class TelemetryProbe:
         self.gpu_domain: Optional[RAPLDomain] = None
         self.has_nvidia_smi = shutil.which("nvidia-smi") is not None
         self.nvidia_energy_supported = False
+        self.windows_cpu_max_mhz = self._detect_windows_cpu_max_mhz() if os.name == "nt" else 0.0
 
         self._detect_rapl_domains()
         if self.has_nvidia_smi:
@@ -44,7 +48,81 @@ class TelemetryProbe:
         except Exception:
             return None
 
+    @staticmethod
+    def _run_powershell(command: str) -> str:
+        ps = shutil.which("powershell.exe") or shutil.which("powershell") or shutil.which("pwsh.exe") or shutil.which("pwsh")
+        if not ps:
+            return ""
+        try:
+            res = subprocess.run(
+                [ps, "-NoProfile", "-Command", command],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if res.returncode != 0:
+                return ""
+            return (res.stdout or "").strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _read_windows_counter(path: str, scale: float = 1.0) -> Optional[float]:
+        safe_path = path.replace("'", "''")
+        cmd = (
+            "$ErrorActionPreference='Stop'; "
+            f"$s=(Get-Counter -Counter '{safe_path}').CounterSamples | Select-Object -First 1; "
+            "if ($s) { [Console]::Out.Write([System.Convert]::ToString([double]$s.CookedValue, [System.Globalization.CultureInfo]::InvariantCulture)) }"
+        )
+        txt = TelemetryProbe._run_powershell(cmd)
+        if not txt:
+            return None
+        try:
+            return float(txt) * scale
+        except Exception:
+            return None
+
+    def _detect_windows_energy_domains(self) -> None:
+        candidates = [
+            ("RAPL_Package0_PKG", r"\Energy Meter(RAPL_Package0_PKG)\Energy"),
+            ("_Total", r"\Energy Meter(_Total)\Energy"),
+        ]
+        for name, energy_path in candidates:
+            if self._read_windows_counter(energy_path, scale=1e-9) is not None:
+                self.cpu_domain = RAPLDomain(
+                    name=name,
+                    energy_path=energy_path,
+                    max_j=0.0,
+                    source="windows_counter",
+                    energy_scale=1e-9,
+                )
+                break
+
+    @staticmethod
+    def _windows_average_cpu_property_mhz(prop_name: str) -> Optional[float]:
+        cmd = (
+            "$ErrorActionPreference='Stop'; "
+            f"$m=Get-CimInstance Win32_Processor | Measure-Object -Property {prop_name} -Average; "
+            "if ($m -and $m.Average) { "
+            "[Console]::Out.Write([System.Convert]::ToString([double]$m.Average, [System.Globalization.CultureInfo]::InvariantCulture)) }"
+        )
+        txt = TelemetryProbe._run_powershell(cmd)
+        if not txt:
+            return None
+        try:
+            return float(txt)
+        except Exception:
+            return None
+
+    @classmethod
+    def _detect_windows_cpu_max_mhz(cls) -> float:
+        v = cls._windows_average_cpu_property_mhz("MaxClockSpeed")
+        return float(v or 0.0)
+
     def _detect_rapl_domains(self) -> None:
+        if os.name == "nt":
+            self._detect_windows_energy_domains()
+            return
         paths = sorted(set(glob.glob("/sys/class/powercap/intel-rapl:*") + glob.glob("/sys/class/powercap/intel-rapl:*:*")))
         domains = []
         for p in paths:
@@ -96,21 +174,59 @@ class TelemetryProbe:
     def _read_rapl_j(self, domain: Optional[RAPLDomain]) -> Optional[float]:
         if domain is None:
             return None
+        if domain.source == "windows_counter":
+            return self._read_windows_counter(domain.energy_path, scale=domain.energy_scale)
         v_uj = self._read_float(domain.energy_path, scale=1.0)
         if v_uj is None:
             return None
         return v_uj * 1e-6
 
     @staticmethod
-    def _cpu_avg_freq_mhz() -> float:
+    def _linux_cpu_avg_freq_mhz() -> float:
         vals = []
-        for p in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq"):
-            v = TelemetryProbe._read_float(p, scale=1e-3)
-            if v is not None:
-                vals.append(v)
+        patterns = [
+            "/sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq",
+            "/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq",
+            "/sys/devices/system/cpu/cpufreq/policy*/cpuinfo_cur_freq",
+            "/sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_cur_freq",
+        ]
+        for pattern in patterns:
+            for p in glob.glob(pattern):
+                v = TelemetryProbe._read_float(p, scale=1e-3)
+                if v is not None and v > 0.0:
+                    vals.append(v)
+            if vals:
+                break
+        if not vals:
+            try:
+                with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as f:
+                    matches = re.findall(r"^cpu MHz\s*:\s*([0-9]+(?:\.[0-9]+)?)$", f.read(), flags=re.MULTILINE)
+                vals = [float(v) for v in matches if float(v) > 0.0]
+            except Exception:
+                vals = []
         if not vals:
             return 0.0
         return float(sum(vals) / len(vals))
+
+    def _windows_cpu_avg_freq_mhz(self) -> float:
+        counter = self._read_windows_counter(r"\Processor Information(_Total)\Processor Frequency")
+        if counter is not None and counter > 0.0:
+            return float(counter)
+
+        current = self._windows_average_cpu_property_mhz("CurrentClockSpeed")
+        if current is not None and current > 0.0:
+            return float(current)
+
+        perf_pct = self._read_windows_counter(r"\Processor Information(_Total)\% Processor Performance")
+        if perf_pct is not None and perf_pct > 0.0 and self.windows_cpu_max_mhz > 0.0:
+            return float(self.windows_cpu_max_mhz * perf_pct / 100.0)
+
+        return 0.0
+
+    def _cpu_avg_freq_mhz(self) -> float:
+        if os.name == "nt":
+            return self._windows_cpu_avg_freq_mhz()
+        return self._linux_cpu_avg_freq_mhz()
 
     def _gpu_freq_mhz(self) -> float:
         v = self._read_float("/sys/class/drm/card0/gt_cur_freq_mhz", scale=1.0)
@@ -120,9 +236,12 @@ class TelemetryProbe:
         return nv or 0.0
 
     def describe_sources(self) -> str:
-        cpu_src = f"rapl:{self.cpu_domain.name}" if self.cpu_domain else "none"
+        if self.cpu_domain:
+            cpu_src = ("win_energy_meter:" if self.cpu_domain.source == "windows_counter" else "rapl:") + self.cpu_domain.name
+        else:
+            cpu_src = "none"
         if self.gpu_domain:
-            gpu_src = f"rapl:{self.gpu_domain.name}"
+            gpu_src = ("win_energy_meter:" if self.gpu_domain.source == "windows_counter" else "rapl:") + self.gpu_domain.name
         elif self.nvidia_energy_supported:
             gpu_src = "nvidia:energy"
         elif self.has_nvidia_smi:
@@ -204,6 +323,8 @@ def apply_freq_percent(control_script_path: str, percent: Optional[int]) -> str:
         return f"invalid:{percent}"
     if not os.path.exists(control_script_path):
         return "missing_script"
+    if os.name == "nt":
+        return "unsupported_on_windows"
 
     cmd = [control_script_path, "freq", str(percent)]
     if os.geteuid() != 0:

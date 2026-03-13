@@ -20,12 +20,21 @@ CFLAGS ?= -O2 -Wall -DCL_TARGET_OPENCL_VERSION=200 -I. -I../lz4_gpu -I../lib $(O
 LDFLAGS ?= $(OPENCL_LDFLAGS) -lm $(PTHREAD_LIB)
 endif
 
-all: lz4_hybrid
+GPU_DIR = ../lz4_gpu
+
+all: sync-kernels lz4_hybrid
 
 lz4_hybrid: lz4_hybrid.c ../lz4_gpu/lz4_gpu_core.c ../lz4_gpu/lz4_gpu_utils.c ../lib/lz4.c
 	$(CC) $(CFLAGS) -o $@$(EXEEXT) $^ $(LDFLAGS)
 
+sync-kernels:
+	@for f in $(GPU_DIR)/*.cl $(GPU_DIR)/*.clbin; do \
+		bn=$$(basename "$$f"); \
+		if [ ! -e "$$bn" ]; then ln -sf "$$f" "$$bn" 2>/dev/null || cp -f "$$f" "$$bn"; fi; \
+	done
+
 clean:
 	rm -f lz4_hybrid lz4_hybrid.exe
+	rm -f *.cl *.clbin
 
-.PHONY: all clean
+.PHONY: all clean sync-kernels

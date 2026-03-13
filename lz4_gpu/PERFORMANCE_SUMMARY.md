@@ -1,10 +1,14 @@
 # LZ4 GPU 性能总结
 
-> 更新时间：2026-03-09  
-> 硬件平台：Intel Core + Intel Iris Xe Graphics（iGPU，共享内存）  
-> 当前基线结果：`/root/lz4/exp_results/runs/20260309_merged_full_83/lz4_param_sweep_merged.csv`  
-> 当前 hybrid 对照结果：`/root/lz4/exp_results/hybrid_bench/hybrid_bench_20260309_180949.csv`  
+> 更新时间：2026-03-13
+> 硬件平台：Intel Core + Intel Iris Xe Graphics（iGPU，共享内存）
+> 当前基线结果：`/root/lz4/exp_results/runs/20260309_merged_full_83/lz4_param_sweep_merged.csv`
+> 当前 hybrid 对照结果：`/root/lz4/exp_results/hybrid_bench/hybrid_bench_20260309_180949.csv`
 > 测试文件集：83 个真实文件（/root/samples）
+
+## Intel 平台（保留原文）
+
+以下现有内容保持不删改，作为 Intel Core + Iris Xe 平台的历史总结与基线说明。Windows + NVIDIA 的新结果补充在文末单独章节。
 
 ---
 
@@ -497,20 +501,20 @@ LZ4 GPU 目前的能效结论不能再写成极端口号式的“GPU 绝对最�
 
 ### 7.1 LZ4_count 4x 循环展开 ❌
 
-**尝试**：将 `LZ4_count` 中的 64-bit 比较循环展开为 4 路并行。  
-**结果**：~20% 性能回退。  
+**尝试**：将 `LZ4_count` 中的 64-bit 比较循环展开为 4 路并行。
+**结果**：~20% 性能回退。
 **原因**：Intel Xe GPU 编译器已对简单循环进行了高效的自动展开和向量化，手动展开破坏了编译器的优化策略。
 
 ### 7.2 搜索循环手动内联 ❌
 
-**尝试**：将压缩主循环中的搜索逻辑手动内联展开。  
-**结果**：15-59% 性能回退。  
+**尝试**：将压缩主循环中的搜索逻辑手动内联展开。
+**结果**：15-59% 性能回退。
 **原因**：增加了寄存器压力，导致 EU 利用率下降。Intel Xe 编译器在函数边界处能更好地管理寄存器分配。
 
 ### 7.3 Post-match 哈希手动内联 ❌
 
-**尝试**：将匹配后的哈希表更新操作手动内联。  
-**结果**：同样的回退模式。  
+**尝试**：将匹配后的哈希表更新操作手动内联。
+**结果**：同样的回退模式。
 **原因**：与 7.2 相同——编译器优化优于手动微操。
 
 ### 关键教训
@@ -523,10 +527,10 @@ LZ4 GPU 目前的能效结论不能再写成极端口号式的“GPU 绝对最�
 
 ### 8.1 当前结论
 
-1. **LZ4 GPU 的系统架构已经稳定**：daemon/client、workspace、buffer 复用、zero-copy 风格传输、内核调度逻辑都已成型。  
-2. **HashLog=14 仍是当前最优折中点**：HL=13 的压缩率灾难性退化结论仍然成立，因此不能作为当前推荐配置。  
-3. **当前 corrected baseline 已经明确证明 GPU 是主导吞吐引擎**：压缩 total 2.14x 于 CPU，解压 total 1.44x 于 CPU。  
-4. **功率结论已经被修正**：GPU 并不是靠更高功耗换取性能，而是在略低于 CPU 的 active power 下提供更高 steady-state total throughput。  
+1. **LZ4 GPU 的系统架构已经稳定**：daemon/client、workspace、buffer 复用、zero-copy 风格传输、内核调度逻辑都已成型。
+2. **HashLog=14 仍是当前最优折中点**：HL=13 的压缩率灾难性退化结论仍然成立，因此不能作为当前推荐配置。
+3. **当前 corrected baseline 已经明确证明 GPU 是主导吞吐引擎**：压缩 total 2.14x 于 CPU，解压 total 1.44x 于 CPU。
+4. **功率结论已经被修正**：GPU 并不是靠更高功耗换取性能，而是在略低于 CPU 的 active power 下提供更高 steady-state total throughput。
 5. **LZ4 GPU 现在应作为整个项目的正式主路径之一来写**：不再是实验性附属分支，也不应再被旧 total semantics 的结论压制。
 
 ### 8.2 展望
@@ -541,6 +545,101 @@ LZ4 GPU 目前的能效结论不能再写成极端口号式的“GPU 绝对最�
 简言之：
 
 > 当前 `lz4_gpu` 已经是一条经过架构重构、实现收敛、方法学校正和全量基线验证后的成熟结果路径。
+
+## Nvidia 平台（Windows + GeForce RTX 4070 Ti 系列，按 full 结果重写）
+
+正式工件（仅 full-corpus）：
+
+- CPU baseline：`exp_results/formal_full_lz4_cpu_baseline_t123468_energy/runs/20260311_161022/`
+- GPU pre-mod（unmodified）：`exp_results/formal_full_lz4_gpu_baseline_unmodified_energy/runs/20260312_022337/`
+- GPU post-mod（final r2）：`exp_results/formal_full_lz4_gpu_final_energy_r2/runs/20260313_015429/`
+
+### 1) Nvidia dGPU 与 Intel iGPU 的关键差异
+
+| 维度 | Intel Iris Xe（iGPU） | Nvidia RTX 4070 Ti（dGPU） | 对 LZ4 GPU 的直接影响 |
+| --- | --- | --- | --- |
+| 内存拓扑 | CPU/GPU 共享内存 | 显存 + 主机内存分离 | dGPU 更依赖传输路径选择与读回字节量 |
+| 传输成本 | map/unmap 近似“零拷贝” | 显式 H2D/D2H 成本显著 | total throughput 更容易被 host/runtime 限制 |
+| 计算能力 | 中等并行 | 高并行、高带宽 | kernel 吞吐上限更高，但不自动转化为 total 增益 |
+| 功耗形态 | 包级功耗耦合 | 板卡功耗独立可观测 | 能效分析必须区分 CPU 与 GPU 贡献 |
+
+结论：在 Nvidia dGPU 上，`lz4_gpu` 的优化重点必须从“只追 kernel”转向“kernel + 传输 + 组装”的系统协同优化。
+
+### 2) Nvidia 路径下的压缩/解压设计
+
+```mermaid
+flowchart LR
+  A[Input Blocks] --> B[GPU Compress Kernel]
+  B --> C{Device-side Compaction?}
+  C -->|Yes| D[Pack Kernel: payload+offsets]
+  C -->|No| E[Fixed Slots]
+  D --> F[Host Readback]
+  E --> F
+  F --> G[Container Assembly]
+  G --> H[Decode Path]
+  H --> I[GPU Decompress Kernel]
+```
+
+设计要点：
+
+- dGPU 默认采用 device-aware 的显式读写路径，避免在不统一内存设备上误用 map/unmap；
+- 压缩端可选 `pack kernel` 做设备侧压缩块整理（减少无效字节回传）；
+- 解压端保持稳定路径，重点保证跨配置兼容和 roundtrip 正确性。
+
+### 3) Nvidia 侧保留优化（动机 / 原理 / 实现）
+
+1. **host-aware copy path**
+   - 动机：dGPU 下主机-设备传输是硬瓶颈之一；
+   - 原理：按 `CL_DEVICE_HOST_UNIFIED_MEMORY` 选择显式 read/write 或 map/unmap；
+   - 实现：`lz4_gpu_core.c` 的写入/读回分支逻辑。
+
+2. **Windows 工程鲁棒性修复**
+   - 动机：旧 `.clbin` 与路径优先级问题会污染 benchmark；
+   - 原理：缺核自动回退源码编译 + 路径优先命中新版本目录；
+   - 实现：kernel 加载回退链与 `lz4_find_file_path()` 搜索次序修订。
+
+3. **device-side compaction（可控开启）**
+   - 动机：减少压缩后回传的冗余槽位字节；
+   - 原理：GPU 侧 pack 出 `payload + offsets`，主机按 offset 组装容器；
+   - 实现：`lz4_gpu.cl:lz4_pack_blocks` + `lz4_gpu_core.{c,h}` 新增 packed buffer 管线；
+   - 策略：保留能力但不强制默认，继续由阈值/环境变量控制。
+
+### 4) Full 结果分析（CPU baseline / pre-mod / post-mod）
+
+#### 4.1 代表配置与统计口径
+
+- CPU baseline 代表：`FP=1;BS=64K;T=3`
+- GPU pre-mod 代表：`FP=1;BS=16K;HL=14;LSZ=1;ACC=4`
+- GPU post-mod 代表：`FP=1;BS=16K;HL=14;LSZ=1;ACC=2`
+- 统计字段：均值 + 中位数（均来自 config summary）
+
+| 组别 | Ratio mean / median % | Comp kernel mean / median | Dec kernel mean / median | Comp total mean / median | Dec total mean / median |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CPU baseline | 26.4609 / 22.3810 | 12323.4841 / 5928.4400 | 19047.2108 / 17515.7000 | 956.6926 / 982.4543 | 562.1856 / 546.6486 |
+| GPU pre-mod | 29.6017 / 25.1700 | 14225.8577 / 11168.6500 | 28819.7517 / 21439.0000 | 458.0045 / 408.0700 | 461.8555 / 425.3900 |
+| GPU post-mod r2 | 28.7164 / 24.7500 | 12253.4641 / 9501.3800 | 27355.3027 / 20431.1300 | 414.0812 / 351.0000 | 435.6943 / 375.1300 |
+
+#### 4.2 pre-mod → post-mod 的变化
+
+- Ratio：`29.6017 → 28.7164`（-0.8853pp，略有改善）
+- Comp total mean：`458.0045 → 414.0812`（约 -9.6%）
+- Dec total mean：`461.8555 → 435.6943`（约 -5.7%）
+- 中位数同向下降（Comp -14.0%，Dec -11.8%）
+
+#### 4.3 模式与例外解释
+
+1. **Nvidia dGPU 下 kernel 与 total 的“剪刀差”依旧明显**：kernel 很高，但 total 主要受 runtime/传输与文件路径约束；
+2. **post-mod 未在 r2 上体现 total 侧净增益**：说明当前 compaction/调度阈值与 workload 分布仍有不匹配区间；
+3. **例外点**：Ratio 有小幅改善，表明压缩质量并未恶化，退化更可能来自系统开销侧而非编码质量侧。
+
+### 5) 局限、结论与下一步
+
+- 局限：当前章节对比采用“代表配置”而非“每文件最优包络”；适合版本对比，不等于全局最优上界。
+- 结论：在当前 Windows + Nvidia full-r2 工件上，`lz4_gpu` 仍是稳定可用后端，但 post-mod 尚未恢复到 pre-mod 的 total 吞吐水平。
+- 下一步：
+  1. 细化 compaction 启用阈值（按块压缩率分段）；
+  2. 继续压缩读回/组装路径的同步与元数据开销；
+  3. 用统一配置矩阵做一次 matched rerun（pre-mod 与 post-mod 同参）确认真实净效应。
 
 ## 9. 2026-03-09 定向优化快照
 

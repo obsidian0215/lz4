@@ -19,13 +19,18 @@ if str(SCRIPT_DIR) not in sys.path:
 from hw_telemetry import TelemetryProbe, apply_freq_percent
 
 
-LZ4_HYBRID_BIN = "/root/lz4/lz4_hybrid/lz4_hybrid"
-DEFAULT_SAMPLES_DIR = "/root/samples_subset"
-OUT_DIR = "/root/lz4/exp_results/hybrid_bench"
+IS_WINDOWS = os.name == "nt"
+EXEEXT = ".exe" if IS_WINDOWS else ""
+REPO_ROOT = SCRIPT_DIR.parent
+LZ4_HYBRID_BIN = os.environ.get("LZ4_HYBRID_BIN", str(REPO_ROOT / "lz4_hybrid" / f"lz4_hybrid{EXEEXT}"))
+DEFAULT_SAMPLES_DIR = os.environ.get("LZ4_SAMPLES_DIR", str(REPO_ROOT / "samples_subset"))
+OUT_DIR = os.environ.get("LZ4_HYBRID_RESULTS_DIR", str(REPO_ROOT / "exp_results" / "hybrid_bench"))
+CPU_CONTROL_SCRIPT = str(REPO_ROOT / "tools" / "cpu_control.sh")
+GPU_CONTROL_SCRIPT = str(REPO_ROOT / "tools" / "gpu_control.sh")
 
 BLOCK_SIZES = ["16K", "32K", "64K"]
 HASH_LOG = 14
-LOCAL_SIZE = 1
+LOCAL_SIZES = [1]
 BENCH_SECONDS = 3
 
 GPU_RATIOS = [0.0, 0.3, 0.5, 0.7, 0.9, 1.0]
@@ -89,6 +94,27 @@ def file_matches_hash(path, expected_hash):
         return False
     return compute_sha256(path) == expected_hash
 
+
+def resolve_single_sample(single_file, samples_root, discovered_samples):
+    if not single_file:
+        return discovered_samples
+
+    cand = Path(single_file)
+    if cand.is_file():
+        return [cand]
+
+    root_cand = Path(samples_root) / single_file
+    if root_cand.is_file():
+        return [root_cand]
+
+    by_name = [p for p in discovered_samples if p.name == single_file]
+    if len(by_name) == 1:
+        return by_name
+    if len(by_name) > 1:
+        raise SystemExit(f"--single-file matched multiple files named '{single_file}', please provide full path")
+
+    raise SystemExit(f"--single-file not found: {single_file}")
+
 COMP_RE = re.compile(
     r"Bench\s+Compress\s*:\s*kernel_tp=([0-9]+(?:\.[0-9]+)?)\s*MB/s\s+"
     r"total_tp=([0-9]+(?:\.[0-9]+)?)\s*MB/s\s+ratio=([0-9]+(?:\.[0-9]+)?)%",
@@ -101,8 +127,8 @@ DEC_RE = re.compile(
 )
 
 
-def run_command_with_telemetry(cmd, telemetry, sample_interval_s=0.05):
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+def run_command_with_telemetry(cmd, telemetry, cwd=None, sample_interval_s=0.05):
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd)
     samples = []
     start_snap = telemetry.snapshot()
     samples.append(start_snap)
@@ -152,19 +178,56 @@ def parse_output(stdout_text):
     }
 
 
+def run_control_action(control_script_path, action):
+    if not os.path.exists(control_script_path):
+        return "missing_script"
+    if IS_WINDOWS:
+        return "unsupported_on_windows"
+    try:
+        cmd = [control_script_path, action]
+        if os.geteuid() != 0:
+            cmd = ["sudo", "-n"] + cmd
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if res.returncode == 0:
+            return "ok"
+        msg = ((res.stderr or "") + "\n" + (res.stdout or "")).strip().splitlines()
+        short = msg[0][:80] if msg else ""
+        return f"failed:{res.returncode}:{short}"
+    except Exception as exc:
+        return f"error:{type(exc).__name__}"
+
+
 def mean_or_zero(values):
     vals = [float(v) for v in values if v is not None]
     return float(statistics.fmean(vals)) if vals else 0.0
 
 
+def resolve_samples_root(samples_arg):
+    root = Path(samples_arg)
+    if not root.exists():
+        raise SystemExit(f"Samples directory not found: {samples_arg}")
+
+    direct_files = sorted([p for p in root.iterdir() if p.is_file()])
+    if direct_files:
+        return root, direct_files
+
+    child_dirs = sorted([p for p in root.iterdir() if p.is_dir()])
+    if len(child_dirs) == 1:
+        nested_files = sorted([p for p in child_dirs[0].iterdir() if p.is_file()])
+        if nested_files:
+            return child_dirs[0], nested_files
+
+    return root, direct_files
+
+
 def print_summary(all_rows):
     grouped = defaultdict(list)
     for row in all_rows:
-        key = (row["BlockSize"], row["SplitMode"], row["GPURatio"], row["CPUThreads"], row["Acceleration"])
+        key = (row["BlockSize"], row["SplitMode"], row["GPURatio"], row["CPUThreads"], row["Acceleration"], row["LocalSize"])
         grouped[key].append(row)
 
     print("\n=== Mean kernel throughput/ratio per config (across all files) ===")
-    print("BlockSize Mode GPURatio CPUThreads Accel MeanCompKernel(MB/s) MeanDecKernel(MB/s) MeanRatio(%)  N")
+    print("BlockSize Mode GPURatio CPUThreads Accel Local MeanCompKernel(MB/s) MeanDecKernel(MB/s) MeanRatio(%)  N")
 
     summary_rows = []
     for key in sorted(grouped.keys()):
@@ -183,24 +246,24 @@ def print_summary(all_rows):
             "mean_ratio": mean_ratio,
             "n": len(rows),
         })
-        block_size, mode, gr, t, a = key
-        print(f"{block_size:>8s} {mode:>8s} {gr:>7.1f} {t:>10d} {a:>5d} {mean_comp:>20.2f} {mean_dec:>19.2f} {mean_ratio:>11.2f} {len(rows):>3d}")
+        block_size, mode, gr, t, a, lsz = key
+        print(f"{block_size:>8s} {mode:>8s} {gr:>7.1f} {t:>10d} {a:>5d} {lsz:>5d} {mean_comp:>20.2f} {mean_dec:>19.2f} {mean_ratio:>11.2f} {len(rows):>3d}")
 
     valid = [s for s in summary_rows if s["n"] > 0]
     best_comp = max(valid, key=lambda x: x["mean_comp_total"])
     best_dec = max(valid, key=lambda x: x["mean_dec_total"])
 
     print("\n=== Best configs ===")
-    bbs, bm, bgr, bt, ba = best_comp["key"]
-    dbs, dm, dgr, dt, da = best_dec["key"]
+    bbs, bm, bgr, bt, ba, bl = best_comp["key"]
+    dbs, dm, dgr, dt, da, dl = best_dec["key"]
     print(
         "Best compression: "
-            f"block={bbs}, mode={bm}, gpu_ratio={bgr:.1f}, T={bt}, a={ba}, "
+            f"block={bbs}, mode={bm}, gpu_ratio={bgr:.1f}, T={bt}, a={ba}, l={bl}, "
         f"mean_comp_total={best_comp['mean_comp_total']:.2f} MB/s"
     )
     print(
         "Best decompression: "
-            f"block={dbs}, mode={dm}, gpu_ratio={dgr:.1f}, T={dt}, a={da}, "
+            f"block={dbs}, mode={dm}, gpu_ratio={dgr:.1f}, T={dt}, a={da}, l={dl}, "
         f"mean_dec_total={best_dec['mean_dec_total']:.2f} MB/s"
     )
 
@@ -213,9 +276,9 @@ def print_summary(all_rows):
     best_hybrid = max(hybrids, key=lambda x: x["mean_comp_total"], default=None)
 
     def fmt_cfg(s):
-        block_size, mode, gr, t, a = s["key"]
+        block_size, mode, gr, t, a, lsz = s["key"]
         return (
-            f"block={block_size}, mode={mode}, gpu_ratio={gr:.1f}, T={t}, a={a}, "
+            f"block={block_size}, mode={mode}, gpu_ratio={gr:.1f}, T={t}, a={a}, l={lsz}, "
             f"comp_total={s['mean_comp_total']:.2f} MB/s, dec_total={s['mean_dec_total']:.2f} MB/s, ratio={s['mean_ratio']:.2f}%"
         )
 
@@ -245,36 +308,45 @@ def main():
     parser.add_argument("--gpu-ratios", default=','.join(str(x) for x in GPU_RATIOS), help="Comma-separated GPU ratios")
     parser.add_argument("--cpu-threads", default=','.join(str(x) for x in CPU_THREADS), help="Comma-separated CPU thread counts")
     parser.add_argument("--accels", default=','.join(str(x) for x in ACCELS), help="Comma-separated acceleration values")
+    parser.add_argument("--local-sizes", default=','.join(str(x) for x in LOCAL_SIZES), help="Comma-separated local work-group sizes")
+    parser.add_argument("--single-file", default="", help="Only benchmark one file (path or basename under samples dir)")
+    parser.add_argument("--out-dir", default=OUT_DIR, help="Directory for CSV outputs")
     args = parser.parse_args()
 
     if not (os.path.isfile(LZ4_HYBRID_BIN) and os.access(LZ4_HYBRID_BIN, os.X_OK)):
         raise SystemExit(f"Missing or non-executable binary: {LZ4_HYBRID_BIN}")
 
-    samples_dir = Path(args.samples)
-    samples = sorted([p for p in samples_dir.iterdir() if p.is_file()])
+    samples_dir, samples = resolve_samples_root(args.samples)
     if not samples:
         raise SystemExit(f"No sample files found in {samples_dir}")
+
+    if args.single_file:
+        samples = resolve_single_sample(args.single_file, str(samples_dir), samples)
 
     block_sizes = parse_str_list(args.block_sizes, BLOCK_SIZES)
     split_modes = parse_str_list(args.split_modes, SPLIT_MODES)
     gpu_ratios = parse_float_list(args.gpu_ratios, GPU_RATIOS)
     cpu_threads = parse_int_list(args.cpu_threads, CPU_THREADS)
     accels = parse_int_list(args.accels, ACCELS)
+    local_sizes = parse_int_list(args.local_sizes, LOCAL_SIZES)
 
-    configs = list(itertools.product(block_sizes, split_modes, gpu_ratios, cpu_threads, accels))
+    configs = list(itertools.product(block_sizes, split_modes, gpu_ratios, cpu_threads, accels, local_sizes))
     expected_rows = len(samples) * len(configs)
 
-    Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
-    csv_path = Path(OUT_DIR) / f"hybrid_bench_{ts}.csv"
-    latest_csv_path = Path(OUT_DIR) / "hybrid_bench_latest.csv"
+    csv_path = out_dir / f"hybrid_bench_{ts}.csv"
+    latest_csv_path = out_dir / "hybrid_bench_latest.csv"
 
     telemetry = TelemetryProbe()
     print(f"Telemetry sources: {telemetry.describe_sources()}")
 
-    cpu_apply = apply_freq_percent("/root/lz4/tools/cpu_control.sh", 100)
-    gpu_apply = apply_freq_percent("/root/lz4/tools/gpu_control.sh", 100)
+    cpu_apply = apply_freq_percent(CPU_CONTROL_SCRIPT, 100)
+    gpu_apply = apply_freq_percent(GPU_CONTROL_SCRIPT, 100)
     print(f"Frequency apply: CPU={cpu_apply}, GPU={gpu_apply}")
+
+    hybrid_cwd = str(Path(LZ4_HYBRID_BIN).resolve().parent)
 
     csv_columns = [
         "File",
@@ -283,6 +355,7 @@ def main():
         "GPURatio",
         "CPUThreads",
         "Acceleration",
+        "LocalSize",
         "CompKernelTP_MBs",
         "CompTotalTP_MBs",
         "DecKernelTP_MBs",
@@ -314,7 +387,7 @@ def main():
                 if sample_key not in hash_cache:
                     hash_cache[sample_key] = compute_sha256(sample_key)
                 orig_hash = hash_cache[sample_key]
-                for block_size, split_mode, gpu_ratio, threads, accel in configs:
+                for block_size, split_mode, gpu_ratio, threads, accel, local_size in configs:
                     done += 1
                     bench_cmd = [
                         LZ4_HYBRID_BIN,
@@ -322,7 +395,7 @@ def main():
                         "--bench-io",
                         "-b", block_size,
                         "-H", str(HASH_LOG),
-                        "-l", str(LOCAL_SIZE),
+                        "-l", str(local_size),
                         "-a", str(accel),
                         "-T", str(threads),
                         "--gpu-ratio", str(gpu_ratio),
@@ -331,7 +404,7 @@ def main():
                     if split_mode == "adaptive":
                         bench_cmd[1:1] = ["--adaptive", "--sample-blocks", "8"]
 
-                    res, tel_delta = run_command_with_telemetry(bench_cmd, telemetry)
+                    res, tel_delta = run_command_with_telemetry(bench_cmd, telemetry, cwd=hybrid_cwd)
                     merged_output = (res.stdout or "") + "\n" + (res.stderr or "")
                     parsed = parse_output(merged_output)
 
@@ -359,6 +432,7 @@ def main():
                         "GPURatio": f"{gpu_ratio:.1f}",
                         "CPUThreads": threads,
                         "Acceleration": accel,
+                        "LocalSize": local_size,
                         "CompKernelTP_MBs": "",
                         "CompTotalTP_MBs": "",
                         "DecKernelTP_MBs": "",
@@ -392,6 +466,7 @@ def main():
                         "GPURatio": gpu_ratio,
                         "CPUThreads": threads,
                         "Acceleration": accel,
+                        "LocalSize": local_size,
                         "CompKernelTP_MBs": float(row["CompKernelTP_MBs"]) if row["CompKernelTP_MBs"] else None,
                         "CompTotalTP_MBs": float(row["CompTotalTP_MBs"]) if row["CompTotalTP_MBs"] else None,
                         "DecKernelTP_MBs": float(row["DecKernelTP_MBs"]) if row["DecKernelTP_MBs"] else None,
@@ -413,9 +488,9 @@ def main():
         print_summary(all_rows)
 
     finally:
-        subprocess.run(["/root/lz4/tools/cpu_control.sh", "reset"], capture_output=True, text=True, check=False)
-        subprocess.run(["/root/lz4/tools/gpu_control.sh", "reset"], capture_output=True, text=True, check=False)
-        print("Frequency reset: CPU/GPU scripts invoked with 'reset'.")
+        cpu_reset = run_control_action(CPU_CONTROL_SCRIPT, "reset")
+        gpu_reset = run_control_action(GPU_CONTROL_SCRIPT, "reset")
+        print(f"Frequency reset: CPU={cpu_reset}; GPU={gpu_reset}.")
 
 
 if __name__ == "__main__":

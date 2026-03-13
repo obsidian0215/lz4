@@ -18,6 +18,7 @@
 #include "../lib/lz4.h"
 
 #define HYBRID_MAGIC 0x184D2205U
+#define HYBRID_GPU_BLOCKS_STRIPED_FLAG 0x80000000U
 
 typedef struct {
     size_t block_size;
@@ -44,6 +45,7 @@ typedef struct {
     cl_device_id dev;
     cl_program prog;
     cl_kernel kcomp;
+    cl_kernel kpack;
     cl_kernel kdec;
     lz4_gpu_workspace_t ws;
 } ocl_env_t;
@@ -52,7 +54,7 @@ typedef struct {
     const unsigned char* src;
     size_t src_size;
     size_t block_size;
-    size_t global_start_block;
+    const size_t* block_indices;
     size_t num_blocks;
     int num_threads;
     int acceleration;
@@ -70,7 +72,7 @@ typedef struct {
     const uint32_t* comp_sizes;
     const uint32_t* comp_offsets;
     size_t block_size;
-    size_t global_start_block;
+    const size_t* block_indices;
     size_t num_blocks;
     int num_threads;
 
@@ -118,6 +120,7 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
                                int local_size,
                                int hash_log,
                                uint32_t** out_sizes,
+                               uint32_t** out_offsets,
                                unsigned char** out_slots,
                                size_t* out_slot_size,
                                uint64_t* kernel_us);
@@ -181,21 +184,104 @@ static size_t block_input_size(size_t total_size, size_t block_size, size_t bloc
     }
 }
 
-static size_t blocks_span_size(size_t total_size, size_t block_size, size_t start_block, size_t count) {
-    if (count == 0) return 0;
-    {
-        const size_t first = start_block * block_size;
-        const size_t last_block = start_block + count - 1;
-        const size_t last_end = last_block * block_size + block_input_size(total_size, block_size, last_block);
-        if (last_end <= first) return 0;
-        return last_end - first;
-    }
-}
-
 static size_t sampled_block_index(size_t sample_pos, size_t sample_count, size_t num_blocks) {
     if (num_blocks == 0) return 0;
     if (sample_count <= 1 || num_blocks <= 1) return 0;
     return (sample_pos * (num_blocks - 1)) / (sample_count - 1);
+}
+
+static void move_last_block_to_end(size_t* indices, size_t count, size_t num_blocks) {
+    size_t last_block;
+    if (!indices || count == 0 || num_blocks == 0) return;
+    last_block = num_blocks - 1;
+    if (indices[count - 1] == last_block) return;
+    for (size_t i = 0; i < count; ++i) {
+        if (indices[i] == last_block) {
+            const size_t tmp = indices[count - 1];
+            indices[count - 1] = indices[i];
+            indices[i] = tmp;
+            return;
+        }
+    }
+}
+
+static int partition_blocks_prefix(size_t num_blocks,
+                                   size_t gpu_blocks,
+                                   size_t** gpu_indices,
+                                   size_t* gpu_count,
+                                   size_t** cpu_indices,
+                                   size_t* cpu_count) {
+    size_t* gpu = NULL;
+    size_t* cpu = NULL;
+    size_t cpu_blocks;
+
+    if (!gpu_indices || !gpu_count || !cpu_indices || !cpu_count) return -1;
+    if (gpu_blocks > num_blocks) gpu_blocks = num_blocks;
+    cpu_blocks = num_blocks - gpu_blocks;
+
+    if (gpu_blocks > 0) {
+        gpu = (size_t*)malloc(gpu_blocks * sizeof(size_t));
+        if (!gpu) return -1;
+        for (size_t i = 0; i < gpu_blocks; ++i) gpu[i] = i;
+    }
+    if (cpu_blocks > 0) {
+        cpu = (size_t*)malloc(cpu_blocks * sizeof(size_t));
+        if (!cpu) {
+            free(gpu);
+            return -1;
+        }
+        for (size_t i = 0; i < cpu_blocks; ++i) cpu[i] = gpu_blocks + i;
+    }
+
+    *gpu_indices = gpu;
+    *gpu_count = gpu_blocks;
+    *cpu_indices = cpu;
+    *cpu_count = cpu_blocks;
+    return 0;
+}
+
+static int partition_blocks_distributed(size_t num_blocks,
+                                        size_t gpu_blocks,
+                                        size_t** gpu_indices,
+                                        size_t* gpu_count,
+                                        size_t** cpu_indices,
+                                        size_t* cpu_count) {
+    size_t* gpu = NULL;
+    size_t* cpu = NULL;
+    size_t gpu_written = 0;
+    size_t cpu_written = 0;
+
+    if (!gpu_indices || !gpu_count || !cpu_indices || !cpu_count) return -1;
+    if (gpu_blocks > num_blocks) gpu_blocks = num_blocks;
+
+    if (gpu_blocks > 0) {
+        gpu = (size_t*)malloc(gpu_blocks * sizeof(size_t));
+        if (!gpu) return -1;
+    }
+    if (num_blocks > gpu_blocks) {
+        cpu = (size_t*)malloc((num_blocks - gpu_blocks) * sizeof(size_t));
+        if (!cpu) {
+            free(gpu);
+            return -1;
+        }
+    }
+
+    for (size_t idx = 0; idx < num_blocks; ++idx) {
+        if ((((idx + 1) * gpu_blocks) / num_blocks) != ((idx * gpu_blocks) / num_blocks)) {
+            gpu[gpu_written++] = idx;
+        } else {
+            cpu[cpu_written++] = idx;
+        }
+    }
+
+    move_last_block_to_end(gpu, gpu_written, num_blocks);
+    move_last_block_to_end(cpu, cpu_written, num_blocks);
+
+    *gpu_indices = gpu;
+    *gpu_count = gpu_written;
+    *cpu_indices = cpu;
+    *cpu_count = cpu_written;
+    return 0;
 }
 
 static int collect_lz4_sample_stats(const unsigned char* input,
@@ -368,28 +454,55 @@ static int ocl_init(ocl_env_t* ocl, int hash_log) {
     lz4_gpu_workspace_init(&ocl->ws);
 
     err = clGetPlatformIDs(1, &pf, NULL);
-    if (err != CL_SUCCESS || pf == NULL) return -1;
+    if (err != CL_SUCCESS || pf == NULL) {
+        fprintf(stderr, "OpenCL init failed: clGetPlatformIDs err=%d\n", err);
+        return -1;
+    }
 
     err = clGetDeviceIDs(pf, pref_type, 1, &ocl->dev, NULL);
     if (err != CL_SUCCESS && pref_type != CL_DEVICE_TYPE_GPU) err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_GPU, 1, &ocl->dev, NULL);
     if (err != CL_SUCCESS && pref_type != CL_DEVICE_TYPE_DEFAULT) err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_DEFAULT, 1, &ocl->dev, NULL);
     if (err != CL_SUCCESS && pref_type != CL_DEVICE_TYPE_ALL) err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_ALL, 1, &ocl->dev, NULL);
-    if (err != CL_SUCCESS) return -1;
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "OpenCL init failed: clGetDeviceIDs err=%d\n", err);
+        return -1;
+    }
 
     ocl->ctx = clCreateContext(NULL, 1, &ocl->dev, NULL, NULL, &err);
-    if (err != CL_SUCCESS || !ocl->ctx) return -1;
+    if (err != CL_SUCCESS || !ocl->ctx) {
+        fprintf(stderr, "OpenCL init failed: clCreateContext err=%d\n", err);
+        return -1;
+    }
 
     ocl->queue = clCreateCommandQueue(ocl->ctx, ocl->dev, CL_QUEUE_PROFILING_ENABLE, &err);
-    if (err != CL_SUCCESS || !ocl->queue) return -1;
+    if (err != CL_SUCCESS || !ocl->queue) {
+        fprintf(stderr, "OpenCL init failed: clCreateCommandQueue err=%d\n", err);
+        return -1;
+    }
 
     ocl->prog = lz4_load_program(ocl->ctx, ocl->dev, hash_log);
-    if (!ocl->prog) return -1;
+    if (!ocl->prog) {
+        fprintf(stderr, "OpenCL init failed: lz4_load_program returned NULL\n");
+        return -1;
+    }
 
     ocl->kcomp = clCreateKernel(ocl->prog, "lz4_compress_block", &err);
-    if (err != CL_SUCCESS || !ocl->kcomp) return -1;
+    if (err != CL_SUCCESS || !ocl->kcomp) {
+        fprintf(stderr, "OpenCL init failed: create kernel lz4_compress_block err=%d\n", err);
+        return -1;
+    }
+
+    ocl->kpack = clCreateKernel(ocl->prog, "lz4_pack_blocks", &err);
+    if (err != CL_SUCCESS || !ocl->kpack) {
+        fprintf(stderr, "OpenCL init failed: create kernel lz4_pack_blocks err=%d\n", err);
+        return -1;
+    }
 
     ocl->kdec = clCreateKernel(ocl->prog, "lz4_decompress_blocks", &err);
-    if (err != CL_SUCCESS || !ocl->kdec) return -1;
+    if (err != CL_SUCCESS || !ocl->kdec) {
+        fprintf(stderr, "OpenCL init failed: create kernel lz4_decompress_blocks err=%d\n", err);
+        return -1;
+    }
 
     return 0;
 }
@@ -398,6 +511,7 @@ static void ocl_free(ocl_env_t* ocl) {
     if (!ocl) return;
     lz4_gpu_workspace_free(&ocl->ws);
     if (ocl->kdec) clReleaseKernel(ocl->kdec);
+    if (ocl->kpack) clReleaseKernel(ocl->kpack);
     if (ocl->kcomp) clReleaseKernel(ocl->kcomp);
     if (ocl->prog) clReleaseProgram(ocl->prog);
     if (ocl->queue) clReleaseCommandQueue(ocl->queue);
@@ -437,6 +551,42 @@ static size_t parse_wi_per_cu_env(const char* primary_env, const char* fallback_
     parsed = strtoul(env, &end, 10);
     if (end != env && parsed > 0) return (size_t)parsed;
     return defv;
+}
+
+static int lz4_env_flag_value(const char* name, int* is_set) {
+    const char* env = getenv(name);
+    if (is_set) *is_set = 0;
+    if (!env || !*env) return 0;
+    if (is_set) *is_set = 1;
+    if (strcmp(env, "1") == 0 || strcasecmp(env, "true") == 0 || strcasecmp(env, "yes") == 0 || strcasecmp(env, "on") == 0) return 1;
+    if (strcmp(env, "0") == 0 || strcasecmp(env, "false") == 0 || strcasecmp(env, "no") == 0 || strcasecmp(env, "off") == 0) return 0;
+    return atoi(env) != 0;
+}
+
+static unsigned lz4_env_unsigned_value(const char* name, unsigned defv) {
+    const char* env = getenv(name);
+    char* end = NULL;
+    unsigned long parsed;
+    if (!env || !*env) return defv;
+    parsed = strtoul(env, &end, 10);
+    if (end == env || *end != '\0' || parsed > UINT_MAX) return defv;
+    return (unsigned)parsed;
+}
+
+static int lz4_should_use_device_compaction(size_t packed_bytes, size_t sparse_bytes, size_t num_blocks, cl_kernel pack_kernel) {
+    int force_set = 0;
+    int force_value = lz4_env_flag_value("LZ4_GPU_FORCE_COMPACTION", &force_set);
+    if (!pack_kernel) return 0;
+    if (force_set) return force_value;
+    if (packed_bytes == 0 || sparse_bytes == 0 || packed_bytes >= sparse_bytes) return 0;
+    {
+        unsigned min_blocks = lz4_env_unsigned_value("LZ4_GPU_COMPACTION_MIN_BLOCKS", 8U);
+        unsigned min_gain_pct = lz4_env_unsigned_value("LZ4_GPU_COMPACTION_MIN_GAIN_PCT", 5U);
+        size_t saved_bytes;
+        if (num_blocks < (size_t)min_blocks) return 0;
+        saved_bytes = sparse_bytes - packed_bytes;
+        return saved_bytes * 100U >= sparse_bytes * (size_t)min_gain_pct;
+    }
 }
 
 static size_t choose_comp_worker_count(cl_command_queue queue, size_t num_blocks, size_t local_size) {
@@ -521,7 +671,7 @@ static void* cpu_comp_worker(void* argp) {
     cpu_comp_job_t* job = arg->job;
     const size_t n = job->num_blocks;
     for (size_t i = arg->thread_idx; i < n; i += arg->thread_count) {
-        const size_t g = job->global_start_block + i;
+        const size_t g = job->block_indices ? job->block_indices[i] : i;
         const size_t in_sz = block_input_size(job->src_size, job->block_size, g);
         const unsigned char* src_ptr = job->src + g * job->block_size;
         unsigned char* dst_ptr = job->out_slots + i * job->out_slot_size;
@@ -596,7 +746,7 @@ static void* cpu_decomp_worker(void* argp) {
     cpu_decomp_job_t* job = arg->job;
 
     for (size_t i = arg->thread_idx; i < job->num_blocks; i += arg->thread_count) {
-        const size_t g = job->global_start_block + i;
+        const size_t g = job->block_indices ? job->block_indices[i] : i;
         const int csz = (int)job->comp_sizes[i];
         unsigned char* dst_ptr = job->out_full + g * job->block_size;
         const unsigned char* src_ptr = job->comp_data + (size_t)job->comp_offsets[i];
@@ -665,14 +815,17 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
                                int local_size,
                                int hash_log,
                                uint32_t** out_sizes,
+                               uint32_t** out_offsets,
                                unsigned char** out_slots,
                                size_t* out_slot_size,
                                uint64_t* kernel_us) {
     cl_int err = CL_SUCCESS;
     uint32_t* h_block_info = NULL;
     uint32_t* h_out_offsets = NULL;
+    uint32_t* h_packed_offsets = NULL;
     uint32_t* h_sizes = NULL;
     unsigned char* h_out = NULL;
+    unsigned char* packed_out = NULL;
     size_t num_blocks;
     size_t single_block_max_out;
     size_t lsz;
@@ -685,8 +838,17 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
     size_t dict_entries_per_worker;
     size_t dict_bytes;
     size_t prev_dict_capacity;
+    size_t packed_total = 0;
+    size_t sparse_total = 0;
+    int use_device_compaction = 0;
 
-    if (!ocl || !src || src_size == 0 || block_size == 0 || !out_sizes || !out_slots || !out_slot_size || !kernel_us) return -1;
+    if (!ocl || !src || src_size == 0 || block_size == 0 || !out_sizes || !out_offsets || !out_slots || !out_slot_size || !kernel_us) return -1;
+
+    *out_sizes = NULL;
+    *out_offsets = NULL;
+    *out_slots = NULL;
+    *out_slot_size = 0;
+    *kernel_us = 0;
 
     num_blocks = (src_size + block_size - 1) / block_size;
     if (num_blocks == 0) return -1;
@@ -699,9 +861,9 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
 
     h_block_info = (uint32_t*)malloc(num_blocks * 2U * sizeof(uint32_t));
     h_out_offsets = (uint32_t*)malloc(num_blocks * sizeof(uint32_t));
+    h_packed_offsets = (uint32_t*)malloc(num_blocks * sizeof(uint32_t));
     h_sizes = (uint32_t*)malloc(num_blocks * sizeof(uint32_t));
-    h_out = (unsigned char*)malloc(num_blocks * single_block_max_out);
-    if (!h_block_info || !h_out_offsets || !h_sizes || !h_out) goto fail;
+    if (!h_block_info || !h_out_offsets || !h_packed_offsets || !h_sizes) goto fail;
 
     for (size_t i = 0; i < num_blocks; ++i) {
         const size_t start = i * block_size;
@@ -777,6 +939,8 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
 
     {
         const uint64_t t0 = get_us();
+    sparse_total = num_blocks * single_block_max_out;
+
         err = clEnqueueNDRangeKernel(ocl->queue, ocl->kcomp, 1, NULL, &gsz, &lsz, 0, NULL, NULL);
         if (err != CL_SUCCESS) goto fail;
         clFinish(ocl->queue);
@@ -795,37 +959,119 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
             if (err != CL_SUCCESS) goto fail;
         }
     }
-    {
-        void* mapped_out = clEnqueueMapBuffer(ocl->queue, ocl->ws.out_buf, CL_TRUE, CL_MAP_READ,
-                                              0, num_blocks * single_block_max_out, 0, NULL, NULL, &err);
-        if (err == CL_SUCCESS && mapped_out) {
-            memcpy(h_out, mapped_out, num_blocks * single_block_max_out);
-            clEnqueueUnmapMemObject(ocl->queue, ocl->ws.out_buf, mapped_out, 0, NULL, NULL);
-            clFinish(ocl->queue);
-        } else {
-            err = clEnqueueReadBuffer(ocl->queue, ocl->ws.out_buf, CL_TRUE, 0, num_blocks * single_block_max_out, h_out, 0, NULL, NULL);
+
+    for (size_t i = 0; i < num_blocks; ++i) {
+        if (h_sizes[i] == 0xFFFFFFFFU) goto fail;
+        h_packed_offsets[i] = (uint32_t)packed_total;
+        packed_total += (size_t)h_sizes[i];
+    }
+
+    use_device_compaction = lz4_should_use_device_compaction(packed_total, sparse_total, num_blocks, ocl->kpack);
+
+    if (packed_total > 0) {
+        packed_out = (unsigned char*)malloc(packed_total);
+        if (!packed_out) goto fail;
+    }
+
+    if (use_device_compaction) {
+        size_t pack_global;
+        uint32_t totalBlocks32 = (uint32_t)num_blocks;
+        ocl->ws.packed_offsets_buf = ensure_buffer(ocl->ctx,
+                                                   ocl->ws.packed_offsets_buf,
+                                                   num_blocks * sizeof(uint32_t),
+                                                   &ocl->ws.current_packed_offsets_capacity,
+                                                   &err);
+        if (err != CL_SUCCESS || !ocl->ws.packed_offsets_buf) goto fail;
+        ocl->ws.packed_out_buf = ensure_buffer(ocl->ctx,
+                                               ocl->ws.packed_out_buf,
+                                               packed_total,
+                                               &ocl->ws.current_packed_out_capacity,
+                                               &err);
+        if (packed_total > 0 && (err != CL_SUCCESS || !ocl->ws.packed_out_buf)) goto fail;
+        if (write_buffer_mapped(ocl->queue,
+                                ocl->ws.packed_offsets_buf,
+                                h_packed_offsets,
+                                num_blocks * sizeof(uint32_t)) != 0) {
+            goto fail;
+        }
+
+        err = CL_SUCCESS;
+        err |= clSetKernelArg(ocl->kpack, 0, sizeof(cl_mem), &ocl->ws.out_buf);
+        err |= clSetKernelArg(ocl->kpack, 1, sizeof(cl_mem), &ocl->ws.packed_out_buf);
+        err |= clSetKernelArg(ocl->kpack, 2, sizeof(cl_mem), &ocl->ws.out_offsets_buf);
+        err |= clSetKernelArg(ocl->kpack, 3, sizeof(cl_mem), &ocl->ws.packed_offsets_buf);
+        err |= clSetKernelArg(ocl->kpack, 4, sizeof(cl_mem), &ocl->ws.output_size_buf);
+        err |= clSetKernelArg(ocl->kpack, 5, sizeof(uint32_t), &totalBlocks32);
+        if (err != CL_SUCCESS) goto fail;
+
+        pack_global = round_up_size(num_blocks, lsz);
+        if (pack_global == 0) pack_global = lsz;
+        {
+            const uint64_t t0 = get_us();
+            err = clEnqueueNDRangeKernel(ocl->queue, ocl->kpack, 1, NULL, &pack_global, &lsz, 0, NULL, NULL);
             if (err != CL_SUCCESS) goto fail;
+            clFinish(ocl->queue);
+            *kernel_us += get_us() - t0;
+        }
+
+        if (packed_total > 0) {
+            void* mapped_packed = clEnqueueMapBuffer(ocl->queue, ocl->ws.packed_out_buf, CL_TRUE, CL_MAP_READ,
+                                                     0, packed_total, 0, NULL, NULL, &err);
+            if (err == CL_SUCCESS && mapped_packed) {
+                memcpy(packed_out, mapped_packed, packed_total);
+                clEnqueueUnmapMemObject(ocl->queue, ocl->ws.packed_out_buf, mapped_packed, 0, NULL, NULL);
+                clFinish(ocl->queue);
+            } else {
+                err = clEnqueueReadBuffer(ocl->queue, ocl->ws.packed_out_buf, CL_TRUE, 0, packed_total, packed_out, 0, NULL, NULL);
+                if (err != CL_SUCCESS) goto fail;
+            }
+        }
+    } else {
+        if (sparse_total > 0) {
+            h_out = (unsigned char*)malloc(sparse_total);
+            if (!h_out) goto fail;
+            {
+                void* mapped_out = clEnqueueMapBuffer(ocl->queue, ocl->ws.out_buf, CL_TRUE, CL_MAP_READ,
+                                                      0, sparse_total, 0, NULL, NULL, &err);
+                if (err == CL_SUCCESS && mapped_out) {
+                    memcpy(h_out, mapped_out, sparse_total);
+                    clEnqueueUnmapMemObject(ocl->queue, ocl->ws.out_buf, mapped_out, 0, NULL, NULL);
+                    clFinish(ocl->queue);
+                } else {
+                    err = clEnqueueReadBuffer(ocl->queue, ocl->ws.out_buf, CL_TRUE, 0, sparse_total, h_out, 0, NULL, NULL);
+                    if (err != CL_SUCCESS) goto fail;
+                }
+            }
+        }
+        for (size_t i = 0; i < num_blocks; ++i) {
+            memcpy(packed_out + h_packed_offsets[i], h_out + i * single_block_max_out, (size_t)h_sizes[i]);
         }
     }
 
     *out_sizes = h_sizes;
-    *out_slots = h_out;
-    *out_slot_size = single_block_max_out;
+    *out_offsets = h_packed_offsets;
+    *out_slots = packed_out;
+    *out_slot_size = packed_total;
 
     h_sizes = NULL;
-    h_out = NULL;
+    h_packed_offsets = NULL;
+    packed_out = NULL;
 
     free(h_block_info);
     free(h_out_offsets);
+    free(h_packed_offsets);
     free(h_sizes);
     free(h_out);
+    free(packed_out);
     return 0;
 
 fail:
     free(h_block_info);
     free(h_out_offsets);
+    free(h_packed_offsets);
     free(h_sizes);
     free(h_out);
+    free(packed_out);
     return -1;
 }
 
@@ -976,19 +1222,25 @@ static int hybrid_compress_memory(ocl_env_t* ocl,
     size_t num_blocks;
     size_t gpu_blocks;
     size_t cpu_blocks;
-    size_t cpu_start;
     size_t cpu_slot_size = 0;
     double effective_gpu_ratio;
     double sample_ratio_pct = 0.0;
     uint32_t* all_sizes = NULL;
     unsigned char* final_out = NULL;
     size_t final_sz = 0;
+    size_t* gpu_block_indices = NULL;
+    size_t* cpu_block_indices = NULL;
+    size_t* gpu_pos_by_block = NULL;
+    size_t* cpu_pos_by_block = NULL;
+    unsigned char* gpu_input = NULL;
+    size_t gpu_input_size = 0;
 
     cpu_comp_job_t cpu_job;
     pthread_t cpu_thread;
     int cpu_thread_started = 0;
 
     uint32_t* gpu_sizes = NULL;
+    uint32_t* gpu_offsets = NULL;
     unsigned char* gpu_slots = NULL;
     size_t gpu_slot_size = 0;
 
@@ -1008,8 +1260,14 @@ static int hybrid_compress_memory(ocl_env_t* ocl,
     }
     gpu_blocks = (size_t)((double)num_blocks * effective_gpu_ratio + 0.5);
     if (gpu_blocks > num_blocks) gpu_blocks = num_blocks;
-    cpu_blocks = num_blocks - gpu_blocks;
-    cpu_start = gpu_blocks;
+    if (partition_blocks_distributed(num_blocks,
+                                     gpu_blocks,
+                                     &gpu_block_indices,
+                                     &gpu_blocks,
+                                     &cpu_block_indices,
+                                     &cpu_blocks) != 0) {
+        goto fail;
+    }
 
     if (cfg->verbose && cfg->adaptive_split) {
         fprintf(stderr,
@@ -1033,7 +1291,7 @@ static int hybrid_compress_memory(ocl_env_t* ocl,
         cpu_job.src = input;
         cpu_job.src_size = input_size;
         cpu_job.block_size = cfg->block_size;
-        cpu_job.global_start_block = cpu_start;
+        cpu_job.block_indices = cpu_block_indices;
         cpu_job.num_blocks = cpu_blocks;
         cpu_job.num_threads = cfg->cpu_threads;
         cpu_job.acceleration = cfg->acceleration;
@@ -1052,15 +1310,26 @@ static int hybrid_compress_memory(ocl_env_t* ocl,
         }
 
         if (gpu_blocks > 0) {
-            const size_t gpu_input_size = blocks_span_size(input_size, cfg->block_size, 0, gpu_blocks);
+            gpu_input = (unsigned char*)calloc(gpu_blocks, cfg->block_size);
+            if (!gpu_input) goto fail;
+            gpu_input_size = gpu_blocks * cfg->block_size;
+            for (size_t i = 0; i < gpu_blocks; ++i) {
+                const size_t g = gpu_block_indices[i];
+                const size_t blk_sz = block_input_size(input_size, cfg->block_size, g);
+                memcpy(gpu_input + i * cfg->block_size, input + g * cfg->block_size, blk_sz);
+            }
+            if (gpu_block_indices[gpu_blocks - 1] == num_blocks - 1) {
+                gpu_input_size -= cfg->block_size - block_input_size(input_size, cfg->block_size, num_blocks - 1);
+            }
             if (gpu_compress_blocks(ocl,
-                                    input,
+                                    gpu_input,
                                     gpu_input_size,
                                     cfg->block_size,
                                     cfg->acceleration,
                                     cfg->local_size,
                                     cfg->hash_log,
                                     &gpu_sizes,
+                                    &gpu_offsets,
                                     &gpu_slots,
                                     &gpu_slot_size,
                                     m ? &m->gpu_kernel_us : &(uint64_t){0}) != 0) {
@@ -1081,8 +1350,18 @@ static int hybrid_compress_memory(ocl_env_t* ocl,
         }
     }
 
-    for (size_t i = 0; i < gpu_blocks; ++i) all_sizes[i] = gpu_sizes[i];
-    for (size_t i = 0; i < cpu_blocks; ++i) all_sizes[cpu_start + i] = cpu_job.out_sizes[i];
+    for (size_t i = 0; i < gpu_blocks; ++i) all_sizes[gpu_block_indices[i]] = gpu_sizes[i];
+    for (size_t i = 0; i < cpu_blocks; ++i) all_sizes[cpu_block_indices[i]] = cpu_job.out_sizes[i];
+
+    gpu_pos_by_block = (size_t*)malloc(num_blocks * sizeof(size_t));
+    cpu_pos_by_block = (size_t*)malloc(num_blocks * sizeof(size_t));
+    if (!gpu_pos_by_block || !cpu_pos_by_block) goto fail;
+    for (size_t i = 0; i < num_blocks; ++i) {
+        gpu_pos_by_block[i] = SIZE_MAX;
+        cpu_pos_by_block[i] = SIZE_MAX;
+    }
+    for (size_t i = 0; i < gpu_blocks; ++i) gpu_pos_by_block[gpu_block_indices[i]] = i;
+    for (size_t i = 0; i < cpu_blocks; ++i) cpu_pos_by_block[cpu_block_indices[i]] = i;
 
     final_sz = 16U + num_blocks * 4U;
     for (size_t i = 0; i < num_blocks; ++i) final_sz += (size_t)all_sizes[i];
@@ -1094,23 +1373,22 @@ static int hybrid_compress_memory(ocl_env_t* ocl,
         uint32_t magic = HYBRID_MAGIC;
         uint32_t nblk = (uint32_t)num_blocks;
         uint32_t bsz = (uint32_t)cfg->block_size;
-        uint32_t gblk = (uint32_t)gpu_blocks;
+        uint32_t gblk = (uint32_t)gpu_blocks | HYBRID_GPU_BLOCKS_STRIPED_FLAG;
         memcpy(p, &magic, 4); p += 4;
         memcpy(p, &nblk, 4); p += 4;
         memcpy(p, &bsz, 4); p += 4;
         memcpy(p, &gblk, 4); p += 4;
         memcpy(p, all_sizes, num_blocks * 4U); p += num_blocks * 4U;
 
-        if (gpu_blocks > 0) {
-            for (size_t i = 0; i < gpu_blocks; ++i) {
-                memcpy(p, gpu_slots + i * gpu_slot_size, (size_t)gpu_sizes[i]);
-                p += gpu_sizes[i];
-            }
-        }
-        if (cpu_blocks > 0) {
-            for (size_t i = 0; i < cpu_blocks; ++i) {
-                memcpy(p, cpu_job.out_slots + i * cpu_slot_size, (size_t)cpu_job.out_sizes[i]);
-                p += cpu_job.out_sizes[i];
+        for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
+            if (gpu_pos_by_block[block_idx] != SIZE_MAX) {
+                const size_t pos = gpu_pos_by_block[block_idx];
+                memcpy(p, gpu_slots + (size_t)gpu_offsets[pos], (size_t)gpu_sizes[pos]);
+                p += gpu_sizes[pos];
+            } else {
+                const size_t pos = cpu_pos_by_block[block_idx];
+                memcpy(p, cpu_job.out_slots + pos * cpu_slot_size, (size_t)cpu_job.out_sizes[pos]);
+                p += cpu_job.out_sizes[pos];
             }
         }
     }
@@ -1118,9 +1396,15 @@ static int hybrid_compress_memory(ocl_env_t* ocl,
     *out_buf = final_out;
     *out_size = final_sz;
     free(all_sizes);
+    free(gpu_pos_by_block);
+    free(cpu_pos_by_block);
+    free(gpu_block_indices);
+    free(cpu_block_indices);
+    free(gpu_input);
     free(cpu_job.out_slots);
     free(cpu_job.out_sizes);
     free(gpu_sizes);
+    free(gpu_offsets);
     free(gpu_slots);
     return 0;
 
@@ -1128,9 +1412,15 @@ fail:
     if (cpu_thread_started) pthread_join(cpu_thread, NULL);
     free(all_sizes);
     free(final_out);
+    free(gpu_pos_by_block);
+    free(cpu_pos_by_block);
+    free(gpu_block_indices);
+    free(cpu_block_indices);
+    free(gpu_input);
     free(cpu_job.out_slots);
     free(cpu_job.out_sizes);
     free(gpu_sizes);
+    free(gpu_offsets);
     free(gpu_slots);
     return -1;
 }
@@ -1144,13 +1434,20 @@ static int hybrid_decompress_memory(ocl_env_t* ocl,
                                     hybrid_metrics_t* m) {
     uint32_t magic, num_blocks_u32, block_size_u32, gpu_blocks_u32;
     size_t num_blocks, block_size, gpu_blocks, cpu_blocks;
+    int striped_gpu_layout = 0;
     const uint32_t* sizes = NULL;
     const unsigned char* data_ptr;
     size_t header_size;
-    size_t gpu_comp_size = 0;
+    size_t payload_size = 0;
+    uint32_t* global_offsets = NULL;
+    size_t* gpu_block_indices = NULL;
+    size_t* cpu_block_indices = NULL;
 
     unsigned char* out_full = NULL;
+    unsigned char* gpu_comp_data = NULL;
+    unsigned char* gpu_out_full = NULL;
     uint32_t* gpu_out_sizes = NULL;
+    uint32_t* gpu_comp_sizes = NULL;
     uint32_t* cpu_comp_sizes = NULL;
     uint32_t* cpu_comp_offsets = NULL;
     uint32_t* cpu_out_sizes = NULL;
@@ -1173,7 +1470,8 @@ static int hybrid_decompress_memory(ocl_env_t* ocl,
 
     num_blocks = (size_t)num_blocks_u32;
     block_size = (size_t)block_size_u32;
-    gpu_blocks = (size_t)gpu_blocks_u32;
+    striped_gpu_layout = (gpu_blocks_u32 & HYBRID_GPU_BLOCKS_STRIPED_FLAG) != 0;
+    gpu_blocks = (size_t)(gpu_blocks_u32 & ~HYBRID_GPU_BLOCKS_STRIPED_FLAG);
     if (num_blocks == 0 || block_size == 0 || gpu_blocks > num_blocks) return -1;
 
     header_size = 16U + num_blocks * 4U;
@@ -1181,32 +1479,72 @@ static int hybrid_decompress_memory(ocl_env_t* ocl,
     sizes = (const uint32_t*)(const void*)(comp + 16);
     data_ptr = comp + header_size;
 
-    for (size_t i = 0; i < num_blocks; ++i) gpu_comp_size += (size_t)sizes[i];
-    if (header_size + gpu_comp_size != comp_size) return -1;
+    for (size_t i = 0; i < num_blocks; ++i) payload_size += (size_t)sizes[i];
+    if (header_size + payload_size != comp_size) return -1;
 
-    cpu_blocks = num_blocks - gpu_blocks;
+    if (striped_gpu_layout) {
+        if (partition_blocks_distributed(num_blocks,
+                                         gpu_blocks,
+                                         &gpu_block_indices,
+                                         &gpu_blocks,
+                                         &cpu_block_indices,
+                                         &cpu_blocks) != 0) {
+            goto fail;
+        }
+    } else {
+        if (partition_blocks_prefix(num_blocks,
+                                    gpu_blocks,
+                                    &gpu_block_indices,
+                                    &gpu_blocks,
+                                    &cpu_block_indices,
+                                    &cpu_blocks) != 0) {
+            goto fail;
+        }
+    }
+
+    global_offsets = (uint32_t*)malloc(num_blocks * sizeof(uint32_t));
+    if (!global_offsets) goto fail;
+    {
+        size_t off = 0;
+        for (size_t i = 0; i < num_blocks; ++i) {
+            global_offsets[i] = (uint32_t)off;
+            off += (size_t)sizes[i];
+        }
+    }
+
     out_full = (unsigned char*)malloc(num_blocks * block_size);
     if (!out_full) goto fail;
 
     if (gpu_blocks > 0) {
+        size_t gpu_comp_total = 0;
+        gpu_comp_sizes = (uint32_t*)malloc(gpu_blocks * sizeof(uint32_t));
         gpu_out_sizes = (uint32_t*)calloc(gpu_blocks, sizeof(uint32_t));
-        if (!gpu_out_sizes) goto fail;
+        gpu_out_full = (unsigned char*)malloc(gpu_blocks * block_size);
+        if (!gpu_comp_sizes || !gpu_out_sizes || !gpu_out_full) goto fail;
+        for (size_t i = 0; i < gpu_blocks; ++i) gpu_comp_total += (size_t)sizes[gpu_block_indices[i]];
+        if (gpu_comp_total > 0) {
+            size_t off = 0;
+            gpu_comp_data = (unsigned char*)malloc(gpu_comp_total);
+            if (!gpu_comp_data) goto fail;
+            for (size_t i = 0; i < gpu_blocks; ++i) {
+                const size_t blk_idx = gpu_block_indices[i];
+                const size_t blk_sz = (size_t)sizes[blk_idx];
+                gpu_comp_sizes[i] = sizes[blk_idx];
+                memcpy(gpu_comp_data + off, data_ptr + (size_t)global_offsets[blk_idx], blk_sz);
+                off += blk_sz;
+            }
+        }
     }
     if (cpu_blocks > 0) {
         cpu_comp_sizes = (uint32_t*)malloc(cpu_blocks * sizeof(uint32_t));
         cpu_comp_offsets = (uint32_t*)malloc(cpu_blocks * sizeof(uint32_t));
         cpu_out_sizes = (uint32_t*)calloc(cpu_blocks, sizeof(uint32_t));
         if (!cpu_comp_sizes || !cpu_comp_offsets || !cpu_out_sizes) goto fail;
-        {
-            size_t off = 0;
-            for (size_t i = 0; i < gpu_blocks; ++i) off += (size_t)sizes[i];
-            for (size_t i = 0; i < cpu_blocks; ++i) {
-                cpu_comp_sizes[i] = sizes[gpu_blocks + i];
-                cpu_comp_offsets[i] = (uint32_t)off;
-                off += (size_t)cpu_comp_sizes[i];
-            }
+        for (size_t i = 0; i < cpu_blocks; ++i) {
+            const size_t blk_idx = cpu_block_indices[i];
+            cpu_comp_sizes[i] = sizes[blk_idx];
+            cpu_comp_offsets[i] = global_offsets[blk_idx];
         }
-
     }
 
     {
@@ -1217,7 +1555,7 @@ static int hybrid_decompress_memory(ocl_env_t* ocl,
             cpu_job.comp_sizes = cpu_comp_sizes;
             cpu_job.comp_offsets = cpu_comp_offsets;
             cpu_job.block_size = block_size;
-            cpu_job.global_start_block = gpu_blocks;
+            cpu_job.block_indices = cpu_block_indices;
             cpu_job.num_blocks = cpu_blocks;
             cpu_job.num_threads = cfg->cpu_threads;
             cpu_job.out_full = out_full;
@@ -1229,12 +1567,12 @@ static int hybrid_decompress_memory(ocl_env_t* ocl,
 
         if (gpu_blocks > 0) {
             if (gpu_decompress_blocks(ocl,
-                                      data_ptr,
-                                      sizes,
+                                      gpu_comp_data,
+                                      gpu_comp_sizes,
                                       gpu_blocks,
                                       block_size,
                                       cfg->local_size,
-                                      out_full,
+                                      gpu_out_full,
                                       gpu_out_sizes,
                                       m ? &m->gpu_kernel_us : &(uint64_t){0}) != 0) {
                 goto fail;
@@ -1254,6 +1592,11 @@ static int hybrid_decompress_memory(ocl_env_t* ocl,
         }
     }
 
+    for (size_t i = 0; i < gpu_blocks; ++i) {
+        const size_t blk_idx = gpu_block_indices[i];
+        memcpy(out_full + blk_idx * block_size, gpu_out_full + i * block_size, (size_t)gpu_out_sizes[i]);
+    }
+
     {
         size_t total_out = 0;
         for (size_t i = 0; i < gpu_blocks; ++i) total_out += (size_t)gpu_out_sizes[i];
@@ -1262,6 +1605,12 @@ static int hybrid_decompress_memory(ocl_env_t* ocl,
         *out_size = total_out;
     }
 
+    free(global_offsets);
+    free(gpu_block_indices);
+    free(cpu_block_indices);
+    free(gpu_comp_data);
+    free(gpu_out_full);
+    free(gpu_comp_sizes);
     free(gpu_out_sizes);
     free(cpu_comp_sizes);
     free(cpu_comp_offsets);
@@ -1270,7 +1619,13 @@ static int hybrid_decompress_memory(ocl_env_t* ocl,
 
 fail:
     if (cpu_thread_started) pthread_join(cpu_thread, NULL);
+    free(global_offsets);
+    free(gpu_block_indices);
+    free(cpu_block_indices);
     free(out_full);
+    free(gpu_comp_data);
+    free(gpu_out_full);
+    free(gpu_comp_sizes);
     free(gpu_out_sizes);
     free(cpu_comp_sizes);
     free(cpu_comp_offsets);

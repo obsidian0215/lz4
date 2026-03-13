@@ -92,6 +92,7 @@ static void ocl_init() {
         if (ctx) clReleaseContext(ctx);
         ctx = NULL;
         queue = NULL;
+        return;
     }
 }
 
@@ -232,6 +233,17 @@ static int run_lz4_bench(const char* input_path,
         free(input_ref);
         return 1;
     }
+    cl_kernel kpack = clCreateKernel(prog, "lz4_pack_blocks", &err);
+    if (err != CL_SUCCESS || !kpack) {
+        fprintf(stderr, "bench error: create pack kernel failed (%d)\n", err);
+        clReleaseKernel(kdec);
+        clReleaseKernel(kcomp);
+        clReleaseProgram(prog);
+        clReleaseCommandQueue(queue);
+        clReleaseContext(ctx);
+        free(input_ref);
+        return 1;
+    }
 
     lz4_gpu_workspace_t ws;
     lz4_gpu_workspace_init(&ws);
@@ -302,7 +314,7 @@ static int run_lz4_bench(const char* input_path,
 
         uint64_t tcomp0 = get_us();
 
-        int rc = lz4_compress_core(ctx, queue, kcomp, input_path, "/dev/null",
+        int rc = lz4_compress_core(ctx, queue, kcomp, kpack, input_path, "/dev/null",
                                    (size_t)block_size, acceleration, &ws, &tc,
                                    local_size, hash_log);
         uint64_t tcomp1 = get_us();
@@ -582,6 +594,7 @@ static int run_lz4_bench(const char* input_path,
     if (d_out) clReleaseMemObject(d_out);
     free(input_ref);
     lz4_gpu_workspace_free(&ws);
+    clReleaseKernel(kpack);
     clReleaseKernel(kdec);
     clReleaseKernel(kcomp);
     clReleaseProgram(prog);
@@ -698,9 +711,13 @@ int run_lz4_standalone(int argc, char** argv) {
     if (!prog) { fprintf(stderr, "Failed to load OCL program\n"); return 1; }
 
     cl_kernel kernel;
+    cl_kernel pack_kernel = NULL;
     cl_int err;
     if (mode == mode_compress) {
         kernel = clCreateKernel(prog, "lz4_compress_block", &err);
+        if (err == CL_SUCCESS && kernel) {
+            pack_kernel = clCreateKernel(prog, "lz4_pack_blocks", &err);
+        }
     } else {
         kernel = clCreateKernel(prog, "lz4_decompress_blocks", &err);
     }
@@ -717,7 +734,7 @@ int run_lz4_standalone(int argc, char** argv) {
 
     int ret = -1;
     if (mode == mode_compress) {
-        ret = lz4_compress_core(ctx, queue, kernel, input_path, output_path, (int)g_cli_fixed_block_bytes, g_cli_acceleration, &ws, &t_out, (int)g_cli_local_size, g_cli_hash_log);
+        ret = lz4_compress_core(ctx, queue, kernel, pack_kernel, input_path, output_path, (int)g_cli_fixed_block_bytes, g_cli_acceleration, &ws, &t_out, (int)g_cli_local_size, g_cli_hash_log);
     } else {
         ret = lz4_decompress_core(ctx, queue, kernel, input_path, output_path, &ws, &t_out, (int)g_cli_local_size);
     }
@@ -741,6 +758,7 @@ int run_lz4_standalone(int argc, char** argv) {
     }
 
     lz4_gpu_workspace_free(&ws);
+    if (pack_kernel) clReleaseKernel(pack_kernel);
     clReleaseKernel(kernel);
     clReleaseProgram(prog);
     clReleaseCommandQueue(queue);
