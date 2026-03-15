@@ -28,13 +28,13 @@ OUT_DIR = os.environ.get("LZ4_HYBRID_RESULTS_DIR", str(REPO_ROOT / "exp_results"
 CPU_CONTROL_SCRIPT = str(REPO_ROOT / "tools" / "cpu_control.sh")
 GPU_CONTROL_SCRIPT = str(REPO_ROOT / "tools" / "gpu_control.sh")
 
-BLOCK_SIZES = ["16K", "32K", "64K"]
+BLOCK_SIZES = ["32K", "64K"]
 HASH_LOG = 14
 LOCAL_SIZES = [1]
 BENCH_SECONDS = 3
 
 GPU_RATIOS = [0.0, 0.3, 0.5, 0.7, 0.9, 1.0]
-CPU_THREADS = [1, 2]
+CPU_THREADS = [1, 2, 3, 4]
 ACCELS = [1, 3]
 SPLIT_MODES = ["fixed", "adaptive"]
 

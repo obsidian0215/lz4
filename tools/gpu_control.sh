@@ -206,6 +206,61 @@ set_gpu_freq() {
     log_info "GPU frequency set successfully"
 }
 
+set_gpu_freq_mhz() {
+    local target_mhz=$1
+
+    if [ -z "$target_mhz" ] || [ "$target_mhz" -lt 1 ]; then
+        log_error "Invalid frequency: $target_mhz MHz (must be > 0)"
+        return 1
+    fi
+
+    log_info "Setting GPU frequency to ${target_mhz} MHz..."
+
+    case $GPU_VENDOR in
+        nvidia)
+            sudo nvidia-smi -pm 1 || log_warn "Failed to enable persistence mode"
+            sudo nvidia-smi -lgc ${target_mhz},${target_mhz} || {
+                log_error "Failed to set GPU frequency to ${target_mhz} MHz"
+                return 1
+            }
+            ;;
+        intel)
+            if [ ! -e /sys/class/drm/card0/gt_max_freq_mhz ]; then
+                log_error "Intel GPU frequency control not available"
+                return 1
+            fi
+            local rp0=$(cat /sys/class/drm/card0/gt_RP0_freq_mhz 2>/dev/null || echo 1500)
+            local rpn=$(cat /sys/class/drm/card0/gt_RPn_freq_mhz 2>/dev/null || echo 100)
+
+            if [ $target_mhz -lt $rpn ]; then
+                log_warn "Target ${target_mhz} MHz < RPn ${rpn} MHz, clamping"
+                target_mhz=$rpn
+            fi
+            if [ $target_mhz -gt $rp0 ]; then
+                log_warn "Target ${target_mhz} MHz > RP0 ${rp0} MHz, clamping"
+                target_mhz=$rp0
+            fi
+
+            echo $rp0 | sudo tee /sys/class/drm/card0/gt_max_freq_mhz >/dev/null
+            echo $target_mhz | sudo tee /sys/class/drm/card0/gt_min_freq_mhz >/dev/null
+            echo $target_mhz | sudo tee /sys/class/drm/card0/gt_max_freq_mhz >/dev/null
+
+            local actual=$(cat /sys/class/drm/card0/gt_max_freq_mhz)
+            log_info "GPU frequency set to ${actual} MHz"
+            ;;
+        amd)
+            log_warn "AMD freq_mhz not implemented, falling back to closest level"
+            return 1
+            ;;
+        *)
+            log_error "Unknown GPU vendor"
+            return 1
+            ;;
+    esac
+
+    log_info "GPU frequency set successfully"
+}
+
 # 设置GPU功率限制 (瓦特)
 set_gpu_power() {
     local power_watts=$1
@@ -602,6 +657,7 @@ Commands:
     info                    Show GPU detailed information
     status                  Show current GPU status (concise)
     freq <percent>          Set GPU frequency (0-100%)
+    freq_mhz <MHz>          Set GPU frequency to exact MHz
     power <watts>           Set GPU power limit (watts)
     mode <mode>             Set performance mode (performance/balanced/powersave)
     temp <celsius>          Set temperature limit (NVIDIA only, 1-100°C)
@@ -621,6 +677,7 @@ Examples:
     $0 info                        # Show detailed GPU info
     $0 status                      # Show current status
     $0 freq 80                     # Set GPU to 80% frequency
+    $0 freq_mhz 600                # Set GPU to 600 MHz
     $0 mode performance            # Set to max performance
     $0 mode powersave              # Set to power saving mode
     $0 power 150                   # Set power limit to 150W
@@ -635,7 +692,7 @@ Benchmark Workflow:
     sudo $0 mode performance
 
     # 2. Run your benchmark
-    ./param_scan.sh
+    ./bench_lz4.py
 
     # 3. Reset to default
     sudo $0 reset
@@ -671,6 +728,14 @@ main() {
                 exit 1
             fi
             detect_gpu && set_gpu_freq "$2"
+            ;;
+        freq_mhz)
+            if [ -z "$2" ]; then
+                log_error "Missing frequency argument (MHz)"
+                echo "Usage: $0 freq_mhz <MHz>"
+                exit 1
+            fi
+            detect_gpu && set_gpu_freq_mhz "$2"
             ;;
         power)
             if [ -z "$2" ]; then

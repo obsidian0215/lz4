@@ -100,16 +100,64 @@ typedef struct {
     double mean_ratio_pct;
     size_t low_ratio_blocks;
     size_t high_ratio_blocks;
+    double sample_cpu_throughput;
 } lz4_sample_stats_t;
 
-static cl_device_type preferred_opencl_device_type(void) {
-    const char* pref = getenv("FORCE_OPENCL_DEVICE");
-    if (!pref || !*pref) return CL_DEVICE_TYPE_GPU;
-    if (strcasecmp(pref, "CPU") == 0) return CL_DEVICE_TYPE_CPU;
-    if (strcasecmp(pref, "GPU") == 0) return CL_DEVICE_TYPE_GPU;
-    if (strcasecmp(pref, "DEFAULT") == 0) return CL_DEVICE_TYPE_DEFAULT;
-    if (strcasecmp(pref, "ALL") == 0) return CL_DEVICE_TYPE_ALL;
-    return CL_DEVICE_TYPE_GPU;
+typedef struct {
+    double cpu_throughput;
+    double gpu_throughput;
+    double gpu_overhead_s;
+    int    is_unified_memory;
+    int    valid;
+} device_profile_t;
+
+static device_profile_t g_dev_profile = {0};
+
+static double read_sysfs_double(const char* path) {
+    FILE* f = fopen(path, "r");
+    double val = -1.0;
+    if (f) { if (fscanf(f, "%lf", &val) != 1) val = -1.0; fclose(f); }
+    return val;
+}
+
+static double read_cpu_availability(void) {
+    static uint64_t prev_total = 0, prev_idle = 0;
+    FILE* f = fopen("/proc/stat", "r");
+    char buf[256];
+    uint64_t user, nice, sys, idle, iowait, irq, softirq, steal;
+    uint64_t total, diff_total, diff_idle;
+    double avail;
+    if (!f) return 1.0;
+    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return 1.0; }
+    fclose(f);
+    if (sscanf(buf, "cpu %lu %lu %lu %lu %lu %lu %lu %lu",
+               &user, &nice, &sys, &idle, &iowait, &irq, &softirq, &steal) < 4)
+        return 1.0;
+    total = user + nice + sys + idle + iowait + irq + softirq + steal;
+    diff_total = total - prev_total;
+    diff_idle = idle - prev_idle;
+    prev_total = total;
+    prev_idle = idle;
+    if (diff_total == 0) return 1.0;
+    avail = (double)diff_idle / (double)diff_total;
+    if (avail < 0.05) avail = 0.05;
+    if (avail > 1.0) avail = 1.0;
+    return avail;
+}
+
+static double read_gpu_availability(void) {
+    double busy = read_sysfs_double("/sys/class/drm/card0/device/gpu_busy_percent");
+    if (busy < 0.0) busy = read_sysfs_double("/sys/class/drm/card1/device/gpu_busy_percent");
+    if (busy < 0.0) return 1.0;
+    if (busy > 100.0) busy = 100.0;
+    return 1.0 - busy / 100.0;
+}
+
+static double read_cpu_freq_scale(void) {
+    double cur = read_sysfs_double("/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq");
+    double max_f = read_sysfs_double("/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq");
+    if (cur <= 0 || max_f <= 0) return 1.0;
+    return cur / max_f;
 }
 
 static int gpu_compress_blocks(ocl_env_t* ocl,
@@ -124,6 +172,80 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
                                unsigned char** out_slots,
                                size_t* out_slot_size,
                                uint64_t* kernel_us);
+
+static void calibrate_device_profile(ocl_env_t* ocl, const hybrid_cfg_t* cfg) {
+    if (g_dev_profile.valid) return;
+
+    cl_bool unified = CL_FALSE;
+    clGetDeviceInfo(ocl->dev, CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof(unified), &unified, NULL);
+    g_dev_profile.is_unified_memory = (unified == CL_TRUE) ? 1 : 0;
+
+    {
+        size_t cal_size = 2 * 1024 * 1024;
+        unsigned char* cal_buf = (unsigned char*)malloc(cal_size);
+        char* cal_tmp = NULL;
+        int cal_bound;
+        uint64_t t0, t1;
+        int comp_sz;
+
+        if (!cal_buf) { g_dev_profile.valid = 1; g_dev_profile.cpu_throughput = 500e6; g_dev_profile.gpu_throughput = 2000e6; g_dev_profile.gpu_overhead_s = 0.0005; return; }
+        memset(cal_buf, 0xAB, cal_size);
+        for (size_t i = 0; i < cal_size; i += 97) cal_buf[i] = (unsigned char)(i & 0xFF);
+
+        cal_bound = LZ4_compressBound((int)cal_size);
+        cal_tmp = (char*)malloc((size_t)cal_bound);
+        if (!cal_tmp) { free(cal_buf); g_dev_profile.valid = 1; g_dev_profile.cpu_throughput = 500e6; g_dev_profile.gpu_throughput = 2000e6; g_dev_profile.gpu_overhead_s = 0.0005; return; }
+
+        t0 = get_us();
+        for (int rep = 0; rep < 3; rep++) {
+            comp_sz = LZ4_compress_fast((const char*)cal_buf, cal_tmp, (int)cal_size, cal_bound,
+                                        cfg->acceleration > 0 ? cfg->acceleration : 1);
+        }
+        t1 = get_us();
+        (void)comp_sz;
+        g_dev_profile.cpu_throughput = (3.0 * (double)cal_size) / ((double)(t1 - t0) * 1e-6);
+        free(cal_tmp);
+
+        {
+            uint32_t* gp_sizes = NULL;
+            uint32_t* gp_offsets = NULL;
+            unsigned char* gp_slots = NULL;
+            size_t gp_slot_size = 0;
+            uint64_t gp_kernel_us = 0;
+
+            t0 = get_us();
+            if (gpu_compress_blocks(ocl, cal_buf, cal_size,
+                                    cfg->block_size > 0 ? cfg->block_size : 32768,
+                                    cfg->acceleration > 0 ? cfg->acceleration : 1,
+                                    cfg->local_size, cfg->hash_log,
+                                    &gp_sizes, &gp_offsets, &gp_slots, &gp_slot_size, &gp_kernel_us) == 0) {
+                t1 = get_us();
+                g_dev_profile.gpu_throughput = (double)cal_size / ((double)(t1 - t0) * 1e-6);
+                g_dev_profile.gpu_overhead_s = ((double)(t1 - t0) * 1e-6) - ((double)gp_kernel_us * 1e-6);
+                if (g_dev_profile.gpu_overhead_s < 0.0) g_dev_profile.gpu_overhead_s = 0.0;
+                free(gp_sizes); free(gp_offsets); free(gp_slots);
+            } else {
+                g_dev_profile.gpu_throughput = 2000e6;
+                g_dev_profile.gpu_overhead_s = 0.0005;
+            }
+        }
+        free(cal_buf);
+    }
+
+    if (g_dev_profile.cpu_throughput <= 0.0) g_dev_profile.cpu_throughput = 500e6;
+    if (g_dev_profile.gpu_throughput <= 0.0) g_dev_profile.gpu_throughput = 2000e6;
+    g_dev_profile.valid = 1;
+}
+
+static cl_device_type preferred_opencl_device_type(void) {
+    const char* pref = getenv("FORCE_OPENCL_DEVICE");
+    if (!pref || !*pref) return CL_DEVICE_TYPE_GPU;
+    if (strcasecmp(pref, "CPU") == 0) return CL_DEVICE_TYPE_CPU;
+    if (strcasecmp(pref, "GPU") == 0) return CL_DEVICE_TYPE_GPU;
+    if (strcasecmp(pref, "DEFAULT") == 0) return CL_DEVICE_TYPE_DEFAULT;
+    if (strcasecmp(pref, "ALL") == 0) return CL_DEVICE_TYPE_ALL;
+    return CL_DEVICE_TYPE_GPU;
+}
 
 static int gpu_decompress_blocks(ocl_env_t* ocl,
                                  const unsigned char* comp_data,
@@ -307,30 +429,42 @@ static int collect_lz4_sample_stats(const unsigned char* input,
     tmp = (char*)malloc((size_t)LZ4_compressBound((int)cfg->block_size));
     if (!tmp) return -1;
 
-    for (size_t i = 0; i < sample_blocks; ++i) {
-        const size_t blk_idx = sampled_block_index(i, sample_blocks, num_blocks);
-        const size_t blk_sz = block_input_size(input_size, cfg->block_size, blk_idx);
-        const char* src;
-        int comp_sz;
-        double blk_ratio_pct;
+    {
+        const uint64_t sample_t0 = get_us();
 
-        if (blk_idx == prev_block || blk_sz == 0) continue;
-        src = (const char*)(const void*)(input + blk_idx * cfg->block_size);
-        comp_sz = LZ4_compress_fast(src,
-                                    tmp,
-                                    (int)blk_sz,
-                                    LZ4_compressBound((int)cfg->block_size),
-                                    cfg->acceleration > 0 ? cfg->acceleration : 1);
-        if (comp_sz <= 0) continue;
+        for (size_t i = 0; i < sample_blocks; ++i) {
+            const size_t blk_idx = sampled_block_index(i, sample_blocks, num_blocks);
+            const size_t blk_sz = block_input_size(input_size, cfg->block_size, blk_idx);
+            const char* src;
+            int comp_sz;
+            double blk_ratio_pct;
 
-        blk_ratio_pct = 100.0 * (double)comp_sz / (double)blk_sz;
-        if (blk_ratio_pct < 35.0) stats->low_ratio_blocks++;
-        else if (blk_ratio_pct > 70.0) stats->high_ratio_blocks++;
+            if (blk_idx == prev_block || blk_sz == 0) continue;
+            src = (const char*)(const void*)(input + blk_idx * cfg->block_size);
+            comp_sz = LZ4_compress_fast(src,
+                                        tmp,
+                                        (int)blk_sz,
+                                        LZ4_compressBound((int)cfg->block_size),
+                                        cfg->acceleration > 0 ? cfg->acceleration : 1);
+            if (comp_sz <= 0) continue;
 
-        sample_bytes += blk_sz;
-        sample_comp_bytes += (size_t)comp_sz;
-        stats->sample_count++;
-        prev_block = blk_idx;
+            blk_ratio_pct = 100.0 * (double)comp_sz / (double)blk_sz;
+            if (blk_ratio_pct < 35.0) stats->low_ratio_blocks++;
+            else if (blk_ratio_pct > 70.0) stats->high_ratio_blocks++;
+
+            sample_bytes += blk_sz;
+            sample_comp_bytes += (size_t)comp_sz;
+            stats->sample_count++;
+            prev_block = blk_idx;
+        }
+
+        {
+            const uint64_t sample_t1 = get_us();
+            if (sample_bytes > 0 && sample_t1 > sample_t0)
+                stats->sample_cpu_throughput = (double)sample_bytes / ((double)(sample_t1 - sample_t0) * 1e-6);
+            else
+                stats->sample_cpu_throughput = 0.0;
+        }
     }
 
     free(tmp);
@@ -341,52 +475,140 @@ static int collect_lz4_sample_stats(const unsigned char* input,
     return 0;
 }
 
-static double choose_adaptive_gpu_ratio(const unsigned char* input,
+static double choose_adaptive_gpu_ratio(ocl_env_t* ocl,
+                                        const unsigned char* input,
                                         size_t input_size,
                                         size_t num_blocks,
                                         const hybrid_cfg_t* cfg,
                                         double* sample_ratio_pct_out) {
-    double ratio;
+    /*
+     * Device-aware adaptive scheduler using makespan minimization.
+     *
+     * Model:
+     *   Pc_eff = Pc0_per_thread * gC(data) * sC(runtime) * thread_count
+     *   Pg_eff = Pg0 * gG(data) * sG(runtime)
+     *   r* = Pg_eff / (Pc_eff + Pg_eff) - t0 * Pc_eff * Pg_eff / (B * (Pc_eff + Pg_eff))
+     *   gpu_ratio = clamp(r*, 0, 1)
+     *
+     * Factor categories:
+     *   1. Device capability (Pc0, Pg0, t0) — one-time calibration micro-benchmark
+     *   2. Data characteristics (gC, gG) — from block sampling
+     *   3. Runtime state (sC, sG) — CPU availability, GPU busy percent
+     */
     lz4_sample_stats_t stats;
+    double Pc0, Pg0, t0;
+    double gC, gG;
+    double sC, sG;
+    double Pc_eff, Pg_eff;
+    double r_star;
+    long thread_count;
+    long total_cores;
+    double B = (double)input_size;
 
     if (sample_ratio_pct_out) *sample_ratio_pct_out = 0.0;
-    if (!input || input_size == 0 || num_blocks == 0 || !cfg) return cfg ? cfg->gpu_ratio : 1.0;
-    if (cfg->cpu_threads <= 0) return 1.0;
+    if (!input || input_size == 0 || num_blocks == 0 || !cfg || !ocl)
+        return cfg ? cfg->gpu_ratio : 1.0;
 
-    ratio = cfg->gpu_ratio;
+    /* --- 1. Device capability profile (cached) --- */
+    calibrate_device_profile(ocl, cfg);
+    Pc0 = g_dev_profile.cpu_throughput;   /* single-thread throughput (bytes/s) */
+    Pg0 = g_dev_profile.gpu_throughput;   /* GPU throughput (bytes/s) */
+    t0  = g_dev_profile.gpu_overhead_s;   /* GPU fixed overhead (seconds) */
+
+    /* --- Determine thread count --- */
+    total_cores = sysconf(_SC_NPROCESSORS_ONLN);
+    if (total_cores <= 0) total_cores = 4;
+    if (cfg->cpu_threads > 0)
+        thread_count = cfg->cpu_threads;
+    else
+        thread_count = total_cores;
+
+    /* --- 2. Data characteristics from sampling --- */
+    gC = 1.0;
+    gG = 1.0;
     if (collect_lz4_sample_stats(input, input_size, num_blocks, cfg, &stats, sample_ratio_pct_out) == 0) {
-        const double sample_ratio_pct = stats.mean_ratio_pct;
-        if (sample_ratio_pct_out) *sample_ratio_pct_out = sample_ratio_pct;
+        /* gC: ratio of sample CPU throughput to calibration throughput */
+        if (stats.sample_cpu_throughput > 0.0 && Pc0 > 0.0) {
+            gC = stats.sample_cpu_throughput / Pc0;
+            if (gC < 0.3) gC = 0.3;
+            if (gC > 3.0) gC = 3.0;
+        }
 
-        if (input_size < (8ULL * 1024ULL * 1024ULL)) {
-            ratio *= 0.70;
-        }
-        if (stats.sample_count < 4) {
-            ratio *= 0.80;
-        }
-        if (sample_ratio_pct < 20.0) {
-            ratio *= 1.00;
-        } else if (sample_ratio_pct < 35.0) {
-            ratio *= 0.95;
-        } else if (sample_ratio_pct > 70.0) {
-            ratio = 0.90 + 0.10 * ratio;
-        } else if (sample_ratio_pct > 55.0) {
-            ratio = 0.75 + 0.25 * ratio;
-        }
-        if (stats.low_ratio_blocks * 2 >= stats.sample_count) {
-            ratio *= 1.00;
-        }
-        if (stats.high_ratio_blocks * 2 >= stats.sample_count) {
-            ratio = 0.88 + 0.12 * ratio;
-        }
-        if (cfg->cpu_threads >= 2 && input_size >= (32ULL * 1024ULL * 1024ULL) && sample_ratio_pct < 35.0) {
-            ratio *= 0.90;
+        /*
+         * gG: GPU data-dependent factor.
+         * GPU compression throughput is primarily memory-bandwidth-bound,
+         * but compression ratio affects output write volume.
+         * gG = (1 + m + Rref) / (1 + m + R)
+         * where m = memory-bandwidth weight (~2.0 for iGPU),
+         *       Rref = reference compression ratio from calibration (~0.5),
+         *       R = actual sample compression ratio.
+         */
+        {
+            const double m = 2.0;
+            const double Rref = 0.50;
+            double R = stats.mean_ratio_pct / 100.0;
+            if (R < 0.05) R = 0.05;
+            if (R > 1.0) R = 1.0;
+            gG = (1.0 + m + Rref) / (1.0 + m + R);
+            if (gG < 0.5) gG = 0.5;
+            if (gG > 2.0) gG = 2.0;
         }
     }
 
-    if (ratio < 0.0) ratio = 0.0;
-    if (ratio > 1.0) ratio = 1.0;
-    return ratio;
+    /* --- 3. Runtime state --- */
+    sC = read_cpu_availability();
+    sG = read_gpu_availability();
+
+    /*
+     * Scale CPU availability relative to the thread count being used.
+     * System-wide idle fraction represents total_cores worth of capacity.
+     * If we use fewer threads, effective availability scales accordingly.
+     */
+    if (cfg->cpu_threads > 0 && cfg->cpu_threads < total_cores) {
+        /*
+         * sC from /proc/stat is system-wide. Scale: even if system reports
+         * 50% idle across all cores, our thread_count threads might still
+         * find enough capacity. Approximate: sC_eff = min(sC * total/used, 1.0)
+         */
+        double scale = (double)total_cores / (double)cfg->cpu_threads;
+        sC = sC * scale;
+        if (sC > 1.0) sC = 1.0;
+    }
+
+    /* --- Effective throughputs --- */
+    Pc_eff = Pc0 * gC * sC * (double)thread_count;
+    Pg_eff = Pg0 * gG * sG;
+
+    /* --- Small input guard: if GPU overhead dominates, skip GPU --- */
+    if (B <= t0 * Pg_eff && t0 > 0.0) {
+        if (cfg->verbose) {
+            fprintf(stderr, "Adaptive: input too small (%.0f B <= overhead %.6f s * %.0f B/s), CPU-only\n",
+                    B, t0, Pg_eff);
+        }
+        return 0.0;
+    }
+
+    /* --- Makespan-optimal ratio --- */
+    if (Pc_eff + Pg_eff <= 0.0) return cfg->gpu_ratio;
+    r_star = Pg_eff / (Pc_eff + Pg_eff);
+    if (B > 0.0 && t0 > 0.0) {
+        r_star -= (t0 * Pc_eff * Pg_eff) / (B * (Pc_eff + Pg_eff));
+    }
+
+    if (r_star < 0.0) r_star = 0.0;
+    if (r_star > 1.0) r_star = 1.0;
+
+    if (cfg->verbose) {
+        fprintf(stderr,
+                "Adaptive: Pc0=%.0f gC=%.2f sC=%.2f threads=%ld Pc_eff=%.0f | "
+                "Pg0=%.0f gG=%.2f sG=%.2f Pg_eff=%.0f | "
+                "t0=%.6f B=%.0f r*=%.4f\n",
+                Pc0, gC, sC, thread_count, Pc_eff,
+                Pg0, gG, sG, Pg_eff,
+                t0, B, r_star);
+    }
+
+    return r_star;
 }
 
 static int read_entire_file(const char* path, unsigned char** out_buf, size_t* out_size) {
@@ -1233,6 +1455,7 @@ static int hybrid_compress_memory(ocl_env_t* ocl,
     size_t* gpu_pos_by_block = NULL;
     size_t* cpu_pos_by_block = NULL;
     unsigned char* gpu_input = NULL;
+    int gpu_input_owned = 0;
     size_t gpu_input_size = 0;
 
     cpu_comp_job_t cpu_job;
@@ -1256,7 +1479,7 @@ static int hybrid_compress_memory(ocl_env_t* ocl,
     if (cfg->cpu_threads <= 0) {
         effective_gpu_ratio = 1.0;
     } else if (cfg->adaptive_split) {
-        effective_gpu_ratio = choose_adaptive_gpu_ratio(input, input_size, num_blocks, cfg, &sample_ratio_pct);
+        effective_gpu_ratio = choose_adaptive_gpu_ratio(ocl, input, input_size, num_blocks, cfg, &sample_ratio_pct);
     }
     gpu_blocks = (size_t)((double)num_blocks * effective_gpu_ratio + 0.5);
     if (gpu_blocks > num_blocks) gpu_blocks = num_blocks;
@@ -1310,16 +1533,23 @@ static int hybrid_compress_memory(ocl_env_t* ocl,
         }
 
         if (gpu_blocks > 0) {
-            gpu_input = (unsigned char*)calloc(gpu_blocks, cfg->block_size);
-            if (!gpu_input) goto fail;
-            gpu_input_size = gpu_blocks * cfg->block_size;
-            for (size_t i = 0; i < gpu_blocks; ++i) {
-                const size_t g = gpu_block_indices[i];
-                const size_t blk_sz = block_input_size(input_size, cfg->block_size, g);
-                memcpy(gpu_input + i * cfg->block_size, input + g * cfg->block_size, blk_sz);
-            }
-            if (gpu_block_indices[gpu_blocks - 1] == num_blocks - 1) {
-                gpu_input_size -= cfg->block_size - block_input_size(input_size, cfg->block_size, num_blocks - 1);
+            if (cpu_blocks == 0) {
+                gpu_input = (unsigned char*)(uintptr_t)input;
+                gpu_input_size = input_size;
+                gpu_input_owned = 0;
+            } else {
+                gpu_input = (unsigned char*)calloc(gpu_blocks, cfg->block_size);
+                if (!gpu_input) goto fail;
+                gpu_input_owned = 1;
+                gpu_input_size = gpu_blocks * cfg->block_size;
+                for (size_t i = 0; i < gpu_blocks; ++i) {
+                    const size_t g = gpu_block_indices[i];
+                    const size_t blk_sz = block_input_size(input_size, cfg->block_size, g);
+                    memcpy(gpu_input + i * cfg->block_size, input + g * cfg->block_size, blk_sz);
+                }
+                if (gpu_block_indices[gpu_blocks - 1] == num_blocks - 1) {
+                    gpu_input_size -= cfg->block_size - block_input_size(input_size, cfg->block_size, num_blocks - 1);
+                }
             }
             if (gpu_compress_blocks(ocl,
                                     gpu_input,
@@ -1400,7 +1630,7 @@ static int hybrid_compress_memory(ocl_env_t* ocl,
     free(cpu_pos_by_block);
     free(gpu_block_indices);
     free(cpu_block_indices);
-    free(gpu_input);
+    if (gpu_input_owned) free(gpu_input);
     free(cpu_job.out_slots);
     free(cpu_job.out_sizes);
     free(gpu_sizes);
@@ -1416,7 +1646,7 @@ fail:
     free(cpu_pos_by_block);
     free(gpu_block_indices);
     free(cpu_block_indices);
-    free(gpu_input);
+    if (gpu_input_owned) free(gpu_input);
     free(cpu_job.out_slots);
     free(cpu_job.out_sizes);
     free(gpu_sizes);

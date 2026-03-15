@@ -343,7 +343,8 @@ inline void LZ4_putIndexOnHash(U32 idx, U32 h, __global U32* tableBase, int tabl
      * Halves hash table memory bandwidth vs 64-bit entries.
      * 8-bit epoch sufficient: each WI processes ceil(totalBlocks/total_wi) blocks,
      * typically <10, well within 255 range. */
-    U32 packed = ((epoch & 0xFF) << 24) | ((sequence >> 24) << 16) | (idx & 0xFFFF);
+    U32 fp = ((sequence * 0x9E3779B1U) >> 24) & 0xFF;
+    U32 packed = ((epoch & 0xFF) << 24) | (fp << 16) | (idx & 0xFFFF);
     tableBase[h & mask] = packed;
 }
 
@@ -356,7 +357,7 @@ inline U32 LZ4_getIndexOnHash(U32 h, __global U32* tableBase, int tableType, U32
         *fp_match = 0;
         return 0;
     }
-    *fp_match = (((packed >> 16) & 0xFF) == (sequence >> 24));
+    *fp_match = (((packed >> 16) & 0xFF) == (((sequence * 0x9E3779B1U) >> 24) & 0xFF));
     return packed & 0xFFFF;
 }
 

@@ -24,6 +24,7 @@ typedef struct {
     int id;
     cl_command_queue queue;
     cl_kernel kernel_comp[MAX_HASH_LOG + 1];
+    cl_kernel kernel_pack[MAX_HASH_LOG + 1];
     cl_kernel kernel_decomp;
     lz4_gpu_workspace_t ws;
     pthread_t thread;
@@ -160,12 +161,16 @@ void process_request(worker_res_t* w, request_t* req, response_t* res) {
         if (!w->kernel_comp[h_log] && prog) {
             cl_int err;
             w->kernel_comp[h_log] = clCreateKernel(prog, "lz4_compress_block", &err);
+            if (err == CL_SUCCESS && w->kernel_comp[h_log]) {
+                w->kernel_pack[h_log] = clCreateKernel(prog, "lz4_pack_blocks", &err);
+            }
         }
         cl_kernel kernel = w->kernel_comp[h_log];
+        cl_kernel pack_kernel = w->kernel_pack[h_log];
         pthread_mutex_unlock(&g_state.compile_lock);
 
         if (kernel) {
-            ret = lz4_compress_core(g_state.context, w->queue, kernel, req->input_path, req->output_path,
+            ret = lz4_compress_core(g_state.context, w->queue, kernel, pack_kernel, req->input_path, req->output_path,
                                   req->block_size, req->acceleration, &w->ws, &t, req->local_size, h_log);
         }
     } else {

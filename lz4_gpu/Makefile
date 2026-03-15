@@ -51,7 +51,7 @@ build_clbin_host: build_clbin.c
 
 precompile: $(PRECOMPILE_HELPER)
 	@echo "Precompiling LZ4 GPU kernels for various hash sizes..."
-	@for bits in 12 13 14 15 16; do \
+	@for bits in 13 14 15 16; do \
 		echo "Building lz4_gpu_$$bits.clbin (LZ4_HASHLOG=$$bits)..."; \
 		./$(PRECOMPILE_HELPER) -o lz4_gpu_$$bits.clbin "-I. -DLZ4_HASHLOG=$$bits" || exit 1; \
 	done

@@ -22,6 +22,7 @@ class TelemetryProbe:
     def __init__(self):
         self.cpu_domain: Optional[RAPLDomain] = None
         self.gpu_domain: Optional[RAPLDomain] = None
+        self.gpu_rapl_nonfunctional = False
         self.has_nvidia_smi = shutil.which("nvidia-smi") is not None
         self.nvidia_energy_supported = False
         self.windows_cpu_max_mhz = self._detect_windows_cpu_max_mhz() if os.name == "nt" else 0.0
@@ -152,6 +153,24 @@ class TelemetryProbe:
                 self.gpu_domain = d
                 break
 
+        if self.gpu_domain is not None and not self._verify_gpu_rapl_functional():
+            self.gpu_domain = None
+            self.gpu_rapl_nonfunctional = True
+
+    def _verify_gpu_rapl_functional(self) -> bool:
+        """Check if gpu_domain RAPL gives meaningful readings (>1mW change in 0.5s)."""
+        if self.gpu_domain is None:
+            return False
+        e1 = self._read_rapl_j(self.gpu_domain)
+        if e1 is None:
+            return False
+        time.sleep(0.3)
+        e2 = self._read_rapl_j(self.gpu_domain)
+        if e2 is None:
+            return False
+        delta = abs(e2 - e1)
+        return delta > 0.001
+
     def _nvidia_query(self, key: str) -> Optional[float]:
         if not self.has_nvidia_smi:
             return None
@@ -246,6 +265,8 @@ class TelemetryProbe:
             gpu_src = "nvidia:energy"
         elif self.has_nvidia_smi:
             gpu_src = "nvidia:power_draw"
+        elif self.gpu_rapl_nonfunctional:
+            gpu_src = "pkg_minus_idle"
         else:
             gpu_src = "none"
         return f"cpu={cpu_src};gpu={gpu_src}"
@@ -259,6 +280,20 @@ class TelemetryProbe:
         if max_v > 0:
             return (max_v - start_v) + end_v
         return 0.0
+
+    def measure_idle_pkg_power_w(self, duration_s: float = 1.0) -> float:
+        """Measure idle package power over duration_s seconds. Returns watts."""
+        if self.cpu_domain is None:
+            return 0.0
+        e1 = self._read_rapl_j(self.cpu_domain)
+        if e1 is None:
+            return 0.0
+        time.sleep(duration_s)
+        e2 = self._read_rapl_j(self.cpu_domain)
+        if e2 is None:
+            return 0.0
+        delta = self._delta_with_wrap(e1, e2, self.cpu_domain.max_j)
+        return delta / duration_s
 
     def snapshot(self) -> Dict[str, Optional[float]]:
         snap = {
@@ -327,6 +362,32 @@ def apply_freq_percent(control_script_path: str, percent: Optional[int]) -> str:
         return "unsupported_on_windows"
 
     cmd = [control_script_path, "freq", str(percent)]
+    if os.geteuid() != 0:
+        cmd = ["sudo", "-n"] + cmd
+
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if res.returncode == 0:
+            return "ok"
+        msg = ((res.stderr or "") + "\n" + (res.stdout or "")).strip().splitlines()
+        short = msg[0][:80] if msg else ""
+        return f"failed:{res.returncode}:{short}"
+    except Exception as exc:
+        return f"error:{type(exc).__name__}"
+
+
+def apply_freq_mhz(control_script_path: str, mhz: Optional[int]) -> str:
+    """Set frequency using absolute MHz value via control script's freq_mhz command."""
+    if mhz is None:
+        return "not_requested"
+    if mhz < 1:
+        return f"invalid:{mhz}"
+    if not os.path.exists(control_script_path):
+        return "missing_script"
+    if os.name == "nt":
+        return "unsupported_on_windows"
+
+    cmd = [control_script_path, "freq_mhz", str(mhz)]
     if os.geteuid() != 0:
         cmd = ["sudo", "-n"] + cmd
 

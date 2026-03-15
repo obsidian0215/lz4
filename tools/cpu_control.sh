@@ -139,6 +139,10 @@ show_cpu_status() {
         fi
     fi
 
+    if [ -f /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference ]; then
+        echo "  EPP: $(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference)"
+    fi
+
     # CPU使用率（简单采样）
     if command -v mpstat &>/dev/null; then
         local idle=$(mpstat 1 1 | grep Average | awk '{print $NF}')
@@ -181,6 +185,10 @@ set_cpu_freq() {
         done
     fi
 
+    for epp in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
+        [ -w "$epp" ] && echo balance_performance | sudo tee $epp > /dev/null 2>&1 || true
+    done
+
     # 关闭Turbo，避免超过目标频率导致频点混叠
     if [ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]; then
         echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo > /dev/null 2>&1 || true
@@ -222,6 +230,79 @@ set_cpu_freq() {
     fi
 
     log_info "CPU frequency set successfully"
+}
+
+set_cpu_freq_mhz() {
+    local target_mhz=$1
+
+    if [ -z "$target_mhz" ] || [ "$target_mhz" -lt 1 ]; then
+        log_error "Invalid frequency: $target_mhz MHz (must be > 0)"
+        return 1
+    fi
+
+    local target_khz=$((target_mhz * 1000))
+
+    local hw_min_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq)
+    local hw_max_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq)
+    local base_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/base_frequency 2>/dev/null || echo 1900000)
+
+    if [ $target_khz -lt $hw_min_khz ]; then
+        log_warn "Target ${target_mhz} MHz < HW min $((hw_min_khz/1000)) MHz, clamping"
+        target_khz=$hw_min_khz
+    fi
+    if [ $target_khz -gt $hw_max_khz ]; then
+        log_warn "Target ${target_mhz} MHz > HW max $((hw_max_khz/1000)) MHz, clamping"
+        target_khz=$hw_max_khz
+    fi
+
+    # Turbo management: if target <= base, disable turbo for deterministic behavior.
+    # If target > base, turbo must stay ON (freq above base requires turbo).
+    if [ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]; then
+        if [ $target_khz -le $base_khz ]; then
+            echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo > /dev/null 2>&1 || true
+            log_info "Turbo disabled (target $((target_khz/1000)) MHz <= base $((base_khz/1000)) MHz)"
+        else
+            echo 0 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo > /dev/null 2>&1 || true
+            log_info "Turbo enabled (target $((target_khz/1000)) MHz > base $((base_khz/1000)) MHz)"
+        fi
+    fi
+
+    log_info "Setting CPU frequency to $((target_khz/1000)) MHz..."
+
+    # Performance governor for deterministic frequency pinning
+    for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        echo performance | sudo tee $cpu > /dev/null 2>&1 || true
+    done
+
+    # EPP must be balance_performance or performance for the CPU to actually reach target freq
+    for epp in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
+        [ -w "$epp" ] && echo balance_performance | sudo tee $epp > /dev/null 2>&1 || true
+    done
+
+    # Widen limits first to avoid constraint violations, then pin
+    for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do
+        echo $hw_max_khz | sudo tee $cpu > /dev/null 2>&1 || true
+    done
+    for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_min_freq; do
+        echo $hw_min_khz | sudo tee $cpu > /dev/null 2>&1 || true
+    done
+
+    # Now set the actual target
+    for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do
+        echo $target_khz | sudo tee $cpu > /dev/null || {
+            log_error "Failed to set max frequency on $cpu"
+            return 1
+        }
+    done
+    for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_min_freq; do
+        echo $target_khz | sudo tee $cpu > /dev/null || {
+            log_error "Failed to set min frequency on $cpu"
+            return 1
+        }
+    done
+
+    local actual_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)
+    log_info "CPU frequency set to $((actual_khz/1000)) MHz (requested: $((target_khz/1000)) MHz)"
 }
 
 # 设置Governor（性能策略）
@@ -404,6 +485,11 @@ reset_cpu() {
     if [ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]; then
         echo 0 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo > /dev/null 2>&1 || true
     fi
+
+    # Restore EPP to balance_performance (EPP=power prevents CPU from boosting)
+    for epp in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
+        [ -w "$epp" ] && echo balance_performance | sudo tee $epp > /dev/null 2>&1 || true
+    done
 
     log_info "CPU reset complete"
 }
@@ -793,6 +879,7 @@ Commands:
     info                    Show detailed CPU information
     status                  Show current CPU status (concise)
     freq <percent>          Set CPU max frequency (0-100%)
+    freq_mhz <MHz>          Set CPU frequency to exact MHz
     governor <name>         Set CPU governor (performance/powersave/ondemand/etc)
     mode <mode>             Set performance mode (performance/balanced/eco)
     turbo <on|off|status>   Enable/disable/check Turbo Boost
@@ -818,6 +905,7 @@ Examples:
     $0 info                        # Show detailed info
     $0 status                      # Show current status
     $0 freq 80                     # Set max frequency to 80%
+    $0 freq_mhz 800                # Set CPU frequency to 800 MHz
     $0 governor performance        # Set performance governor
     $0 mode performance            # Set to max performance
     $0 turbo off                   # Disable Turbo Boost
@@ -872,6 +960,14 @@ main() {
                 exit 1
             fi
             set_cpu_freq "$2"
+            ;;
+        freq_mhz)
+            if [ -z "$2" ]; then
+                log_error "Missing frequency argument (MHz)"
+                echo "Usage: $0 freq_mhz <MHz>"
+                exit 1
+            fi
+            set_cpu_freq_mhz "$2"
             ;;
         governor)
             if [ -z "$2" ]; then
