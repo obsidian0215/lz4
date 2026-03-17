@@ -20,7 +20,6 @@ typedef struct {
     int acceleration;
     int block_size;
     int local_size;
-    int hash_log; // Customizable hash log bits
     char input_path[1024];
     char output_path[1024];
 } request_t;

@@ -462,14 +462,15 @@ static void lz4_set_stream_buffer(FILE* f) {
 int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kernel, cl_kernel pack_kernel,
                     const char* input_path, const char* output_path,
                     size_t block_size, int acceleration, lz4_gpu_workspace_t* ws,
-                    timing_t* t, int local_size, int hash_log) {
+                    timing_t* t, int local_size,
+                    int skip_input_upload) {
+    const int hash_log = 14;
     cl_int err;
     uint64_t t1, t2;
 
-    FILE* fin = fopen(input_path, "rb"); if (!fin) return -1;
-    lz4_set_stream_buffer(fin);
-    fseek(fin, 0, SEEK_END); size_t file_size = ftell(fin); fseek(fin, 0, SEEK_SET);
-    if (file_size == 0) { fclose(fin); return -1; }
+    struct stat st_buf;
+    if (!input_path || stat(input_path, &st_buf) != 0 || st_buf.st_size <= 0) return -1;
+    size_t file_size = (size_t)st_buf.st_size;
     t->in_size = (unsigned long)file_size;
 
     t1 = get_us();
@@ -506,56 +507,63 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
     ws->in_buf = ensure_buffer_ex(context, ws->in_buf, file_size, &ws->current_in_capacity, CL_MEM_READ_ONLY, !use_standard_copy, &err);
     ws->out_buf = ensure_buffer_ex(context, ws->out_buf, (size_t)num_blocks * single_block_max_out, &ws->current_out_capacity, CL_MEM_READ_WRITE, !use_standard_copy, &err);
 
-    t2 = get_us();
-    if (use_standard_copy) {
-        uint8_t* h_in = (uint8_t*)malloc(file_size);
-        if (!h_in) {
-            fprintf(stderr, "[LZ4] malloc input staging buffer failed (%zu bytes)\n", file_size);
-            fclose(fin);
-            free(h_block_info);
-            free(h_out_offsets);
-            return -1;
-        }
-        t1 = get_us();
-        if (fread(h_in, 1, file_size, fin) != file_size) {
-            fprintf(stderr, "[LZ4] fread input failed for standard-copy path\n");
-            free(h_in);
-            fclose(fin);
-            free(h_block_info);
-            free(h_out_offsets);
-            return -1;
-        }
-        t->file_read_us = (unsigned long)(get_us() - t1);
-        t1 = get_us();
-        if (write_buffer_auto(queue, ws->in_buf, h_in, file_size, 1) != 0) {
-            fprintf(stderr, "[LZ4] upload input buffer failed for standard-copy path\n");
-            free(h_in);
-            fclose(fin);
-            free(h_block_info);
-            free(h_out_offsets);
-            return -1;
-        }
-        t->data_upload_us = (unsigned long)(get_us() - t1);
-        free(h_in);
-    } else {
-        void* mapped_in = clEnqueueMapBuffer(queue, ws->in_buf, CL_TRUE, CL_MAP_WRITE, 0, file_size, 0, NULL, NULL, &err);
-        if (err == CL_SUCCESS && mapped_in) {
+    if (!skip_input_upload) {
+        FILE* fin = fopen(input_path, "rb"); if (!fin) { free(h_block_info); free(h_out_offsets); return -1; }
+        lz4_set_stream_buffer(fin);
+        t2 = get_us();
+        if (use_standard_copy) {
+            uint8_t* h_in = (uint8_t*)malloc(file_size);
+            if (!h_in) {
+                fprintf(stderr, "[LZ4] malloc input staging buffer failed (%zu bytes)\n", file_size);
+                fclose(fin);
+                free(h_block_info);
+                free(h_out_offsets);
+                return -1;
+            }
             t1 = get_us();
-            (void)fread(mapped_in, 1, file_size, fin);
+            if (fread(h_in, 1, file_size, fin) != file_size) {
+                fprintf(stderr, "[LZ4] fread input failed for standard-copy path\n");
+                free(h_in);
+                fclose(fin);
+                free(h_block_info);
+                free(h_out_offsets);
+                return -1;
+            }
             t->file_read_us = (unsigned long)(get_us() - t1);
-            clEnqueueUnmapMemObject(queue, ws->in_buf, mapped_in, 0, NULL, NULL);
+            t1 = get_us();
+            if (write_buffer_auto(queue, ws->in_buf, h_in, file_size, 1) != 0) {
+                fprintf(stderr, "[LZ4] upload input buffer failed for standard-copy path\n");
+                free(h_in);
+                fclose(fin);
+                free(h_block_info);
+                free(h_out_offsets);
+                return -1;
+            }
+            t->data_upload_us = (unsigned long)(get_us() - t1);
+            free(h_in);
         } else {
-            fprintf(stderr, "[LZ4] map input buffer failed: %d\n", err);
-            fclose(fin);
-            free(h_block_info);
-            free(h_out_offsets);
-            return -1;
+            void* mapped_in = clEnqueueMapBuffer(queue, ws->in_buf, CL_TRUE, CL_MAP_WRITE, 0, file_size, 0, NULL, NULL, &err);
+            if (err == CL_SUCCESS && mapped_in) {
+                t1 = get_us();
+                (void)fread(mapped_in, 1, file_size, fin);
+                t->file_read_us = (unsigned long)(get_us() - t1);
+                clEnqueueUnmapMemObject(queue, ws->in_buf, mapped_in, 0, NULL, NULL);
+            } else {
+                fprintf(stderr, "[LZ4] map input buffer failed: %d\n", err);
+                fclose(fin);
+                free(h_block_info);
+                free(h_out_offsets);
+                return -1;
+            }
+            t->data_upload_us = 0;
         }
+        fclose(fin);
+        if (!use_standard_copy) {
+            t->file_read_us = (unsigned long)(get_us() - t2);
+        }
+    } else {
+        t->file_read_us = 0;
         t->data_upload_us = 0;
-    }
-    fclose(fin);
-    if (!use_standard_copy) {
-        t->file_read_us = (unsigned long)(get_us() - t2);
     }
 
     size_t out_offsets_cap = num_blocks * sizeof(uint32_t);
@@ -577,12 +585,14 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
         return -1;
     }
 
-    if (write_buffer_auto(queue, ws->out_offsets_buf, h_out_offsets, out_offsets_cap, use_standard_copy) != 0 ||
-        write_buffer_auto(queue, ws->block_info_buf, h_block_info, block_info_cap, use_standard_copy) != 0) {
-        fprintf(stderr, "[LZ4] upload block metadata buffers failed\n");
-        free(h_block_info);
-        free(h_out_offsets);
-        return -1;
+    if (!skip_input_upload) {
+        if (write_buffer_auto(queue, ws->out_offsets_buf, h_out_offsets, out_offsets_cap, use_standard_copy) != 0 ||
+            write_buffer_auto(queue, ws->block_info_buf, h_block_info, block_info_cap, use_standard_copy) != 0) {
+            fprintf(stderr, "[LZ4] upload block metadata buffers failed\n");
+            free(h_block_info);
+            free(h_out_offsets);
+            return -1;
+        }
     }
 
     ws->output_size_buf = ensure_buffer_ex(context, ws->output_size_buf, num_blocks * sizeof(uint32_t), &ws->current_osize_capacity, CL_MEM_READ_WRITE, !use_standard_copy, &err);
@@ -627,24 +637,33 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
     cl_mem dbg_comp_arg = dbg_comp_enabled ? dbg_comp_buf : ws->output_size_buf;
     uint32_t dbg_comp_flag = dbg_comp_enabled ? 1U : 0U;
 
-    err  = clSetKernelArg(kernel, 0, sizeof(cl_mem), &ws->in_buf);
-    err |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &ws->out_buf);
-    err |= clSetKernelArg(kernel, 2, sizeof(cl_mem), &ws->output_size_buf);
-    err |= clSetKernelArg(kernel, 3, sizeof(cl_mem), &ws->block_info_buf);
-    err |= clSetKernelArg(kernel, 4, sizeof(cl_mem), &ws->out_offsets_buf);
-    err |= clSetKernelArg(kernel, 5, sizeof(int), &num_blocks);
-    err |= clSetKernelArg(kernel, 6, sizeof(int), &inputSize);
-    err |= clSetKernelArg(kernel, 7, sizeof(int), &tableType);
-    err |= clSetKernelArg(kernel, 8, sizeof(int), &acceleration);
-    err |= clSetKernelArg(kernel, 9, sizeof(int), &globalIndexBase);
-    err |= clSetKernelArg(kernel, 10, sizeof(cl_mem), &ws->dict_buf);
-    err |= clSetKernelArg(kernel, 11, sizeof(uint32_t), &epoch_base);
-    if (kernel_has_dbg) {
-        err |= clSetKernelArg(kernel, 12, sizeof(cl_mem), &dbg_comp_arg);
-        err |= clSetKernelArg(kernel, 13, sizeof(uint32_t), &dbg_comp_flag);
+    if (!skip_input_upload) {
+        err  = clSetKernelArg(kernel, 0, sizeof(cl_mem), &ws->in_buf);
+        err |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &ws->out_buf);
+        err |= clSetKernelArg(kernel, 2, sizeof(cl_mem), &ws->output_size_buf);
+        err |= clSetKernelArg(kernel, 3, sizeof(cl_mem), &ws->block_info_buf);
+        err |= clSetKernelArg(kernel, 4, sizeof(cl_mem), &ws->out_offsets_buf);
+        err |= clSetKernelArg(kernel, 5, sizeof(int), &num_blocks);
+        err |= clSetKernelArg(kernel, 6, sizeof(int), &inputSize);
+        err |= clSetKernelArg(kernel, 7, sizeof(int), &tableType);
+        err |= clSetKernelArg(kernel, 8, sizeof(int), &acceleration);
+        err |= clSetKernelArg(kernel, 9, sizeof(int), &globalIndexBase);
+        err |= clSetKernelArg(kernel, 10, sizeof(cl_mem), &ws->dict_buf);
+        if (kernel_has_dbg) {
+            err |= clSetKernelArg(kernel, 12, sizeof(cl_mem), &dbg_comp_arg);
+            err |= clSetKernelArg(kernel, 13, sizeof(uint32_t), &dbg_comp_flag);
+        }
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "[LZ4] set compress kernel args failed: %d\n", err);
+            if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
+            free(h_block_info);
+            free(h_out_offsets);
+            return -1;
+        }
     }
+    err = clSetKernelArg(kernel, 11, sizeof(uint32_t), &epoch_base);
     if (err != CL_SUCCESS) {
-        fprintf(stderr, "[LZ4] set compress kernel args failed: %d\n", err);
+        fprintf(stderr, "[LZ4] set epoch_base kernel arg failed: %d\n", err);
         if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
         free(h_block_info);
         free(h_out_offsets);
@@ -1249,7 +1268,8 @@ static int lz4_find_file_path(const char* name, char* out, size_t outlen) {
     return -1;
 }
 
-cl_program lz4_load_program(cl_context context, cl_device_id device, int hash_log) {
+cl_program lz4_load_program(cl_context context, cl_device_id device) {
+    const int hash_log = 14;
     int dbg_enabled = lz4_debug_counters_enabled();
 
     if (!dbg_enabled && !(getenv("LZ4_GPU_NO_CLBIN") && strcmp(getenv("LZ4_GPU_NO_CLBIN"), "1") == 0)) {

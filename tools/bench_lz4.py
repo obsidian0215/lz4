@@ -36,19 +36,21 @@ CPU_CONTROL_SCRIPT = str(REPO_ROOT / "tools" / "cpu_control.sh")
 GPU_CONTROL_SCRIPT = str(REPO_ROOT / "tools" / "gpu_control.sh")
 
 # Configuration Space
-CPU_BLOCK_SIZES = ["64K", "256K"]
-GPU_BLOCK_SIZES = ["32K", "64K"]
-CPU_THREADS = [1, 2, 3, 4]
-HASH_LOGS = [14]
+CPU_BLOCK_SIZES = ["1M"]
+GPU_BLOCK_SIZES = ["64K", "128K", "256K"]
+CPU_THREADS = [1, 4, 0]
 LOCAL_SIZES = [1]
-GPU_ACCELS = [1, 2, 3]
-HYBRID_BLOCK_SIZES = ["64K"]
+GPU_ACCELS = [1, 2]
+HYBRID_BLOCK_SIZES = ["64K", "128K", "256K"]
 HYBRID_GPU_RATIOS = [0.0, 0.3, 0.5, 0.7, 1.0]
-HYBRID_CPU_THREADS = [1, 2, 4, 8]
+HYBRID_CPU_THREADS = [1, 4, 0]
 HYBRID_SPLIT_MODES = ["fixed", "adaptive"]
 HYBRID_LOCAL_SIZES = [1]
-HYBRID_ACCELS = [1, 3]
-HYBRID_HASH_LOG = 14
+HYBRID_ACCELS = [1, 2]
+
+# Default frequency configs (for intel iGPU)
+DEFAULT_CPU_FREQ_MHZ = "800,1900,3000,5000"
+DEFAULT_GPU_FREQ_MHZ = "300,1500"
 
 
 
@@ -562,6 +564,7 @@ def run_command_with_telemetry(cmd, telemetry=None, env=None, sample_interval_s=
         "cpu_freq_avg_mhz": float(cpu_avg),
         "gpu_freq_avg_mhz": float(gpu_avg),
         "cpu_energy_j": float(delta.get("cpu_energy_j", 0.0) or 0.0),
+        "core_energy_j": float(delta.get("core_energy_j", 0.0) or 0.0),
         "gpu_energy_j": float(delta.get("gpu_energy_j", 0.0) or 0.0),
     }
     completed = subprocess.CompletedProcess(cmd, proc.returncode, out, err)
@@ -599,6 +602,7 @@ def run_command_with_telemetry_cwd(cmd, cwd=None, telemetry=None, env=None, samp
         "cpu_freq_avg_mhz": float(cpu_avg),
         "gpu_freq_avg_mhz": float(gpu_avg),
         "cpu_energy_j": float(delta.get("cpu_energy_j", 0.0) or 0.0),
+        "core_energy_j": float(delta.get("core_energy_j", 0.0) or 0.0),
         "gpu_energy_j": float(delta.get("gpu_energy_j", 0.0) or 0.0),
     }
     completed = subprocess.CompletedProcess(cmd, proc.returncode, out, err)
@@ -621,9 +625,11 @@ def apply_wall_energy(stats, tel_window, comp_elapsed_s, dec_elapsed_s, energy_s
     phase_scale = min(1.0, total_phase_s / elapsed_s) if total_phase_s > 0.0 else 0.0
     comp_share = (float(comp_elapsed_s or 0.0) / total_phase_s) if total_phase_s > 0.0 else 0.0
     cpu_total_energy = float(tel_window.get('cpu_energy_j', 0.0) or 0.0)
+    core_total_energy = float(tel_window.get('core_energy_j', 0.0) or 0.0)
     gpu_total_energy = float(tel_window.get('gpu_energy_j', 0.0) or 0.0)
 
-    stats['cpu_energy_j'] = cpu_total_energy * phase_scale * comp_share
+    cpu_e = core_total_energy if core_total_energy > 0.0 else cpu_total_energy
+    stats['cpu_energy_j'] = cpu_e * phase_scale * comp_share
     stats['gpu_energy_j'] = gpu_total_energy * phase_scale * comp_share
     stats['comp_cpu_power_w'] = (stats['cpu_energy_j'] / comp_elapsed_s) if comp_elapsed_s and comp_elapsed_s > 0.0 else 0.0
     stats['comp_gpu_power_w'] = (stats['gpu_energy_j'] / comp_elapsed_s) if comp_elapsed_s and comp_elapsed_s > 0.0 else 0.0
@@ -768,7 +774,7 @@ def parse_stable_bench_output(output):
     }
 
 
-def warm_lz4_gpu_daemon(file_path, bs_arg, hl, lsz, accel):
+def warm_lz4_gpu_daemon(file_path, bs_arg, lsz, accel):
     if IS_WINDOWS:
         return
 
@@ -779,7 +785,6 @@ def warm_lz4_gpu_daemon(file_path, bs_arg, hl, lsz, accel):
             LZ4_GPU_BIN,
             "--use-daemon",
             "-b", bs_arg,
-            "-H", str(hl),
             "-l", str(lsz),
             "-a", str(accel),
             "-o", warm_out,
@@ -946,8 +951,8 @@ def run_lz4_cpu(file_path, bs, threads, orig_hash, telemetry=None):
     return stats
 
 
-def run_lz4_gpu(file_path, bs, hl, lsz, accel, orig_hash, telemetry=None, bench_seconds=3.0, use_daemon=False):
-    print(f"Bench_GPU: {file_path.name} BS={bs} HL={hl} LSZ={lsz} A={accel}")
+def run_lz4_gpu(file_path, bs, lsz, accel, orig_hash, telemetry=None, bench_seconds=3.0, use_daemon=False):
+    print(f"Bench_GPU: {file_path.name} BS={bs} LSZ={lsz} A={accel}")
     bs_arg = str(bs).lower()
     stats = {
         'ratio': 0.0,
@@ -976,7 +981,6 @@ def run_lz4_gpu(file_path, bs, hl, lsz, accel, orig_hash, telemetry=None, bench_
             LZ4_GPU_BIN,
             "--bench", str(bench_seconds),
             "-b", bs_arg,
-            "-H", str(hl),
             "-l", str(lsz),
             "-a", str(accel),
             str(file_path),
@@ -987,7 +991,7 @@ def run_lz4_gpu(file_path, bs, hl, lsz, accel, orig_hash, telemetry=None, bench_
 
         if stable:
             if use_daemon:
-                warm_lz4_gpu_daemon(file_path, bs_arg, hl, lsz, accel)
+                warm_lz4_gpu_daemon(file_path, bs_arg, lsz, accel)
             stats['ratio'] = stable['ratio']
             stats['comp_mbs'] = stable['comp_kernel_tp']
             stats['dec_mbs'] = stable['dec_kernel_tp']
@@ -1004,7 +1008,6 @@ def run_lz4_gpu(file_path, bs, hl, lsz, accel, orig_hash, telemetry=None, bench_
                 cmd_comp_total.extend([
                     "-v",
                     "-b", bs_arg,
-                    "-H", str(hl),
                     "-l", str(lsz),
                     "-a", str(accel),
                     "-o", tmp_comp,
@@ -1078,7 +1081,7 @@ def run_lz4_gpu(file_path, bs, hl, lsz, accel, orig_hash, telemetry=None, bench_
         else:
             stats['throughput_semantics'] = 'stable_kernel_bench_parse_failed'
             stats['roundtrip_verified'] = False
-            print(f"  [GPU] stable bench parse failed for {file_path} (BS={bs} HL={hl} LSZ={lsz} A={accel})", flush=True)
+            print(f"  [GPU] stable bench parse failed for {file_path} (BS={bs} LSZ={lsz} A={accel})", flush=True)
     except Exception as exc:
         print(f"GPU error: {exc}")
 
@@ -1115,7 +1118,6 @@ def run_lz4_hybrid(file_path, bs, gpu_ratio, cpu_threads, local_size, accel, ori
             "--bench", str(bench_seconds),
             "--bench-io",
             "-b", bs_arg,
-            "-H", str(HYBRID_HASH_LOG),
             "-l", str(local_size),
             "-a", str(accel),
             "-T", str(cpu_threads),
@@ -1144,7 +1146,6 @@ def run_lz4_hybrid(file_path, bs, gpu_ratio, cpu_threads, local_size, accel, ori
                 cmd_comp_total = [
                     LZ4_HYBRID_BIN,
                     "-b", bs_arg,
-                    "-H", str(HYBRID_HASH_LOG),
                     "-l", str(local_size),
                     "-a", str(accel),
                     "-T", str(cpu_threads),
@@ -1225,7 +1226,6 @@ def main():
     parser.add_argument('--cpu-threads', default=','.join(str(x) for x in CPU_THREADS), help='CPU thread list, comma-separated (default: 1,2)')
     parser.add_argument('--cpu-block-sizes', default=','.join(CPU_BLOCK_SIZES), help='CPU block sizes, comma-separated')
     parser.add_argument('--gpu-block-sizes', default=','.join(GPU_BLOCK_SIZES), help='GPU block sizes, comma-separated')
-    parser.add_argument('--hash-logs', default=','.join(str(x) for x in HASH_LOGS), help='GPU hash logs, comma-separated')
     parser.add_argument('--local-sizes', default=','.join(str(x) for x in LOCAL_SIZES), help='GPU local sizes, comma-separated')
     parser.add_argument('--gpu-accels', default=','.join(str(x) for x in GPU_ACCELS), help='GPU acceleration factors, comma-separated')
     parser.add_argument('--hybrid-block-sizes', default=','.join(HYBRID_BLOCK_SIZES), help='Hybrid block sizes, comma-separated')
@@ -1236,8 +1236,8 @@ def main():
     parser.add_argument('--hybrid-accels', default=','.join(str(x) for x in HYBRID_ACCELS), help='Hybrid acceleration factors, comma-separated')
     parser.add_argument('--freq-percent', type=int, default=None, help='Set both CPU and GPU to one shared frequency percent (0-100)')
     parser.add_argument('--freq-points', default='', help='Shared CPU/GPU frequency points, comma-separated (e.g. 40,70,100)')
-    parser.add_argument('--cpu-freq-points', default='', help='CPU frequency points in MHz, comma-separated (e.g. 400,800,1200,1600,1900)')
-    parser.add_argument('--gpu-freq-points', default='', help='GPU frequency points in MHz, comma-separated (e.g. 300,600,900,1200,1500)')
+    parser.add_argument('--cpu-freq-points', default=DEFAULT_CPU_FREQ_MHZ, help='CPU frequency points in MHz, comma-separated (default: %(default)s)')
+    parser.add_argument('--gpu-freq-points', default=DEFAULT_GPU_FREQ_MHZ, help='GPU frequency points in MHz, comma-separated (default: %(default)s)')
     parser.add_argument('--hybrid-freq-pairs', default='', help='Hybrid CPU+GPU freq pairs in MHz, semicolon-separated (e.g. "800,300;800,1500;5000,300;5000,1500")')
     parser.add_argument('--single-file', default='', help='Only benchmark one file (path or basename under samples dir)')
     parser.add_argument('--no-telemetry', action='store_true', help='Disable freq/energy telemetry collection')
@@ -1261,7 +1261,6 @@ def main():
     cpu_threads = parse_int_list(args.cpu_threads, CPU_THREADS)
     cpu_block_sizes = parse_str_list(args.cpu_block_sizes, CPU_BLOCK_SIZES)
     gpu_block_sizes = parse_str_list(args.gpu_block_sizes, GPU_BLOCK_SIZES)
-    hash_logs = parse_int_list(args.hash_logs, HASH_LOGS)
     local_sizes = parse_int_list(args.local_sizes, LOCAL_SIZES)
     gpu_accels = parse_int_list(args.gpu_accels, GPU_ACCELS)
     hybrid_block_sizes = parse_str_list(args.hybrid_block_sizes, HYBRID_BLOCK_SIZES)
@@ -1395,34 +1394,33 @@ def main():
                             orig_hash = hash_cache[sample_key]
 
                             for bs in gpu_block_sizes:
-                                for hl in hash_logs:
-                                    for lsz in local_sizes:
-                                        for accel in gpu_accels:
-                                            gpu_stats = run_lz4_gpu(sample, bs, hl, lsz, accel, orig_hash, telemetry=telemetry, bench_seconds=args.bench_seconds, use_daemon=use_gpu_daemon)
-                                            writer.writerow([
-                                                sample.name,
-                                                point_idx,
-                                                "" if cpu_freq_target is None else cpu_freq_target,
-                                                "" if gpu_freq_target is None else gpu_freq_target,
-                                                "GPU", lsz, bs, hl, accel, fmtf(gpu_stats['ratio'], 2),
-                                                fmtf(gpu_stats['comp_mbs'], 2), fmtf(gpu_stats['dec_mbs'], 2),
-                                                fmtf(gpu_stats.get('comp_total_mbs', 0), 2),
-                                                fmtf(gpu_stats.get('dec_total_mbs', 0), 2),
-                                                fmtf(gpu_stats['comp_time_s'], 6), fmtf(gpu_stats['dec_time_s'], 6),
-                                                fmtf(gpu_stats['cpu_freq_avg_mhz'], 2),
-                                                fmtf(gpu_stats['gpu_freq_avg_mhz'], 2),
-                                                fmtf(gpu_stats['cpu_energy_j'], 6),
-                                                fmtf(gpu_stats['gpu_energy_j'], 6),
-                                                fmtf(gpu_stats['comp_cpu_power_w'], 6),
-                                                fmtf(gpu_stats['comp_gpu_power_w'], 6),
-                                                "yes" if gpu_stats.get('roundtrip_verified') else "no",
-                                            ])
-                                            f.flush()
+                                for lsz in local_sizes:
+                                    for accel in gpu_accels:
+                                        gpu_stats = run_lz4_gpu(sample, bs, lsz, accel, orig_hash, telemetry=telemetry, bench_seconds=args.bench_seconds, use_daemon=use_gpu_daemon)
+                                        writer.writerow([
+                                            sample.name,
+                                            point_idx,
+                                            "" if cpu_freq_target is None else cpu_freq_target,
+                                            "" if gpu_freq_target is None else gpu_freq_target,
+                                            "GPU", lsz, bs, 14, accel, fmtf(gpu_stats['ratio'], 2),
+                                            fmtf(gpu_stats['comp_mbs'], 2), fmtf(gpu_stats['dec_mbs'], 2),
+                                            fmtf(gpu_stats.get('comp_total_mbs', 0), 2),
+                                            fmtf(gpu_stats.get('dec_total_mbs', 0), 2),
+                                            fmtf(gpu_stats['comp_time_s'], 6), fmtf(gpu_stats['dec_time_s'], 6),
+                                            fmtf(gpu_stats['cpu_freq_avg_mhz'], 2),
+                                            fmtf(gpu_stats['gpu_freq_avg_mhz'], 2),
+                                            fmtf(gpu_stats['cpu_energy_j'], 6),
+                                            fmtf(gpu_stats['gpu_energy_j'], 6),
+                                            fmtf(gpu_stats['comp_cpu_power_w'], 6),
+                                            fmtf(gpu_stats['comp_gpu_power_w'], 6),
+                                            "yes" if gpu_stats.get('roundtrip_verified') else "no",
+                                        ])
+                                        f.flush()
 
-                                            gpu_cfg_label = f"FP={point_idx};BS={bs};HL={hl};LSZ={lsz};ACC={accel}"
-                                            emit_case_average(sample.name, "GPU", gpu_cfg_label, gpu_stats)
-                                            if gpu_stats.get("roundtrip_verified", False):
-                                                summary_records.append(build_summary_record("GPU", gpu_cfg_label, gpu_stats))
+                                        gpu_cfg_label = f"FP={point_idx};BS={bs};LSZ={lsz};ACC={accel}"
+                                        emit_case_average(sample.name, "GPU", gpu_cfg_label, gpu_stats)
+                                        if gpu_stats.get("roundtrip_verified", False):
+                                            summary_records.append(build_summary_record("GPU", gpu_cfg_label, gpu_stats))
 
                 if run_hybrid:
                     if hybrid_freq_pairs:
@@ -1468,7 +1466,7 @@ def main():
                                                         point_idx,
                                                         "" if cpu_freq_target is None else cpu_freq_target,
                                                         "" if gpu_freq_target is None else gpu_freq_target,
-                                                        "HYBRID", f"{split_mode}:R{ratio}_T{ht}_L{hlsz}_A{accel}", bs, HYBRID_HASH_LOG, accel, fmtf(hybrid_stats['ratio'], 2),
+                                                        "HYBRID", f"{split_mode}:R{ratio}_T{ht}_L{hlsz}_A{accel}", bs, 14, accel, fmtf(hybrid_stats['ratio'], 2),
                                                         fmtf(hybrid_stats['comp_mbs'], 2), fmtf(hybrid_stats['dec_mbs'], 2),
                                                         fmtf(hybrid_stats.get('comp_total_mbs', 0), 2),
                                                         fmtf(hybrid_stats.get('dec_total_mbs', 0), 2),
@@ -1534,34 +1532,33 @@ def main():
                         # GPU Sweep
                         if run_gpu:
                             for bs in gpu_block_sizes:
-                                for hl in hash_logs:
-                                    for lsz in local_sizes:
-                                        for accel in gpu_accels:
-                                            gpu_stats = run_lz4_gpu(sample, bs, hl, lsz, accel, orig_hash, telemetry=telemetry, bench_seconds=args.bench_seconds, use_daemon=use_gpu_daemon)
-                                            writer.writerow([
-                                                sample.name,
-                                                point_idx,
-                                                "" if cpu_freq_target is None else cpu_freq_target,
-                                                "" if gpu_freq_target is None else gpu_freq_target,
-                                                "GPU", lsz, bs, hl, accel, fmtf(gpu_stats['ratio'], 2),
-                                                fmtf(gpu_stats['comp_mbs'], 2), fmtf(gpu_stats['dec_mbs'], 2),
-                                                fmtf(gpu_stats.get('comp_total_mbs', 0), 2),
-                                                fmtf(gpu_stats.get('dec_total_mbs', 0), 2),
-                                                fmtf(gpu_stats['comp_time_s'], 6), fmtf(gpu_stats['dec_time_s'], 6),
-                                                fmtf(gpu_stats['cpu_freq_avg_mhz'], 2),
-                                                fmtf(gpu_stats['gpu_freq_avg_mhz'], 2),
-                                                fmtf(gpu_stats['cpu_energy_j'], 6),
-                                                fmtf(gpu_stats['gpu_energy_j'], 6),
-                                                fmtf(gpu_stats['comp_cpu_power_w'], 6),
-                                                fmtf(gpu_stats['comp_gpu_power_w'], 6),
-                                                "yes" if gpu_stats.get('roundtrip_verified') else "no",
-                                            ])
-                                            f.flush()
+                                for lsz in local_sizes:
+                                    for accel in gpu_accels:
+                                        gpu_stats = run_lz4_gpu(sample, bs, lsz, accel, orig_hash, telemetry=telemetry, bench_seconds=args.bench_seconds, use_daemon=use_gpu_daemon)
+                                        writer.writerow([
+                                            sample.name,
+                                            point_idx,
+                                            "" if cpu_freq_target is None else cpu_freq_target,
+                                            "" if gpu_freq_target is None else gpu_freq_target,
+                                            "GPU", lsz, bs, 14, accel, fmtf(gpu_stats['ratio'], 2),
+                                            fmtf(gpu_stats['comp_mbs'], 2), fmtf(gpu_stats['dec_mbs'], 2),
+                                            fmtf(gpu_stats.get('comp_total_mbs', 0), 2),
+                                            fmtf(gpu_stats.get('dec_total_mbs', 0), 2),
+                                            fmtf(gpu_stats['comp_time_s'], 6), fmtf(gpu_stats['dec_time_s'], 6),
+                                            fmtf(gpu_stats['cpu_freq_avg_mhz'], 2),
+                                            fmtf(gpu_stats['gpu_freq_avg_mhz'], 2),
+                                            fmtf(gpu_stats['cpu_energy_j'], 6),
+                                            fmtf(gpu_stats['gpu_energy_j'], 6),
+                                            fmtf(gpu_stats['comp_cpu_power_w'], 6),
+                                            fmtf(gpu_stats['comp_gpu_power_w'], 6),
+                                            "yes" if gpu_stats.get('roundtrip_verified') else "no",
+                                        ])
+                                        f.flush()
 
-                                            gpu_cfg_label = f"FP={point_idx};BS={bs};HL={hl};LSZ={lsz};ACC={accel}"
-                                            emit_case_average(sample.name, "GPU", gpu_cfg_label, gpu_stats)
-                                            if gpu_stats.get("roundtrip_verified", False):
-                                                summary_records.append(build_summary_record("GPU", gpu_cfg_label, gpu_stats))
+                                        gpu_cfg_label = f"FP={point_idx};BS={bs};LSZ={lsz};ACC={accel}"
+                                        emit_case_average(sample.name, "GPU", gpu_cfg_label, gpu_stats)
+                                        if gpu_stats.get("roundtrip_verified", False):
+                                            summary_records.append(build_summary_record("GPU", gpu_cfg_label, gpu_stats))
 
                         if run_hybrid:
                              for bs in hybrid_block_sizes:
@@ -1590,7 +1587,7 @@ def main():
                                                         point_idx,
                                                         "" if cpu_freq_target is None else cpu_freq_target,
                                                         "" if gpu_freq_target is None else gpu_freq_target,
-                                                        "HYBRID", f"{split_mode}:R{ratio}_T{ht}_L{hlsz}_A{accel}", bs, HYBRID_HASH_LOG, accel, fmtf(hybrid_stats['ratio'], 2),
+                                                        "HYBRID", f"{split_mode}:R{ratio}_T{ht}_L{hlsz}_A{accel}", bs, 14, accel, fmtf(hybrid_stats['ratio'], 2),
                                                         fmtf(hybrid_stats['comp_mbs'], 2), fmtf(hybrid_stats['dec_mbs'], 2),
                                                         fmtf(hybrid_stats.get('comp_total_mbs', 0), 2),
                                                         fmtf(hybrid_stats.get('dec_total_mbs', 0), 2),

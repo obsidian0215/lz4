@@ -55,12 +55,11 @@ Notes:
 ### Common options
 
 - `-b`, `--block-size`: block size such as `16K`, `32K`, `64K`
-- `-T`, `--cpu-threads`: CPU worker count
+- `-T`, `--cpu-threads`: CPU worker count (default: auto = all cores via `sysconf`)
 - `--gpu-ratio`: fixed GPU block fraction
 - `--adaptive`: enable adaptive split selection
 - `--sample-blocks`: adaptive sample count
 - `-a`, `--acceleration`: LZ4 acceleration factor
-- `-H`, `--hash`: GPU hash log
 - `-l`, `--local`: OpenCL local work-group size
 
 ### Benchmarks
@@ -77,21 +76,18 @@ Notes:
 - The current file format records the total block count, block size, GPU block count, and per-block compressed sizes.
 - The current LZ4 hybrid container still assumes a GPU-first front segment in the compressed payload layout, so arbitrary GPU block permutations are not yet a format-compatible optimization.
 - Recent fixes include repeated-bench correctness, GPU workspace reuse, distributed adaptive sampling, and broader 16K/32K/64K benchmark coverage.
+- Bench loop optimization: GPU kernel args cached across iterations; input upload skipped on repeated iterations.
+- Thread auto-detection: defaults to all available cores via `sysconf(_SC_NPROCESSORS_ONLN)`, overridable via `-T`.
 
-## 2026-03 benchmark refresh
+## Adaptive scheduling model
 
-The latest full-corpus hybrid result is:
+The adaptive split model (`--adaptive`) is energy-aware, load-aware, and compute-resource-aware.
 
-- `exp_results/hybrid_bench/hybrid_bench_20260309_180949.csv`
-
-Recommended companion baseline for endpoint comparison:
-
-- `../exp_results/runs/20260309_merged_full_83/lz4_param_sweep_merged.csv`
-
-Current matched 83-file highlights:
-
-- raw medians: fixed `919.72 / 675.42 MB/s`, adaptive `889.91 / 674.58 MB/s`
-- best-per-file medians: fixed `1425.90 / 802.90 MB/s`, adaptive `1302.24 / 813.20 MB/s`
-- winner counts: fixed wins `48/83` files on compression total, while GPU still dominates decompression with `62/83`
-
-Interpretation: fixed hybrid is now a real compression competitor on the full corpus, but GPU remains the safer default endpoint, especially for decompression.
+- **Throughput model**: Calibrates per-byte CPU throughput (Pc0) and GPU throughput (Pg0) at startup.
+- **Compression-ratio gain** (gC/gG): Adjusts for actual vs reference compression ratio.
+- **Load awareness**: Reads `/proc/stat` for CPU idle fraction, scales by thread count vs total cores.
+- **GPU availability**: Monitors GPU utilization.
+- **Compute-resource awareness**: CPU capacity = `Pc0 * threads * cpu_availability`; thread count is the CPU capacity bound.
+- **Energy-aware correction**: Measures per-byte energy via RAPL core domain (`intel-rapl:0:0`) for CPU and uncore domain (`intel-rapl:0:1`) for GPU during calibration. Final ratio = 70% throughput-optimal + 30% energy-optimal blend.
+- **Small-input guard**: Routes to CPU-only if input smaller than GPU overhead.
+- **Degenerate fallback**: Returns 0.5 when both effective throughputs are zero (decoupled from user-specified gpu_ratio).

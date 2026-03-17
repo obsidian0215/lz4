@@ -15,7 +15,7 @@ int is_daemon_running(void) {
     return access(SOCKET_PATH, F_OK) == 0;
 }
 
-static int do_daemon_op(int mode, const char* input, const char* output, int block_size, int acceleration, int local_size, int hash_log) {
+static int do_daemon_op(int mode, const char* input, const char* output, int block_size, int acceleration, int local_size) {
     int sock;
     struct sockaddr_un addr;
     request_t req;
@@ -52,7 +52,6 @@ static int do_daemon_op(int mode, const char* input, const char* output, int blo
     req.block_size = block_size;
     req.acceleration = acceleration;
     req.local_size = local_size;
-    req.hash_log = hash_log;
 
     if (send(sock, &req, sizeof(req), 0) != sizeof(req)) {
         perror("send request");
@@ -81,6 +80,6 @@ static int do_daemon_op(int mode, const char* input, const char* output, int blo
     }
 }
 
-int run_lz4_client(int mode, const char* input_path, const char* output_path, int block_size, int acceleration, int local_size, int hash_log) {
-    return do_daemon_op(mode, input_path, output_path, block_size, acceleration, local_size, hash_log);
+int run_lz4_client(int mode, const char* input_path, const char* output_path, int block_size, int acceleration, int local_size) {
+    return do_daemon_op(mode, input_path, output_path, block_size, acceleration, local_size);
 }

@@ -21,6 +21,7 @@ class RAPLDomain:
 class TelemetryProbe:
     def __init__(self):
         self.cpu_domain: Optional[RAPLDomain] = None
+        self.core_domain: Optional[RAPLDomain] = None
         self.gpu_domain: Optional[RAPLDomain] = None
         self.gpu_rapl_nonfunctional = False
         self.has_nvidia_smi = shutil.which("nvidia-smi") is not None
@@ -146,6 +147,11 @@ class TelemetryProbe:
                     self.cpu_domain = d
                     break
 
+        for d in domains:
+            if d.name == "core":
+                self.core_domain = d
+                break
+
         gpu_keywords = ("gpu", "uncore", "gt", "graphics")
         for d in domains:
             n = d.name.lower()
@@ -259,6 +265,7 @@ class TelemetryProbe:
             cpu_src = ("win_energy_meter:" if self.cpu_domain.source == "windows_counter" else "rapl:") + self.cpu_domain.name
         else:
             cpu_src = "none"
+        core_src = f"rapl:{self.core_domain.name}" if self.core_domain else "none"
         if self.gpu_domain:
             gpu_src = ("win_energy_meter:" if self.gpu_domain.source == "windows_counter" else "rapl:") + self.gpu_domain.name
         elif self.nvidia_energy_supported:
@@ -269,7 +276,7 @@ class TelemetryProbe:
             gpu_src = "pkg_minus_idle"
         else:
             gpu_src = "none"
-        return f"cpu={cpu_src};gpu={gpu_src}"
+        return f"cpu={cpu_src};core={core_src};gpu={gpu_src}"
 
     @staticmethod
     def _delta_with_wrap(start_v: Optional[float], end_v: Optional[float], max_v: float) -> float:
@@ -301,6 +308,7 @@ class TelemetryProbe:
             "cpu_freq_mhz": self._cpu_avg_freq_mhz(),
             "gpu_freq_mhz": self._gpu_freq_mhz(),
             "cpu_energy_j": self._read_rapl_j(self.cpu_domain),
+            "core_energy_j": self._read_rapl_j(self.core_domain),
             "gpu_energy_j": None,
             "gpu_power_w": None,
         }
@@ -325,6 +333,12 @@ class TelemetryProbe:
             self.cpu_domain.max_j if self.cpu_domain else 0.0,
         )
 
+        core_energy = self._delta_with_wrap(
+            start.get("core_energy_j"),
+            end.get("core_energy_j"),
+            self.core_domain.max_j if self.core_domain else 0.0,
+        )
+
         gpu_energy = 0.0
         if self.gpu_domain is not None:
             gpu_energy = self._delta_with_wrap(
@@ -347,6 +361,7 @@ class TelemetryProbe:
             "gpu_freq_start_mhz": float(start.get("gpu_freq_mhz") or 0.0),
             "gpu_freq_end_mhz": float(end.get("gpu_freq_mhz") or 0.0),
             "cpu_energy_j": float(cpu_energy),
+            "core_energy_j": float(core_energy),
             "gpu_energy_j": float(gpu_energy),
         }
 

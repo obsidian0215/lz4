@@ -83,7 +83,8 @@ static char* read_file_bin(const char* path, size_t* out_len) {
     return buf;
 }
 
-cl_program load_program_with_hash(cl_context context, cl_device_id device, int hash_log) {
+cl_program load_program(cl_context context, cl_device_id device) {
+    const int hash_log = 14;
     uint64_t t1 = get_us();
     char bin_name[128];
     snprintf(bin_name, sizeof(bin_name), "/root/lz4/lz4_gpu/lz4_gpu_%d.clbin", hash_log);
@@ -151,12 +152,10 @@ void process_request(worker_res_t* w, request_t* req, response_t* res) {
     t.ocl_setup_us = 0;
 
     if (req->mode == mode_compress) {
-        int h_log = req->hash_log;
-        if (h_log < MIN_HASH_LOG) h_log = 14;
-        if (h_log > MAX_HASH_LOG) h_log = MAX_HASH_LOG;
+        const int h_log = 14;
 
         pthread_mutex_lock(&g_state.compile_lock);
-        if (!g_state.program_comp[h_log]) g_state.program_comp[h_log] = load_program_with_hash(g_state.context, g_state.device, h_log);
+        if (!g_state.program_comp[h_log]) g_state.program_comp[h_log] = load_program(g_state.context, g_state.device);
         cl_program prog = g_state.program_comp[h_log];
         if (!w->kernel_comp[h_log] && prog) {
             cl_int err;
@@ -171,12 +170,12 @@ void process_request(worker_res_t* w, request_t* req, response_t* res) {
 
         if (kernel) {
             ret = lz4_compress_core(g_state.context, w->queue, kernel, pack_kernel, req->input_path, req->output_path,
-                                  req->block_size, req->acceleration, &w->ws, &t, req->local_size, h_log);
+                                  req->block_size, req->acceleration, &w->ws, &t, req->local_size, 0);
         }
     } else {
         int h_log = 14;
         pthread_mutex_lock(&g_state.compile_lock);
-        if (!g_state.program_comp[h_log]) g_state.program_comp[h_log] = load_program_with_hash(g_state.context, g_state.device, h_log);
+        if (!g_state.program_comp[h_log]) g_state.program_comp[h_log] = load_program(g_state.context, g_state.device);
         cl_program prog = g_state.program_comp[h_log];
         if (!w->kernel_decomp && prog) {
             cl_int err;

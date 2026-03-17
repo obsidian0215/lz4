@@ -59,9 +59,8 @@ Notes:
 
 - `-b`, `--block-size`: GPU block size (`16K`, `32K`, `64K`, ...)
 - `-a`, `--acceleration`: compression acceleration
-- `-H`, `--hash`: hash log bits
 - `-l`, `--local`: local work-group size
-- `--bench [SECONDS]`: warmed stable benchmark loop
+- `--bench [N]`: warmed stable benchmark loop (N seconds, default 3)
 
 ### Device selection
 

@@ -339,16 +339,17 @@ inline U32 LZ4_hashPosition(const __global BYTE* p, int tableType, U32* sequence
 inline void LZ4_putIndexOnHash(U32 idx, U32 h, __global U32* tableBase, int tableType, U32 sequence, U32 epoch) __attribute__((always_inline)) {
     U32 const hashLog = (tableType == 0) ? (LZ4_HASHLOG + 1) : LZ4_HASHLOG;
     U32 const mask = (1U << hashLog) - 1U;
-    /* Compact 32-bit entry: [8-bit epoch | 8-bit fingerprint | 16-bit index]
-     * Halves hash table memory bandwidth vs 64-bit entries.
-     * 8-bit epoch sufficient: each WI processes ceil(totalBlocks/total_wi) blocks,
-     * typically <10, well within 255 range. */
+    /* Compact 32-bit entry: [8-bit epoch | 8-bit fingerprint | 16-bit low position]
+     * Store the low 16 bits of the byte position and reconstruct the full match
+     * position relative to the current byte offset on lookup. This keeps the
+     * 8-bit fingerprint filter while allowing blocks > 64KB to continue using
+     * the last 64KB search window correctly. */
     U32 fp = ((sequence * 0x9E3779B1U) >> 24) & 0xFF;
     U32 packed = ((epoch & 0xFF) << 24) | (fp << 16) | (idx & 0xFFFF);
     tableBase[h & mask] = packed;
 }
 
-inline U32 LZ4_getIndexOnHash(U32 h, __global U32* tableBase, int tableType, U32 sequence, int* fp_match, U32 epoch) __attribute__((always_inline)) {
+inline U32 LZ4_getIndexOnHash(U32 h, __global U32* tableBase, int tableType, U32 sequence, int* fp_match, U32 epoch, U32 current) __attribute__((always_inline)) {
     U32 const hashLog = (tableType == 0) ? (LZ4_HASHLOG + 1) : LZ4_HASHLOG;
     U32 const mask = (1U << hashLog) - 1U;
     U32 const packed = tableBase[h & mask];
@@ -358,7 +359,12 @@ inline U32 LZ4_getIndexOnHash(U32 h, __global U32* tableBase, int tableType, U32
         return 0;
     }
     *fp_match = (((packed >> 16) & 0xFF) == (((sequence * 0x9E3779B1U) >> 24) & 0xFF));
-    return packed & 0xFFFF;
+    {
+        U32 pos16 = packed & 0xFFFF;
+        U32 matchIndex = (current & 0xFFFF0000U) | pos16;
+        if (matchIndex > current) matchIndex -= 0x10000U;
+        return matchIndex;
+    }
 }
 
 inline void LZ4_putIndexOnHashLocal(U32 idx, U32 h, __local U16* table) __attribute__((always_inline)) {
@@ -462,7 +468,7 @@ int lz4_compress_core_accelerated(
                 ipValue = forwardIpValue;
                 U32 current = (U32)(forwardIp - src);
                 int fp_match;
-                U32 matchIndex = LZ4_getIndexOnHash(h_iter, hashTable, tableType, ipValue, &fp_match, epoch);
+                U32 matchIndex = LZ4_getIndexOnHash(h_iter, hashTable, tableType, ipValue, &fp_match, epoch, current);
                 ip = forwardIp;
                 forwardIp += step;
                 step = (searchMatchNb++ >> 6);
@@ -513,7 +519,7 @@ _next_match_g:
         U32 h_ip = LZ4_hashPosition(ip, tableType, &seq_ip);
         U32 current = (U32)(ip - src);
         int fp_match;
-        U32 matchIndex = LZ4_getIndexOnHash(h_ip, hashTable, tableType, seq_ip, &fp_match, epoch);
+        U32 matchIndex = LZ4_getIndexOnHash(h_ip, hashTable, tableType, seq_ip, &fp_match, epoch, current);
         LZ4_putIndexOnHash(current, h_ip, hashTable, tableType, seq_ip, epoch);
         if (fp_match && (matchIndex < current) && (current - matchIndex < LZ4_DISTANCE_MAX)) {
             if (LZ4_read32(src + matchIndex) == seq_ip) {

@@ -23,7 +23,6 @@
 typedef struct {
     size_t block_size;
     int acceleration;
-    int hash_log;
     int local_size;
     int cpu_threads;
     double gpu_ratio;
@@ -107,6 +106,8 @@ typedef struct {
     double cpu_throughput;
     double gpu_throughput;
     double gpu_overhead_s;
+    double cpu_energy_per_byte;
+    double gpu_energy_per_byte;
     int    is_unified_memory;
     int    valid;
 } device_profile_t;
@@ -117,6 +118,13 @@ static double read_sysfs_double(const char* path) {
     FILE* f = fopen(path, "r");
     double val = -1.0;
     if (f) { if (fscanf(f, "%lf", &val) != 1) val = -1.0; fclose(f); }
+    return val;
+}
+
+static uint64_t read_rapl_energy_uj(const char* domain_path) {
+    FILE* f = fopen(domain_path, "r");
+    uint64_t val = 0;
+    if (f) { if (fscanf(f, "%lu", &val) != 1) val = 0; fclose(f); }
     return val;
 }
 
@@ -166,12 +174,12 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
                                size_t block_size,
                                int acceleration,
                                int local_size,
-                               int hash_log,
                                uint32_t** out_sizes,
                                uint32_t** out_offsets,
                                unsigned char** out_slots,
                                size_t* out_slot_size,
-                               uint64_t* kernel_us);
+                               uint64_t* kernel_us,
+                               int skip_input_upload);
 
 static void calibrate_device_profile(ocl_env_t* ocl, const hybrid_cfg_t* cfg) {
     if (g_dev_profile.valid) return;
@@ -196,14 +204,25 @@ static void calibrate_device_profile(ocl_env_t* ocl, const hybrid_cfg_t* cfg) {
         cal_tmp = (char*)malloc((size_t)cal_bound);
         if (!cal_tmp) { free(cal_buf); g_dev_profile.valid = 1; g_dev_profile.cpu_throughput = 500e6; g_dev_profile.gpu_throughput = 2000e6; g_dev_profile.gpu_overhead_s = 0.0005; return; }
 
-        t0 = get_us();
-        for (int rep = 0; rep < 3; rep++) {
-            comp_sz = LZ4_compress_fast((const char*)cal_buf, cal_tmp, (int)cal_size, cal_bound,
-                                        cfg->acceleration > 0 ? cfg->acceleration : 1);
+        {
+            uint64_t e0 = read_rapl_energy_uj("/sys/class/powercap/intel-rapl:0:0/energy_uj");
+            t0 = get_us();
+            for (int rep = 0; rep < 3; rep++) {
+                comp_sz = LZ4_compress_fast((const char*)cal_buf, cal_tmp, (int)cal_size, cal_bound,
+                                            cfg->acceleration > 0 ? cfg->acceleration : 1);
+            }
+            t1 = get_us();
+            (void)comp_sz;
+            g_dev_profile.cpu_throughput = (3.0 * (double)cal_size) / ((double)(t1 - t0) * 1e-6);
+
+            {
+                uint64_t e1 = read_rapl_energy_uj("/sys/class/powercap/intel-rapl:0:0/energy_uj");
+                if (e0 > 0 && e1 > e0) {
+                    double energy_j = (double)(e1 - e0) * 1e-6;
+                    g_dev_profile.cpu_energy_per_byte = energy_j / (3.0 * (double)cal_size);
+                }
+            }
         }
-        t1 = get_us();
-        (void)comp_sz;
-        g_dev_profile.cpu_throughput = (3.0 * (double)cal_size) / ((double)(t1 - t0) * 1e-6);
         free(cal_tmp);
 
         {
@@ -213,16 +232,26 @@ static void calibrate_device_profile(ocl_env_t* ocl, const hybrid_cfg_t* cfg) {
             size_t gp_slot_size = 0;
             uint64_t gp_kernel_us = 0;
 
+            uint64_t ge0 = read_rapl_energy_uj("/sys/class/powercap/intel-rapl:0:1/energy_uj");
             t0 = get_us();
             if (gpu_compress_blocks(ocl, cal_buf, cal_size,
                                     cfg->block_size > 0 ? cfg->block_size : 32768,
                                     cfg->acceleration > 0 ? cfg->acceleration : 1,
-                                    cfg->local_size, cfg->hash_log,
-                                    &gp_sizes, &gp_offsets, &gp_slots, &gp_slot_size, &gp_kernel_us) == 0) {
+                                    cfg->local_size,
+                                    &gp_sizes, &gp_offsets, &gp_slots, &gp_slot_size, &gp_kernel_us, 0) == 0) {
                 t1 = get_us();
                 g_dev_profile.gpu_throughput = (double)cal_size / ((double)(t1 - t0) * 1e-6);
                 g_dev_profile.gpu_overhead_s = ((double)(t1 - t0) * 1e-6) - ((double)gp_kernel_us * 1e-6);
                 if (g_dev_profile.gpu_overhead_s < 0.0) g_dev_profile.gpu_overhead_s = 0.0;
+
+                {
+                    uint64_t ge1 = read_rapl_energy_uj("/sys/class/powercap/intel-rapl:0:1/energy_uj");
+                    if (ge0 > 0 && ge1 > ge0) {
+                        double energy_j = (double)(ge1 - ge0) * 1e-6;
+                        g_dev_profile.gpu_energy_per_byte = energy_j / (double)cal_size;
+                    }
+                }
+
                 free(gp_sizes); free(gp_offsets); free(gp_slots);
             } else {
                 g_dev_profile.gpu_throughput = 2000e6;
@@ -507,7 +536,7 @@ static double choose_adaptive_gpu_ratio(ocl_env_t* ocl,
 
     if (sample_ratio_pct_out) *sample_ratio_pct_out = 0.0;
     if (!input || input_size == 0 || num_blocks == 0 || !cfg || !ocl)
-        return cfg ? cfg->gpu_ratio : 1.0;
+        return 0.5;
 
     /* --- 1. Device capability profile (cached) --- */
     calibrate_device_profile(ocl, cfg);
@@ -589,10 +618,20 @@ static double choose_adaptive_gpu_ratio(ocl_env_t* ocl,
     }
 
     /* --- Makespan-optimal ratio --- */
-    if (Pc_eff + Pg_eff <= 0.0) return cfg->gpu_ratio;
+    if (Pc_eff + Pg_eff <= 0.0) return 0.5;
     r_star = Pg_eff / (Pc_eff + Pg_eff);
     if (B > 0.0 && t0 > 0.0) {
         r_star -= (t0 * Pc_eff * Pg_eff) / (B * (Pc_eff + Pg_eff));
+    }
+
+    /* --- 4. Energy-aware correction --- */
+    {
+        double eC = g_dev_profile.cpu_energy_per_byte;
+        double eG = g_dev_profile.gpu_energy_per_byte;
+        if (eC > 0.0 && eG > 0.0) {
+            double r_energy = (Pg_eff * eC) / (Pc_eff * eG + Pg_eff * eC);
+            r_star = 0.7 * r_star + 0.3 * r_energy;
+        }
     }
 
     if (r_star < 0.0) r_star = 0.0;
@@ -602,9 +641,12 @@ static double choose_adaptive_gpu_ratio(ocl_env_t* ocl,
         fprintf(stderr,
                 "Adaptive: Pc0=%.0f gC=%.2f sC=%.2f threads=%ld Pc_eff=%.0f | "
                 "Pg0=%.0f gG=%.2f sG=%.2f Pg_eff=%.0f | "
+                "eC=%.2e eG=%.2e | "
                 "t0=%.6f B=%.0f r*=%.4f\n",
                 Pc0, gC, sC, thread_count, Pc_eff,
                 Pg0, gG, sG, Pg_eff,
+                g_dev_profile.cpu_energy_per_byte,
+                g_dev_profile.gpu_energy_per_byte,
                 t0, B, r_star);
     }
 
@@ -667,7 +709,7 @@ static int create_temp_path(char* path_buf, size_t path_buf_size, const char* te
     return 0;
 }
 
-static int ocl_init(ocl_env_t* ocl, int hash_log) {
+static int ocl_init(ocl_env_t* ocl) {
     cl_int err;
     cl_platform_id pf = NULL;
     cl_device_type pref_type = preferred_opencl_device_type();
@@ -702,7 +744,7 @@ static int ocl_init(ocl_env_t* ocl, int hash_log) {
         return -1;
     }
 
-    ocl->prog = lz4_load_program(ocl->ctx, ocl->dev, hash_log);
+    ocl->prog = lz4_load_program(ocl->ctx, ocl->dev);
     if (!ocl->prog) {
         fprintf(stderr, "OpenCL init failed: lz4_load_program returned NULL\n");
         return -1;
@@ -1035,12 +1077,13 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
                                size_t block_size,
                                int acceleration,
                                int local_size,
-                               int hash_log,
                                uint32_t** out_sizes,
                                uint32_t** out_offsets,
                                unsigned char** out_slots,
                                size_t* out_slot_size,
-                               uint64_t* kernel_us) {
+                               uint64_t* kernel_us,
+                               int skip_input_upload) {
+    const int hash_log = 14;
     cl_int err = CL_SUCCESS;
     uint32_t* h_block_info = NULL;
     uint32_t* h_out_offsets = NULL;
@@ -1135,28 +1178,33 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
     epoch_base = ocl->ws.comp_epoch_base;
     ocl->ws.comp_epoch_base += (uint32_t)(((size_t)num_blocks + gsz - 1) / gsz) + 2U;
 
-    if (write_buffer_mapped(ocl->queue, ocl->ws.in_buf, src, src_size) != 0 ||
-        write_buffer_mapped(ocl->queue, ocl->ws.block_info_buf, h_block_info, num_blocks * 2U * sizeof(uint32_t)) != 0 ||
-        write_buffer_mapped(ocl->queue, ocl->ws.out_offsets_buf, h_out_offsets, num_blocks * sizeof(uint32_t)) != 0) {
-        goto fail;
+    if (!skip_input_upload) {
+        if (write_buffer_mapped(ocl->queue, ocl->ws.in_buf, src, src_size) != 0 ||
+            write_buffer_mapped(ocl->queue, ocl->ws.block_info_buf, h_block_info, num_blocks * 2U * sizeof(uint32_t)) != 0 ||
+            write_buffer_mapped(ocl->queue, ocl->ws.out_offsets_buf, h_out_offsets, num_blocks * sizeof(uint32_t)) != 0) {
+            goto fail;
+        }
     }
 
     inputSize = (int)src_size;
     totalBlocks = (int)num_blocks;
 
-    err = CL_SUCCESS;
-    err |= clSetKernelArg(ocl->kcomp, 0, sizeof(cl_mem), &ocl->ws.in_buf);
-    err |= clSetKernelArg(ocl->kcomp, 1, sizeof(cl_mem), &ocl->ws.out_buf);
-    err |= clSetKernelArg(ocl->kcomp, 2, sizeof(cl_mem), &ocl->ws.output_size_buf);
-    err |= clSetKernelArg(ocl->kcomp, 3, sizeof(cl_mem), &ocl->ws.block_info_buf);
-    err |= clSetKernelArg(ocl->kcomp, 4, sizeof(cl_mem), &ocl->ws.out_offsets_buf);
-    err |= clSetKernelArg(ocl->kcomp, 5, sizeof(int), &totalBlocks);
-    err |= clSetKernelArg(ocl->kcomp, 6, sizeof(int), &inputSize);
-    err |= clSetKernelArg(ocl->kcomp, 7, sizeof(int), &tableType);
-    err |= clSetKernelArg(ocl->kcomp, 8, sizeof(int), &acceleration);
-    err |= clSetKernelArg(ocl->kcomp, 9, sizeof(int), &globalIndexBase);
-    err |= clSetKernelArg(ocl->kcomp, 10, sizeof(cl_mem), &ocl->ws.dict_buf);
-    err |= clSetKernelArg(ocl->kcomp, 11, sizeof(uint32_t), &epoch_base);
+    if (!skip_input_upload) {
+        err = CL_SUCCESS;
+        err |= clSetKernelArg(ocl->kcomp, 0, sizeof(cl_mem), &ocl->ws.in_buf);
+        err |= clSetKernelArg(ocl->kcomp, 1, sizeof(cl_mem), &ocl->ws.out_buf);
+        err |= clSetKernelArg(ocl->kcomp, 2, sizeof(cl_mem), &ocl->ws.output_size_buf);
+        err |= clSetKernelArg(ocl->kcomp, 3, sizeof(cl_mem), &ocl->ws.block_info_buf);
+        err |= clSetKernelArg(ocl->kcomp, 4, sizeof(cl_mem), &ocl->ws.out_offsets_buf);
+        err |= clSetKernelArg(ocl->kcomp, 5, sizeof(int), &totalBlocks);
+        err |= clSetKernelArg(ocl->kcomp, 6, sizeof(int), &inputSize);
+        err |= clSetKernelArg(ocl->kcomp, 7, sizeof(int), &tableType);
+        err |= clSetKernelArg(ocl->kcomp, 8, sizeof(int), &acceleration);
+        err |= clSetKernelArg(ocl->kcomp, 9, sizeof(int), &globalIndexBase);
+        err |= clSetKernelArg(ocl->kcomp, 10, sizeof(cl_mem), &ocl->ws.dict_buf);
+        if (err != CL_SUCCESS) goto fail;
+    }
+    err = clSetKernelArg(ocl->kcomp, 11, sizeof(uint32_t), &epoch_base);
     if (err != CL_SUCCESS) goto fail;
 
     {
@@ -1440,7 +1488,8 @@ static int hybrid_compress_memory(ocl_env_t* ocl,
                                   const hybrid_cfg_t* cfg,
                                   unsigned char** out_buf,
                                   size_t* out_size,
-                                  hybrid_metrics_t* m) {
+                                  hybrid_metrics_t* m,
+                                  int skip_input_upload) {
     size_t num_blocks;
     size_t gpu_blocks;
     size_t cpu_blocks;
@@ -1557,12 +1606,12 @@ static int hybrid_compress_memory(ocl_env_t* ocl,
                                     cfg->block_size,
                                     cfg->acceleration,
                                     cfg->local_size,
-                                    cfg->hash_log,
                                     &gpu_sizes,
                                     &gpu_offsets,
                                     &gpu_slots,
                                     &gpu_slot_size,
-                                    m ? &m->gpu_kernel_us : &(uint64_t){0}) != 0) {
+                                    m ? &m->gpu_kernel_us : &(uint64_t){0},
+                                    skip_input_upload) != 0) {
                 goto fail;
             }
         }
@@ -1872,15 +1921,13 @@ static void show_help(const char* prog) {
     fprintf(stderr, "  -o, --output FILE        Output file\n");
     fprintf(stderr, "  -b, --block-size N       Block size in bytes (default: 16K)\n");
     fprintf(stderr, "  -a, --acceleration N     GPU acceleration (default: 1)\n");
-    fprintf(stderr, "  -H, --hash N             GPU hash log bits (default: 14)\n");
     fprintf(stderr, "  -l, --local N            GPU local work-group size (default: 1)\n");
-    fprintf(stderr, "  -T, --cpu-threads N      CPU thread count for CPU portion (default: 1)\n");
+    fprintf(stderr, "  -T, --cpu-threads N      CPU thread count for CPU portion (default: auto = all cores)\n");
     fprintf(stderr, "  --adaptive               Enable adaptive per-file CPU/GPU split\n");
     fprintf(stderr, "  --sample-blocks N        Adaptive sample block count (default: 8)\n");
     fprintf(stderr, "  --gpu-ratio F            Fraction of blocks assigned to GPU (default: 0.7)\n");
-    fprintf(stderr, "  --bench [SECONDS]        Benchmark mode\n");
+    fprintf(stderr, "  --bench [N]              Benchmark mode with optional N seconds (default: 3)\n");
     fprintf(stderr, "  --bench-io               Include file write/read in bench total throughput\n");
-    fprintf(stderr, "  --bench-seconds N        Benchmark duration in seconds (default: 3)\n");
     fprintf(stderr, "  -v, --verbose            Verbose output\n");
 }
 
@@ -1906,7 +1953,7 @@ static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_sec
         return 1;
     }
 
-    if (ocl_init(&ocl, cfg->hash_log) != 0) {
+    if (ocl_init(&ocl) != 0) {
         fprintf(stderr, "bench error: OpenCL init failed\n");
         free(input);
         return 1;
@@ -1943,7 +1990,7 @@ static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_sec
         uint64_t dec_write_us = 0;
 
         const uint64_t ctot0 = get_us();
-        if (hybrid_compress_memory(&ocl, input, input_size, cfg, &comp_buf, &comp_size, &cm) != 0) {
+        if (hybrid_compress_memory(&ocl, input, input_size, cfg, &comp_buf, &comp_size, &cm, (n > 0) ? 1 : 0) != 0) {
             verify_ok = 0;
             break;
         }
@@ -2079,9 +2126,8 @@ int main(int argc, char** argv) {
     hybrid_cfg_t cfg;
     cfg.block_size = 16 * 1024;
     cfg.acceleration = 1;
-    cfg.hash_log = 14;
     cfg.local_size = 1;
-    cfg.cpu_threads = 1;
+    cfg.cpu_threads = 0;  /* 0 = auto-detect at runtime */
     cfg.gpu_ratio = 0.7;
     cfg.adaptive_split = 0;
     cfg.adaptive_sample_blocks = 8;
@@ -2114,9 +2160,6 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--acceleration") == 0) {
             if (i + 1 < argc) cfg.acceleration = atoi(argv[++i]);
             else { fprintf(stderr, "Error: -a requires an argument\n"); return 1; }
-        } else if (strcmp(argv[i], "-H") == 0 || strcmp(argv[i], "--hash") == 0) {
-            if (i + 1 < argc) cfg.hash_log = atoi(argv[++i]);
-            else { fprintf(stderr, "Error: -H requires an argument\n"); return 1; }
         } else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--local") == 0) {
             if (i + 1 < argc) cfg.local_size = atoi(argv[++i]);
             else { fprintf(stderr, "Error: -l requires an argument\n"); return 1; }
@@ -2142,11 +2185,6 @@ int main(int argc, char** argv) {
             }
         } else if (strcmp(argv[i], "--bench-io") == 0) {
             bench_include_io = 1;
-        } else if (strcmp(argv[i], "--bench-seconds") == 0) {
-            if (i + 1 < argc) bench_seconds = atof(argv[++i]);
-            else { fprintf(stderr, "Error: --bench-seconds requires an argument\n"); return 1; }
-        } else if (strncmp(argv[i], "--bench-seconds=", 16) == 0) {
-            bench_seconds = atof(argv[i] + 16);
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             cfg.verbose = 1;
         } else if (argv[i][0] == '-') {
@@ -2174,10 +2212,11 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Error: block size must be > 0\n");
         return 1;
     }
-    if (cfg.cpu_threads <= 0) cfg.cpu_threads = 1;
+    if (cfg.cpu_threads <= 0) {
+        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        cfg.cpu_threads = (ncpu > 0) ? (int)ncpu : 4;
+    }
     if (cfg.local_size <= 0) cfg.local_size = 1;
-    if (cfg.hash_log <= 0) cfg.hash_log = 14;
-    if (cfg.hash_log == 13) cfg.hash_log = 14;
     if (cfg.gpu_ratio < 0.0) cfg.gpu_ratio = 0.0;
     if (cfg.gpu_ratio > 1.0) cfg.gpu_ratio = 1.0;
 
@@ -2209,7 +2248,7 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        if (ocl_init(&ocl, cfg.hash_log) != 0) {
+        if (ocl_init(&ocl) != 0) {
             fprintf(stderr, "Error: OpenCL init failed\n");
             free(in_buf);
             return 1;
@@ -2217,7 +2256,7 @@ int main(int argc, char** argv) {
 
         if (!mode_decompress) {
             const uint64_t t0 = get_us();
-            if (hybrid_compress_memory(&ocl, in_buf, in_sz, &cfg, &out_buf, &out_sz, &met) != 0) {
+            if (hybrid_compress_memory(&ocl, in_buf, in_sz, &cfg, &out_buf, &out_sz, &met, 0) != 0) {
                 fprintf(stderr, "Error: compression failed\n");
                 goto done;
             }
