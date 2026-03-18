@@ -7,6 +7,7 @@
 
 typedef struct {
     cl_mem in_buf;
+    cl_mem comp_in_buf;
     cl_mem out_buf;
     cl_mem packed_out_buf;
     cl_mem block_info_buf;
@@ -21,6 +22,7 @@ typedef struct {
     cl_mem decomp_sizes_out_buf;
     uint32_t comp_epoch_base;
     size_t current_in_capacity;
+    size_t current_comp_in_capacity;
     size_t current_out_capacity;
     size_t current_packed_out_capacity;
     size_t current_blocks_capacity;

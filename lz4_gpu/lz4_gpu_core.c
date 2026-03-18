@@ -42,6 +42,7 @@ void lz4_gpu_workspace_init(lz4_gpu_workspace_t* ws) {
 
 void lz4_gpu_workspace_free(lz4_gpu_workspace_t* ws) {
     if (ws->in_buf) clReleaseMemObject(ws->in_buf);
+    if (ws->comp_in_buf) clReleaseMemObject(ws->comp_in_buf);
     if (ws->out_buf) clReleaseMemObject(ws->out_buf);
     if (ws->packed_out_buf) clReleaseMemObject(ws->packed_out_buf);
     if (ws->block_info_buf) clReleaseMemObject(ws->block_info_buf);

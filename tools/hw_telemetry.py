@@ -302,6 +302,34 @@ class TelemetryProbe:
         delta = self._delta_with_wrap(e1, e2, self.cpu_domain.max_j)
         return delta / duration_s
 
+    def measure_idle_core_power_w(self, duration_s: float = 1.0) -> float:
+        """Measure idle CPU core-domain power over duration_s seconds. Returns watts."""
+        if self.core_domain is None:
+            return 0.0
+        e1 = self._read_rapl_j(self.core_domain)
+        if e1 is None:
+            return 0.0
+        time.sleep(duration_s)
+        e2 = self._read_rapl_j(self.core_domain)
+        if e2 is None:
+            return 0.0
+        delta = self._delta_with_wrap(e1, e2, self.core_domain.max_j)
+        return delta / duration_s
+
+    def measure_idle_gpu_power_w(self, duration_s: float = 1.0) -> float:
+        """Measure idle GPU power over duration_s seconds. Returns watts."""
+        s0 = self.snapshot()
+        time.sleep(duration_s)
+        s1 = self.snapshot()
+        d = self.diff(s0, s1)
+        elapsed = float(d.get("elapsed_s", duration_s) or duration_s)
+        if elapsed <= 0.0:
+            elapsed = duration_s if duration_s > 0.0 else 1.0
+        gpu_e = float(d.get("gpu_energy_j", 0.0) or 0.0)
+        if gpu_e <= 0.0:
+            return 0.0
+        return gpu_e / elapsed
+
     def snapshot(self) -> Dict[str, Optional[float]]:
         snap = {
             "ts": time.time(),
@@ -363,6 +391,105 @@ class TelemetryProbe:
             "cpu_energy_j": float(cpu_energy),
             "core_energy_j": float(core_energy),
             "gpu_energy_j": float(gpu_energy),
+        }
+
+    def summarize_samples(self, samples) -> Dict[str, float]:
+        if not samples:
+            return {
+                "elapsed_s": 0.0,
+                "cpu_freq_avg_mhz": 0.0,
+                "gpu_freq_avg_mhz": 0.0,
+                "cpu_energy_j": 0.0,
+                "core_energy_j": 0.0,
+                "gpu_energy_j": 0.0,
+                "cpu_pkg_peak_power_w": 0.0,
+                "cpu_core_peak_power_w": 0.0,
+                "gpu_peak_power_w": 0.0,
+            }
+
+        cpu_freq_vals = [float(s.get("cpu_freq_mhz") or 0.0) for s in samples]
+        gpu_freq_vals = [float(s.get("gpu_freq_mhz") or 0.0) for s in samples if float(s.get("gpu_freq_mhz") or 0.0) > 0.0]
+
+        if len(samples) == 1:
+            return {
+                "elapsed_s": 0.0,
+                "cpu_freq_avg_mhz": float(sum(cpu_freq_vals) / len(cpu_freq_vals)) if cpu_freq_vals else 0.0,
+                "gpu_freq_avg_mhz": float(sum(gpu_freq_vals) / len(gpu_freq_vals)) if gpu_freq_vals else 0.0,
+                "cpu_energy_j": 0.0,
+                "core_energy_j": 0.0,
+                "gpu_energy_j": 0.0,
+                "cpu_pkg_peak_power_w": 0.0,
+                "cpu_core_peak_power_w": 0.0,
+                "gpu_peak_power_w": 0.0,
+            }
+
+        cpu_energy = 0.0
+        core_energy = 0.0
+        gpu_energy = 0.0
+        cpu_pkg_peak = 0.0
+        cpu_core_peak = 0.0
+        gpu_peak = 0.0
+        elapsed_total = max(1e-9, float((samples[-1].get("ts") or 0.0) - (samples[0].get("ts") or 0.0)))
+
+        for i in range(1, len(samples)):
+            s0 = samples[i - 1]
+            s1 = samples[i]
+            dt = max(1e-9, float((s1.get("ts") or 0.0) - (s0.get("ts") or 0.0)))
+
+            de_cpu = self._delta_with_wrap(
+                s0.get("cpu_energy_j"),
+                s1.get("cpu_energy_j"),
+                self.cpu_domain.max_j if self.cpu_domain else 0.0,
+            )
+            de_core = self._delta_with_wrap(
+                s0.get("core_energy_j"),
+                s1.get("core_energy_j"),
+                self.core_domain.max_j if self.core_domain else 0.0,
+            )
+
+            de_gpu = 0.0
+            gp_interval = 0.0
+            if self.gpu_domain is not None:
+                de_gpu = self._delta_with_wrap(
+                    s0.get("gpu_energy_j"),
+                    s1.get("gpu_energy_j"),
+                    self.gpu_domain.max_j,
+                )
+                gp_interval = de_gpu / dt if de_gpu > 0.0 else 0.0
+            elif self.nvidia_energy_supported:
+                de_gpu = self._delta_with_wrap(s0.get("gpu_energy_j"), s1.get("gpu_energy_j"), 0.0)
+                gp_interval = de_gpu / dt if de_gpu > 0.0 else 0.0
+            elif self.has_nvidia_smi:
+                p0 = s0.get("gpu_power_w")
+                p1 = s1.get("gpu_power_w")
+                if p0 is not None and p1 is not None:
+                    gp_interval = max(0.0, (float(p0) + float(p1)) * 0.5)
+                    de_gpu = gp_interval * dt
+
+            cpu_energy += de_cpu
+            core_energy += de_core
+            gpu_energy += de_gpu
+
+            if de_cpu > 0.0:
+                cpu_pkg_peak = max(cpu_pkg_peak, de_cpu / dt)
+            if de_core > 0.0:
+                cpu_core_peak = max(cpu_core_peak, de_core / dt)
+            if gp_interval > 0.0:
+                gpu_peak = max(gpu_peak, gp_interval)
+
+        if gpu_peak <= 0.0 and gpu_energy > 0.0 and elapsed_total > 0.0:
+            gpu_peak = gpu_energy / elapsed_total
+
+        return {
+            "elapsed_s": float(elapsed_total),
+            "cpu_freq_avg_mhz": float(sum(cpu_freq_vals) / len(cpu_freq_vals)) if cpu_freq_vals else 0.0,
+            "gpu_freq_avg_mhz": float(sum(gpu_freq_vals) / len(gpu_freq_vals)) if gpu_freq_vals else 0.0,
+            "cpu_energy_j": float(cpu_energy),
+            "core_energy_j": float(core_energy),
+            "gpu_energy_j": float(gpu_energy),
+            "cpu_pkg_peak_power_w": float(cpu_pkg_peak),
+            "cpu_core_peak_power_w": float(cpu_core_peak),
+            "gpu_peak_power_w": float(gpu_peak),
         }
 
 

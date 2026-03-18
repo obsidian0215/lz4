@@ -30,7 +30,16 @@ lz4_hybrid: lz4_hybrid.c ../lz4_gpu/lz4_gpu_core.c ../lz4_gpu/lz4_gpu_utils.c ..
 sync-kernels:
 	@for f in $(GPU_DIR)/*.cl $(GPU_DIR)/*.clbin; do \
 		bn=$$(basename "$$f"); \
-		if [ ! -e "$$bn" ]; then ln -sf "$$f" "$$bn" 2>/dev/null || cp -f "$$f" "$$bn"; fi; \
+		needs_sync=0; \
+		if [ ! -e "$$bn" ]; then \
+			needs_sync=1; \
+		elif [ -f "$$bn" ]; then \
+			linktxt=$$(tr -d '\r\n' < "$$bn" 2>/dev/null || true); \
+			case "$$linktxt" in \
+				../lz4_gpu/*) needs_sync=1 ;; \
+			esac; \
+		fi; \
+		if [ $$needs_sync -eq 1 ]; then ln -sf "$$f" "$$bn" 2>/dev/null || cp -f "$$f" "$$bn"; fi; \
 	done
 
 clean:
