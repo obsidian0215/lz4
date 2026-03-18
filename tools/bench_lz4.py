@@ -45,8 +45,9 @@ HYBRID_BLOCK_SIZES = ["64K", "128K", "256K"]
 HYBRID_GPU_RATIOS = [0.0, 0.3, 0.5, 0.7, 1.0]
 HYBRID_CPU_THREADS = [1, 4, 0]
 HYBRID_SPLIT_MODES = ["fixed", "adaptive"]
+HYBRID_SPLIT_LAYOUTS = ["prefix", "striped"]
 HYBRID_LOCAL_SIZES = [1]
-HYBRID_ACCELS = [1, 2]
+HYBRID_ACCELS = [1]
 
 # Default frequency configs (for intel iGPU)
 DEFAULT_CPU_FREQ_MHZ = "800,1900,3000,5000"
@@ -1062,6 +1063,11 @@ def run_lz4_gpu(file_path, bs, lsz, accel, orig_hash, telemetry=None, bench_seco
             stats['dec_mbs'] = stable['dec_kernel_tp']
             stats['comp_total_mbs'] = stable.get('comp_total_tp', 0.0)
             stats['dec_total_mbs'] = stable.get('dec_total_tp', 0.0)
+            if in_sz > 0:
+                if float(stats.get('comp_total_mbs', 0.0) or 0.0) > 0.0:
+                    stats['comp_time_s'] = in_sz / (float(stats['comp_total_mbs']) * 1024.0 * 1024.0)
+                if float(stats.get('dec_total_mbs', 0.0) or 0.0) > 0.0:
+                    stats['dec_time_s'] = in_sz / (float(stats['dec_total_mbs']) * 1024.0 * 1024.0)
 
             tmp_comp = make_temp_file_path("lz4_gpu_total", ".lz4")
             tmp_dec = f"{tmp_comp}.dec"
@@ -1117,14 +1123,18 @@ def run_lz4_gpu(file_path, bs, lsz, accel, orig_hash, telemetry=None, bench_seco
                     and file_matches_hash(tmp_dec, orig_hash)
                 )
 
-                if comp_elapsed_s > 0.0:
+                if float(stats.get('comp_total_mbs', 0.0) or 0.0) <= 0.0 and comp_elapsed_s > 0.0:
                     stats['comp_time_s'] = comp_elapsed_s
                 elif comp_total_parsed.get('inclusive_tp'):
                     stats['comp_total_mbs'] = comp_total_parsed['inclusive_tp']
-                if dec_elapsed_s > 0.0:
+                    if in_sz > 0 and float(stats.get('comp_total_mbs', 0.0) or 0.0) > 0.0:
+                        stats['comp_time_s'] = in_sz / (float(stats['comp_total_mbs']) * 1024.0 * 1024.0)
+                if float(stats.get('dec_total_mbs', 0.0) or 0.0) <= 0.0 and dec_elapsed_s > 0.0:
                     stats['dec_time_s'] = dec_elapsed_s
                 elif dec_total_parsed.get('inclusive_tp'):
                     stats['dec_total_mbs'] = dec_total_parsed['inclusive_tp']
+                    if in_sz > 0 and float(stats.get('dec_total_mbs', 0.0) or 0.0) > 0.0:
+                        stats['dec_time_s'] = in_sz / (float(stats['dec_total_mbs']) * 1024.0 * 1024.0)
             finally:
                 safe_remove(tmp_comp)
                 safe_remove(tmp_dec)
@@ -1167,8 +1177,8 @@ def run_lz4_gpu(file_path, bs, lsz, accel, orig_hash, telemetry=None, bench_seco
     return stats
 
 
-def run_lz4_hybrid(file_path, bs, gpu_ratio, cpu_threads, local_size, accel, orig_hash, telemetry=None, bench_seconds=3.0, split_mode="fixed", sample_blocks=8):
-    print(f"Bench_HYBRID: {file_path.name} BS={bs} mode={split_mode} R={gpu_ratio} T={cpu_threads} LSZ={local_size} A={accel}")
+def run_lz4_hybrid(file_path, bs, gpu_ratio, cpu_threads, local_size, accel, orig_hash, telemetry=None, bench_seconds=3.0, split_mode="fixed", split_layout="prefix", sample_blocks=8):
+    print(f"Bench_HYBRID: {file_path.name} BS={bs} mode={split_mode} layout={split_layout} R={gpu_ratio} T={cpu_threads} LSZ={local_size} A={accel}")
     sample_path = str(file_path.resolve())
     bs_arg = str(bs).lower()
     stats = {
@@ -1214,6 +1224,7 @@ def run_lz4_hybrid(file_path, bs, gpu_ratio, cpu_threads, local_size, accel, ori
             bench_cmd[1:1] = ["--adaptive", "--sample-blocks", str(sample_blocks), "--gpu-ratio", str(gpu_ratio)]
         else:
             bench_cmd[1:1] = ["--gpu-ratio", str(gpu_ratio)]
+        bench_cmd[1:1] = ["--split-striped" if split_layout == "striped" else "--split-prefix"]
 
         bench_res, _ = run_command_with_telemetry_cwd(bench_cmd, cwd=hybrid_dir, telemetry=telemetry, env=build_gpu_subprocess_env())
         bench_output = (bench_res.stdout or "") + (bench_res.stderr or "")
@@ -1224,6 +1235,11 @@ def run_lz4_hybrid(file_path, bs, gpu_ratio, cpu_threads, local_size, accel, ori
             stats['dec_mbs'] = stable['dec_kernel_tp']
             stats['comp_total_mbs'] = stable.get('comp_total_tp', 0.0)
             stats['dec_total_mbs'] = stable.get('dec_total_tp', 0.0)
+            if in_sz > 0:
+                if float(stats.get('comp_total_mbs', 0.0) or 0.0) > 0.0:
+                    stats['comp_time_s'] = in_sz / (float(stats['comp_total_mbs']) * 1024.0 * 1024.0)
+                if float(stats.get('dec_total_mbs', 0.0) or 0.0) > 0.0:
+                    stats['dec_time_s'] = in_sz / (float(stats['dec_total_mbs']) * 1024.0 * 1024.0)
 
             total_ok = False
             total_tel = {}
@@ -1243,6 +1259,7 @@ def run_lz4_hybrid(file_path, bs, gpu_ratio, cpu_threads, local_size, accel, ori
                     cmd_comp_total[1:1] = ["--adaptive", "--sample-blocks", str(sample_blocks), "--gpu-ratio", str(gpu_ratio)]
                 else:
                     cmd_comp_total[1:1] = ["--gpu-ratio", str(gpu_ratio)]
+                cmd_comp_total[1:1] = ["--split-striped" if split_layout == "striped" else "--split-prefix"]
                 comp_total_res, comp_total_tel = run_command_with_telemetry_cwd(cmd_comp_total, cwd=hybrid_dir, telemetry=telemetry, env=build_gpu_subprocess_env())
 
                 cmd_dec_total = [
@@ -1255,13 +1272,14 @@ def run_lz4_hybrid(file_path, bs, gpu_ratio, cpu_threads, local_size, accel, ori
                     cmd_dec_total[1:1] = ["--adaptive", "--sample-blocks", str(sample_blocks), "--gpu-ratio", str(gpu_ratio), "-T", str(cpu_threads)]
                 else:
                     cmd_dec_total[1:1] = ["--gpu-ratio", str(gpu_ratio), "-T", str(cpu_threads)]
+                cmd_dec_total[1:1] = ["--split-striped" if split_layout == "striped" else "--split-prefix"]
                 dec_total_res, dec_total_tel = run_command_with_telemetry_cwd(cmd_dec_total, cwd=hybrid_dir, telemetry=telemetry, env=build_gpu_subprocess_env())
 
                 comp_elapsed_s = float(comp_total_tel.get('elapsed_s', 0.0) or 0.0)
                 dec_elapsed_s = float(dec_total_tel.get('elapsed_s', 0.0) or 0.0)
-                if comp_elapsed_s > 0.0:
+                if float(stats.get('comp_total_mbs', 0.0) or 0.0) <= 0.0 and comp_elapsed_s > 0.0:
                     stats['comp_time_s'] = comp_elapsed_s
-                if dec_elapsed_s > 0.0:
+                if float(stats.get('dec_total_mbs', 0.0) or 0.0) <= 0.0 and dec_elapsed_s > 0.0:
                     stats['dec_time_s'] = dec_elapsed_s
 
                 total_ok = (
@@ -1316,6 +1334,7 @@ def main():
     parser.add_argument('--cpu-only', action='store_true', help='Run CPU sweep only (skip GPU and Hybrid)')
     parser.add_argument('--gpu-only', action='store_true', help='Run GPU sweep only (skip CPU and Hybrid)')
     parser.add_argument('--hybrid-only', action='store_true', help='Run Hybrid sweep only (skip CPU and GPU)')
+    parser.add_argument('--include-standalone-gpu', action='store_true', help='Include standalone GPU sweep in default all-mode (default skips it because Hybrid R=1.0 already covers GPU path)')
     parser.add_argument('--cpu-threads', default=','.join(str(x) for x in CPU_THREADS), help='CPU thread list, comma-separated (default: 1,2)')
     parser.add_argument('--cpu-block-sizes', default=','.join(CPU_BLOCK_SIZES), help='CPU block sizes, comma-separated')
     parser.add_argument('--gpu-block-sizes', default=','.join(GPU_BLOCK_SIZES), help='GPU block sizes, comma-separated')
@@ -1325,6 +1344,7 @@ def main():
     parser.add_argument('--hybrid-gpu-ratios', default=','.join(str(x) for x in HYBRID_GPU_RATIOS), help='Hybrid GPU ratios, comma-separated')
     parser.add_argument('--hybrid-cpu-threads', default=','.join(str(x) for x in HYBRID_CPU_THREADS), help='Hybrid CPU threads, comma-separated')
     parser.add_argument('--hybrid-split-modes', default=','.join(HYBRID_SPLIT_MODES), help='Hybrid split modes, comma-separated (fixed,adaptive)')
+    parser.add_argument('--hybrid-split-layouts', default=','.join(HYBRID_SPLIT_LAYOUTS), help='Hybrid split layouts, comma-separated (prefix,striped)')
     parser.add_argument('--hybrid-local-sizes', default=','.join(str(x) for x in HYBRID_LOCAL_SIZES), help='Hybrid local sizes, comma-separated')
     parser.add_argument('--hybrid-accels', default=','.join(str(x) for x in HYBRID_ACCELS), help='Hybrid acceleration factors, comma-separated')
     parser.add_argument('--freq-percent', type=int, default=None, help='Set both CPU and GPU to one shared frequency percent (0-100)')
@@ -1343,7 +1363,7 @@ def main():
         raise SystemExit('Cannot combine --cpu-only, --gpu-only, --hybrid-only')
 
     run_cpu = not args.gpu_only and not args.hybrid_only
-    run_gpu = args.gpu_only
+    run_gpu = not args.cpu_only and not args.hybrid_only
     run_hybrid = (not args.cpu_only and not args.gpu_only) or args.hybrid_only
 
     def emit_gpu_row_from_hybrid(sample, point_idx, cpu_freq_target, gpu_freq_target, bs, lsz, accel, hybrid_stats):
@@ -1372,6 +1392,10 @@ def main():
         if hybrid_stats.get("roundtrip_verified", False):
             summary_records.append(build_summary_record("GPU", gpu_cfg_label, hybrid_stats))
 
+    if (not args.cpu_only and not args.gpu_only and not args.hybrid_only and run_hybrid and not args.include_standalone_gpu):
+        run_gpu = False
+        print("[DefaultFlow] Standalone GPU sweep skipped; Hybrid sweep includes R=1.0 GPU path. Use --include-standalone-gpu to enable standalone GPU.")
+
     if run_cpu:
         resolved_lz4_bin = resolve_lz4_cpu_binary()
         globals()["LZ4_BIN"] = resolved_lz4_bin
@@ -1386,6 +1410,7 @@ def main():
     hybrid_gpu_ratios = parse_float_list(args.hybrid_gpu_ratios, HYBRID_GPU_RATIOS)
     hybrid_cpu_threads = parse_int_list(args.hybrid_cpu_threads, HYBRID_CPU_THREADS)
     hybrid_split_modes = parse_str_list(args.hybrid_split_modes, HYBRID_SPLIT_MODES)
+    hybrid_split_layouts = parse_str_list(args.hybrid_split_layouts, HYBRID_SPLIT_LAYOUTS)
     hybrid_local_sizes = parse_int_list(args.hybrid_local_sizes, HYBRID_LOCAL_SIZES)
     hybrid_accels = parse_int_list(args.hybrid_accels, HYBRID_ACCELS)
     use_gpu_daemon = run_gpu and (not IS_WINDOWS)
@@ -1568,33 +1593,36 @@ def main():
                                 hash_cache[sample_key] = compute_sha256(sample_key)
                             orig_hash = hash_cache[sample_key]
 
-                            for bs in hybrid_block_sizes:
-                                for hlsz in hybrid_local_sizes:
+                            for hlsz in hybrid_local_sizes:
+                                for split_layout in hybrid_split_layouts:
                                     for split_mode in hybrid_split_modes:
                                         # Adaptive mode: scheduler decides ratio automatically, sweep is meaningless.
                                         # Use gpu_ratio=1.0 as upper-bound hint and let the algorithm adjust.
                                         effective_ratios = [1.0] if split_mode == "adaptive" else hybrid_gpu_ratios
                                         for ratio in effective_ratios:
-                                            for ht in hybrid_cpu_threads:
-                                                for accel in hybrid_accels:
-                                                    hybrid_stats = run_lz4_hybrid(
-                                                        sample,
-                                                        bs,
-                                                        ratio,
-                                                        ht,
-                                                        hlsz,
-                                                        accel,
-                                                        orig_hash,
-                                                        telemetry=telemetry,
-                                                        bench_seconds=args.bench_seconds,
-                                                        split_mode=split_mode,
-                                                    )
+                                            bs_candidates = cpu_block_sizes if (split_mode == "fixed" and abs(float(ratio)) < 1e-9) else hybrid_block_sizes
+                                            for bs in bs_candidates:
+                                                for ht in hybrid_cpu_threads:
+                                                    for accel in hybrid_accels:
+                                                        hybrid_stats = run_lz4_hybrid(
+                                                            sample,
+                                                            bs,
+                                                            ratio,
+                                                            ht,
+                                                            hlsz,
+                                                            accel,
+                                                            orig_hash,
+                                                            telemetry=telemetry,
+                                                            bench_seconds=args.bench_seconds,
+                                                            split_mode=split_mode,
+                                                            split_layout=split_layout,
+                                                        )
                                                     writer.writerow([
                                                         sample.name,
                                                         point_idx,
                                                         "" if cpu_freq_target is None else cpu_freq_target,
                                                         "" if gpu_freq_target is None else gpu_freq_target,
-                                                        "HYBRID", f"{split_mode}:R{ratio}_T{ht}_L{hlsz}_A{accel}", bs, 14, accel, fmtf(hybrid_stats['ratio'], 2),
+                                                        "HYBRID", f"{split_mode}:{split_layout}:R{ratio}_T{ht}_L{hlsz}_A{accel}", bs, 14, accel, fmtf(hybrid_stats['ratio'], 2),
                                                         fmtf(hybrid_stats['comp_mbs'], 2), fmtf(hybrid_stats['dec_mbs'], 2),
                                                         fmtf(hybrid_stats.get('comp_total_mbs', 0), 2),
                                                         fmtf(hybrid_stats.get('dec_total_mbs', 0), 2),
@@ -1609,11 +1637,11 @@ def main():
                                                     ])
                                                     f.flush()
 
-                                                    hybrid_cfg_label = f"FP={point_idx};BS={bs};M={split_mode};R={ratio};T={ht};LSZ={hlsz};ACC={accel}"
+                                                    hybrid_cfg_label = f"FP={point_idx};BS={bs};M={split_mode};SL={split_layout};R={ratio};T={ht};LSZ={hlsz};ACC={accel}"
                                                     emit_case_average(sample.name, "HYBRID", hybrid_cfg_label, hybrid_stats)
                                                     if hybrid_stats.get("roundtrip_verified", False):
                                                         summary_records.append(build_summary_record("HYBRID", hybrid_cfg_label, hybrid_stats))
-                                                    if (not run_gpu and split_mode == "fixed" and abs(float(ratio) - 1.0) < 1e-9):
+                                                    if (not run_gpu and split_mode == "fixed" and split_layout == "prefix" and abs(float(ratio) - 1.0) < 1e-9 and ht == hybrid_cpu_threads[0]):
                                                         emit_gpu_row_from_hybrid(sample, point_idx, cpu_freq_target, gpu_freq_target, bs, hlsz, accel, hybrid_stats)
             else:
                 freq_combos = [(fp, fp) for fp in freq_points]
@@ -1691,33 +1719,36 @@ def main():
                                             summary_records.append(build_summary_record("GPU", gpu_cfg_label, gpu_stats))
 
                         if run_hybrid:
-                             for bs in hybrid_block_sizes:
-                                for hlsz in hybrid_local_sizes:
+                            for hlsz in hybrid_local_sizes:
+                                for split_layout in hybrid_split_layouts:
                                     for split_mode in hybrid_split_modes:
                                         # Adaptive mode: scheduler decides ratio automatically, sweep is meaningless.
                                         # Use gpu_ratio=1.0 as upper-bound hint and let the algorithm adjust.
                                         effective_ratios = [1.0] if split_mode == "adaptive" else hybrid_gpu_ratios
                                         for ratio in effective_ratios:
-                                            for ht in hybrid_cpu_threads:
-                                                for accel in hybrid_accels:
-                                                    hybrid_stats = run_lz4_hybrid(
-                                                        sample,
-                                                        bs,
-                                                        ratio,
-                                                        ht,
-                                                        hlsz,
-                                                        accel,
-                                                        orig_hash,
-                                                        telemetry=telemetry,
-                                                        bench_seconds=args.bench_seconds,
-                                                        split_mode=split_mode,
-                                                    )
+                                            bs_candidates = cpu_block_sizes if (split_mode == "fixed" and abs(float(ratio)) < 1e-9) else hybrid_block_sizes
+                                            for bs in bs_candidates:
+                                                for ht in hybrid_cpu_threads:
+                                                    for accel in hybrid_accels:
+                                                        hybrid_stats = run_lz4_hybrid(
+                                                            sample,
+                                                            bs,
+                                                            ratio,
+                                                            ht,
+                                                            hlsz,
+                                                            accel,
+                                                            orig_hash,
+                                                            telemetry=telemetry,
+                                                            bench_seconds=args.bench_seconds,
+                                                            split_mode=split_mode,
+                                                            split_layout=split_layout,
+                                                        )
                                                     writer.writerow([
                                                         sample.name,
                                                         point_idx,
                                                         "" if cpu_freq_target is None else cpu_freq_target,
                                                         "" if gpu_freq_target is None else gpu_freq_target,
-                                                        "HYBRID", f"{split_mode}:R{ratio}_T{ht}_L{hlsz}_A{accel}", bs, 14, accel, fmtf(hybrid_stats['ratio'], 2),
+                                                            "HYBRID", f"{split_mode}:{split_layout}:R{ratio}_T{ht}_L{hlsz}_A{accel}", bs, 14, accel, fmtf(hybrid_stats['ratio'], 2),
                                                         fmtf(hybrid_stats['comp_mbs'], 2), fmtf(hybrid_stats['dec_mbs'], 2),
                                                         fmtf(hybrid_stats.get('comp_total_mbs', 0), 2),
                                                         fmtf(hybrid_stats.get('dec_total_mbs', 0), 2),
@@ -1732,11 +1763,11 @@ def main():
                                                     ])
                                                     f.flush()
 
-                                                    hybrid_cfg_label = f"FP={point_idx};BS={bs};M={split_mode};R={ratio};T={ht};LSZ={hlsz};ACC={accel}"
+                                                    hybrid_cfg_label = f"FP={point_idx};BS={bs};M={split_mode};SL={split_layout};R={ratio};T={ht};LSZ={hlsz};ACC={accel}"
                                                     emit_case_average(sample.name, "HYBRID", hybrid_cfg_label, hybrid_stats)
                                                     if hybrid_stats.get("roundtrip_verified", False):
                                                         summary_records.append(build_summary_record("HYBRID", hybrid_cfg_label, hybrid_stats))
-                                                    if (not run_gpu and split_mode == "fixed" and abs(float(ratio) - 1.0) < 1e-9):
+                                                    if (not run_gpu and split_mode == "fixed" and split_layout == "prefix" and abs(float(ratio) - 1.0) < 1e-9 and ht == hybrid_cpu_threads[0]):
                                                         emit_gpu_row_from_hybrid(sample, point_idx, cpu_freq_target, gpu_freq_target, bs, hlsz, accel, hybrid_stats)
 
         print_and_save_config_summary(summary_records, results_summary_csv)

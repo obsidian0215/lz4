@@ -29,6 +29,7 @@ lz4_hybrid: lz4_hybrid.c ../lz4_gpu/lz4_gpu_core.c ../lz4_gpu/lz4_gpu_utils.c ..
 
 sync-kernels:
 	@for f in $(GPU_DIR)/*.cl $(GPU_DIR)/*.clbin; do \
+		[ -e "$$f" ] || continue; \
 		bn=$$(basename "$$f"); \
 		needs_sync=0; \
 		if [ ! -e "$$bn" ]; then \

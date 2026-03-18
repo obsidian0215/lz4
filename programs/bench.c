@@ -647,6 +647,7 @@ static int BMK_benchMem(const void* srcBuffer, size_t srcSize,
         U32 nbCompressionLoops = (U32)((5 MB) / (srcSize+1)) + 1;  /* conservative initial compression speed estimate */
         U32 nbDecodeLoops = (U32)((200 MB) / (srcSize+1)) + 1;  /* conservative initial decode speed estimate */
         Duration_ns totalCTime=0, totalDTime=0;
+        U64 totalCBytes = 0, totalDBytes = 0;
         U32 cCompleted=(g_decodeOnly==1), dCompleted=0;
 #       define NB_MARKS 4
         const char* const marks[NB_MARKS] = { " |", " /", " =",  "\\" };
@@ -721,6 +722,7 @@ static int BMK_benchMem(const void* srcBuffer, size_t srcSize,
                         assert(nbCompressionLoops < 40000000);   /* avoid overflow */
                         nbCompressionLoops *= 100;
                     }
+                    totalCBytes += (U64)totalRSize * nbLoops;
                     totalCTime += duration_ns;
                     cCompleted = totalCTime>maxTime;
                 }
@@ -749,6 +751,7 @@ static int BMK_benchMem(const void* srcBuffer, size_t srcSize,
                     LZ4F_decompress_binding : LZ4_decompress_safe_usingDict;
                 const char* const decString = g_decodeOnly ?
                     "LZ4F_decompress" : "LZ4_decompress_safe_usingDict";
+                size_t const decLoopBytes = totalRSize;
                 TIME_t const timeStart = TIME_getTime();
                 U32 nbLoops;
 
@@ -804,6 +807,7 @@ static int BMK_benchMem(const void* srcBuffer, size_t srcSize,
                         assert(nbDecodeLoops < 40000000);   /* avoid overflow */
                         nbDecodeLoops *= 100;
                     }
+                        totalDBytes += (U64)decLoopBytes * nbLoops;
                     totalDTime += duration_ns;
                     dCompleted = totalDTime > (DECOMP_MULT*maxTime);
             }   }
@@ -852,6 +856,12 @@ static int BMK_benchMem(const void* srcBuffer, size_t srcSize,
         }   /* for (testNb = 1; testNb <= (g_nbSeconds + !g_nbSeconds); testNb++) */
 
         OUTLEVEL(2, "%2i#\n", cLevel);
+
+        if (g_displayLevel >= 2) {
+            double const cAvgSpeed = (totalCTime > 0) ? (((double)totalCBytes / (double)totalCTime) * 1000.0) : 0.0;
+            double const dAvgSpeed = (totalDTime > 0) ? (((double)totalDBytes / (double)totalDTime) * 1000.0) : 0.0;
+            DISPLAYLEVEL(2, "      avg total throughput : C=%6.1f MB/s, D=%6.1f MB/s\n", cAvgSpeed, dAvgSpeed);
+        }
 
         /* quiet mode */
         if (g_displayLevel == 1) {

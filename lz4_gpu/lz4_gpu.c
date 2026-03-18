@@ -551,7 +551,22 @@ static int run_lz4_bench(const char* input_path,
 
         double in_mb = (double)tc.in_size / (1024.0 * 1024.0);
         comp_tp[n] = (tc.kernel_exec_us > 0) ? (in_mb * 1000000.0 / (double)tc.kernel_exec_us) : 0.0;
+        /* Exclude host file I/O from total throughput (keep device transfer + compute path). */
         double comp_total_us = (double)(tcomp1 - tcomp0);
+        {
+            double io_read_us = (double)tc.file_read_us;
+            double io_write_us = (double)tc.file_write_us;
+            if (io_write_us > (double)tc.download_total_us) {
+                io_write_us -= (double)tc.download_total_us;
+            } else {
+                io_write_us = 0.0;
+            }
+            if (comp_total_us > io_read_us + io_write_us) {
+                comp_total_us -= (io_read_us + io_write_us);
+            } else {
+                comp_total_us = 0.0;
+            }
+        }
         comp_total_tp[n] = (comp_total_us > 0.0) ? (in_mb * 1000000.0 / comp_total_us) : 0.0;
         double dec_kernel_us = (double)(td1 - td0);
         dec_tp[n] = (dec_kernel_us > 0.0) ? (in_mb * 1000000.0 / dec_kernel_us) : 0.0;
