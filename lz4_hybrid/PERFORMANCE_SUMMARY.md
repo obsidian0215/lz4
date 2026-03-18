@@ -1,6 +1,6 @@
 # lz4_hybrid 性能分析报告（按当前实现与修正后结果更新）
 
-> 更新时间：2026-03-15
+> 更新时间：2026-03-18
 > 程序路径：`/root/lz4/lz4_hybrid/lz4_hybrid`
 > 全量测试结果：`/root/lz4/exp_results/runs/hybrid_test/lz4_param_sweep.csv`
 > 对照基线：CPU (Comp 1451, Dec 1415 MB/s), GPU (Comp 1438, Dec 1302 MB/s)
@@ -8,6 +8,16 @@
 ## Intel 平台（保留原文）
 
 以下现有章节保留为 Intel Core + Iris Xe 平台的原始分析；Windows + NVIDIA 的新增结果见文末章节。
+
+### 2026-03-18 状态修正（当前 Intel live code）
+
+为了让本文能够继续作为后续实验结果的可靠解释框架，需要先声明当前 `lz4_hybrid` 的正式状态：
+
+1. **默认 bench 流程已改为不单跑 standalone GPU**：脚本默认只跑 CPU + Hybrid，然后将 hybrid `R=1.0` 复制成 GPU 行。
+2. **Total throughput 口径已统一为 operation-total**：当前 total throughput 不再重新计入文件读写 I/O，也不再依赖 `--bench-io`。
+3. **`--bench-io` 已被移除**：任何仍把 `--bench-io` 视为当前黄金口径的段落，都应理解为历史记录。
+4. **当前唯一保留的 LZ4 hybrid 新实现优化是 kernel-argument caching for stable `cl_mem` args**，位于 `lz4_hybrid.c`。此前测试过的 dict-tail-zero、persistent thread-pool reuse、`wi_per_cu` 固化调优都已拒绝。
+5. **新的远端 full-validation 正在 192.168.2.225 上后台重跑**，包含默认 CPU/GPU 频率扫描，且在同步后已重新构建二进制；结果章节需等待本轮 artifact 完成后再覆盖最终统计。
 
 ## 1. 概述 (Overview)
 
@@ -20,12 +30,12 @@
 
 与旧版文档相比，本版最重要的变化有两点：
 
-1. **测试口径已修正**：当前 total throughput 来自 `lz4_hybrid --bench --bench-io` 的 warmed in-binary 路径；同时 `kernel_tp` 已按真实 CPU/GPU 编解码执行跨度（取两者 max）计算，不再直接使用包含额外 host-side coordination 的 `parallel_us`；
+1. **测试口径已修正**：当前 total throughput 来自 `lz4_hybrid --bench` 的 warmed in-binary operation path；同时 `kernel_tp` 已按真实 CPU/GPU 编解码执行跨度（取两者 max）计算，不再直接使用包含额外 host-side coordination 的 `parallel_us`；
 2. **adaptive split 已真实生效**：此前 `--adaptive` 曾存在“CLI 有开关但 active split path 不改变”的缺口，本轮已在 live code 中修复。
 
 - **核心目标**：探索 CPU/GPU 协同在 LZ4 实时压缩中的真实系统价值，而不是只比较 kernel speed。
 - **程序路径**：`/root/lz4/lz4_hybrid/lz4_hybrid`
-- **主要特性**：fixed/adaptive split、多线程 CPU、OpenCL GPU、bench-io total semantics。
+- **主要特性**：fixed/adaptive split、多线程 CPU、OpenCL GPU、operation-total semantics。
 
 ## 2. 设计原理 (Design Principles)
 
@@ -153,11 +163,23 @@ CPU 端利用原生的 `liblz4` 结合 `pthread` 构建。
 - **核心计算时间**：由于 CPU 与 GPU 是真正并发运行的，系统的编解码延迟受限于两者中最慢的一个。因此，`Kernel Throughput` 的计算公式为：`input_MB / max(cpu_kernel_us, gpu_kernel_us)`。
 - **瓶颈识别**：如果 `gpu_kernel_us < cpu_kernel_us`，则表明系统的瓶颈在 CPU 侧，增加 GPU 比例或提高 CPU 线程数可能是优化方向。这种指标剥离了 host 端的 I/O 与调度开销，反映了计算核心的理论极限。
 
-### 4.5 --bench-io 的意义
+### 4.5 当前 total semantics 与 bench 路径
 
-传统的 Python 测试框架（Harness）通过派生子进程来测量压缩和解压，这会引入显著的进程启动与内存清零开销。
-- **二进制内循环**：`--bench-io` 模式在 `lz4_hybrid` 进程内部执行完整的闭环测试：`Memory -> Compressed -> /tmp/file -> Decompressed -> Verify`。
-- **I/O 优化继承**：该模式继承了 `lz4_gpu_core` 中 2MB 大小的 `setvbuf` 缓冲配置。通过在用户空间预缓冲，极大减少了 `fwrite` 对系统调用的依赖。这种“温启动”方式提供的 Total Throughput 是评估生产环境实时性能的最真实依据。
+传统的 Python harness 通过派生子进程来测量压缩和解压，这会引入额外的进程启动与运行时初始化成本。当前 `lz4_hybrid` 的正式 total throughput 定义已经收敛到二进制内 warmed timed operation path：
+
+- bench 在同一进程内重复执行压缩/解压操作；
+- total throughput 统计 host coordination + runtime + kernel 的整体 wall-time；
+- **不再额外把文件读写 I/O 纳入 total throughput 定义**；
+- 因而 `--bench-io` 已不再保留。
+
+### 4.6 当前正式保留的实现级优化：stable `cl_mem` kernel-arg caching
+
+这一项是本轮 LZ4 hybrid 唯一经过隔离验证后继续保留的实现改动。
+
+- **背景问题**：在 steady-state bench 中，多个 `cl_mem` 参数在大量迭代中并不会变化，但主机端仍可能重复调用 `clSetKernelArg`，积累成可见的 host dispatch 成本。
+- **设计原则**：只缓存稳定的 `cl_mem` 参数；动态标量参数仍每次设置；当 buffer 指针发生变化时，再重新发出对应 `clSetKernelArg`。
+- **实现形式**：`lz4_hybrid.c` 中的 `ocl_env_t` 扩展了 cached `cl_mem` 槽位，并通过 `set_kernel_mem_arg_if_changed(...)` 一类辅助函数控制更新。
+- **保留理由**：快速复测表明，GPU-only 等价路径与 mixed-ratio 路径整体持平或小幅改善，压缩率不变，未观察到稳定的明显吞吐回退。
 
 ## 5. 69-File Corpus 全量测试结果
 
@@ -539,4 +561,3 @@ flowchart LR
   1. 单独优化解压侧 gather/scatter 与同步链路；
   2. 做 fixed vs adaptive 的 Nvidia 全参复扫；
   3. 增加按文件类型分层阈值，避免一刀切 split。
-

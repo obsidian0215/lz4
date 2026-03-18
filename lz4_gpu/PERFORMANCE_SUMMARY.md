@@ -1,6 +1,6 @@
 # LZ4 GPU 性能总结
 
-> 更新时间：2026-03-15
+> 更新时间：2026-03-18
 > 硬件平台：Intel Core + Intel Iris Xe Graphics（iGPU，共享内存）
 > 当前基线结果：`/root/lz4/exp_results/runs/20260309_merged_full_83/lz4_param_sweep_merged.csv`
 > 当前 hybrid 对照结果：`/root/lz4/exp_results/hybrid_bench/hybrid_bench_20260309_180949.csv`
@@ -9,6 +9,15 @@
 ## Intel 平台（保留原文）
 
 以下现有内容保持不删改，作为 Intel Core + Iris Xe 平台的历史总结与基线说明。Windows + NVIDIA 的新结果补充在文末单独章节。
+
+### 2026-03-18 状态修正（当前有效基线）
+
+当前 Intel `lz4_gpu` 文档需要显式锚定到已重新核实的 baseline 与 live code：
+
+1. **LZ4 的健康基线必须区分 direct CLI 与 harness path**。先前较快的基线数字来自 `tools/bench_lz4.py + /root/lz4/programs/lz4` 的 harness-based recipe，而不是任意 direct CLI 调用。
+2. **OpenCL Graphics 平台选择与 verify 路径已修复**。当前基线不应再混入错误 CPU OpenCL 平台或 verify-failed 阶段的数字。
+3. **当前新的远端 full-validation 正在 192.168.2.225 上重跑**，包含默认频率扫描，并已在同步代码后重新构建。新的实验统计完成后，应以该 artifact 覆盖旧结果章节中的最终数值。
+4. **当前 LZ4 GPU 主设计重点仍然是哈希表/匹配查找/向量化解压/host runtime 复用**；不要把 bench 修复本身误写为主要性能来源。
 
 ---
 

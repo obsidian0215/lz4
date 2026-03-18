@@ -125,7 +125,10 @@ class TelemetryProbe:
         if os.name == "nt":
             self._detect_windows_energy_domains()
             return
-        paths = sorted(set(glob.glob("/sys/class/powercap/intel-rapl:*") + glob.glob("/sys/class/powercap/intel-rapl:*:*")))
+        paths = sorted(set(
+            glob.glob("/sys/class/powercap/intel-rapl/intel-rapl:*")
+            + glob.glob("/sys/class/powercap/intel-rapl/intel-rapl:*/intel-rapl:*")
+        ))
         domains = []
         for p in paths:
             if not os.path.isdir(p):
@@ -159,9 +162,10 @@ class TelemetryProbe:
                 self.gpu_domain = d
                 break
 
-        if self.gpu_domain is not None and not self._verify_gpu_rapl_functional():
-            self.gpu_domain = None
-            self.gpu_rapl_nonfunctional = True
+        if self.gpu_domain is not None:
+            if self._read_rapl_j(self.gpu_domain) is None:
+                self.gpu_domain = None
+                self.gpu_rapl_nonfunctional = True
 
     def _verify_gpu_rapl_functional(self) -> bool:
         """Check if gpu_domain RAPL gives meaningful readings (>1mW change in 0.5s)."""

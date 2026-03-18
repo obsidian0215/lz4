@@ -893,6 +893,7 @@ def parse_lz4_cpu_bench_output(output, input_size):
 def run_lz4_cpu(file_path, bs, threads, orig_hash, telemetry=None, bench_seconds=3.0):
     print(f"Bench_CPU: {file_path.name} BS={bs} T={threads}")
     sample_path = str(file_path.resolve())
+    exec_threads = int(threads) if int(threads) > 0 else max(1, int(os.cpu_count() or 1))
     stats = {
         'ratio': 0.0,
         'comp_mbs': 0.0,
@@ -925,7 +926,7 @@ def run_lz4_cpu(file_path, bs, threads, orig_hash, telemetry=None, bench_seconds
             idle_core_power_w = telemetry.measure_idle_core_power_w(0.2)
 
         # Use native lz4 bench output only (no temp file workflow)
-        cmd_bench = [LZ4_BIN, "-q", f"-B{str(bs).upper()}", f"-T{threads}", "-b1", sample_path]
+        cmd_bench = [LZ4_BIN, "-q", f"-B{str(bs).upper()}", f"-T{exec_threads}", "-b1", sample_path]
         bench_res, tel_window = run_command_with_telemetry(cmd_bench, telemetry=telemetry)
         bench_output = (bench_res.stdout or "") + (bench_res.stderr or "")
         parsed = parse_lz4_cpu_bench_output(bench_output, in_sz)
@@ -935,36 +936,22 @@ def run_lz4_cpu(file_path, bs, threads, orig_hash, telemetry=None, bench_seconds
             stats['dec_mbs'] = parsed.get('dec_mbs', 0)
             stats['comp_time_s'] = parsed.get('comp_time_s', 0)
             stats['dec_time_s'] = parsed.get('dec_time_s', 0)
+            stats['comp_total_mbs'] = parsed.get('comp_mbs', 0)
+            stats['dec_total_mbs'] = parsed.get('dec_mbs', 0)
 
             tmp_comp = make_temp_file_path("lz4_cpu_total", ".lz4")
             tmp_dec = f"{tmp_comp}.dec"
-            expanded_input = None
-            comp_input_path = sample_path
-            comp_input_size = in_sz
             total_ok = False
 
             try:
-                target_total_bytes = 64 * 1024 * 1024
-                if in_sz > 0 and in_sz < target_total_bytes:
-                    repeat = int((target_total_bytes + in_sz - 1) / in_sz)
-                    if repeat > 1:
-                        expanded_input = make_temp_file_path("lz4_cpu_total_input", ".bin")
-                        with open(sample_path, "rb") as fin:
-                            src_data = fin.read()
-                        with open(expanded_input, "wb") as fout:
-                            for _ in range(repeat):
-                                fout.write(src_data)
-                        comp_input_path = expanded_input
-                        comp_input_size = in_sz * repeat
-
                 cmd_comp_total = [
                     LZ4_BIN,
                     "-q",
                     "-z",
                     "-f",
                     f"-B{str(bs).upper()}",
-                    f"-T{threads}",
-                    comp_input_path,
+                    f"-T{exec_threads}",
+                    sample_path,
                     tmp_comp,
                 ]
                 t0 = time.perf_counter()
@@ -983,7 +970,7 @@ def run_lz4_cpu(file_path, bs, threads, orig_hash, telemetry=None, bench_seconds
                 dec_total_res, _ = run_command_with_telemetry(cmd_dec_total, telemetry=None)
                 dec_elapsed_s = max(0.0, time.perf_counter() - t1)
 
-                expected_hash = orig_hash if (comp_input_path == sample_path) else compute_sha256(comp_input_path)
+                expected_hash = orig_hash
 
                 total_ok = (
                     comp_total_res.returncode == 0
@@ -991,16 +978,11 @@ def run_lz4_cpu(file_path, bs, threads, orig_hash, telemetry=None, bench_seconds
                     and file_matches_hash(tmp_dec, expected_hash)
                 )
 
-                if comp_elapsed_s > 0.0:
-                    stats['comp_total_mbs'] = comp_input_size / (comp_elapsed_s * 1024.0 * 1024.0)
-                if dec_elapsed_s > 0.0:
-                    stats['dec_total_mbs'] = comp_input_size / (dec_elapsed_s * 1024.0 * 1024.0)
             finally:
                 safe_remove(tmp_comp)
                 safe_remove(tmp_dec)
-                safe_remove(expanded_input)
 
-            stats['throughput_semantics'] = 'stable_cpu_bench_with_scaled_total_io'
+            stats['throughput_semantics'] = 'stable_cpu_bench_with_op_total'
             stats['roundtrip_verified'] = (bench_res.returncode == 0) and total_ok
         else:
             stats['throughput_semantics'] = 'stable_cpu_bench_parse_failed'
@@ -1078,14 +1060,8 @@ def run_lz4_gpu(file_path, bs, lsz, accel, orig_hash, telemetry=None, bench_seco
             stats['ratio'] = stable['ratio']
             stats['comp_mbs'] = stable['comp_kernel_tp']
             stats['dec_mbs'] = stable['dec_kernel_tp']
-            if stable.get('comp_total_tp', 0.0):
-                stats['comp_total_mbs'] = float(stable.get('comp_total_tp', 0.0) or 0.0)
-            if stable.get('dec_total_tp', 0.0):
-                stats['dec_total_mbs'] = float(stable.get('dec_total_tp', 0.0) or 0.0)
-            if in_sz > 0 and stats['comp_total_mbs'] > 0.0:
-                stats['comp_time_s'] = in_sz / (stats['comp_total_mbs'] * 1024.0 * 1024.0)
-            if in_sz > 0 and stats['dec_total_mbs'] > 0.0:
-                stats['dec_time_s'] = in_sz / (stats['dec_total_mbs'] * 1024.0 * 1024.0)
+            stats['comp_total_mbs'] = stable.get('comp_total_tp', 0.0)
+            stats['dec_total_mbs'] = stable.get('dec_total_tp', 0.0)
 
             tmp_comp = make_temp_file_path("lz4_gpu_total", ".lz4")
             tmp_dec = f"{tmp_comp}.dec"
@@ -1141,19 +1117,19 @@ def run_lz4_gpu(file_path, bs, lsz, accel, orig_hash, telemetry=None, bench_seco
                     and file_matches_hash(tmp_dec, orig_hash)
                 )
 
-                if comp_total_parsed.get('inclusive_tp') and stats['comp_total_mbs'] <= 0.0:
-                    stats['comp_total_mbs'] = comp_total_parsed['inclusive_tp']
-                if dec_total_parsed.get('inclusive_tp') and stats['dec_total_mbs'] <= 0.0:
-                    stats['dec_total_mbs'] = dec_total_parsed['inclusive_tp']
-                if comp_elapsed_s > 0.0 and stats['comp_time_s'] <= 0.0:
+                if comp_elapsed_s > 0.0:
                     stats['comp_time_s'] = comp_elapsed_s
-                if dec_elapsed_s > 0.0 and stats['dec_time_s'] <= 0.0:
+                elif comp_total_parsed.get('inclusive_tp'):
+                    stats['comp_total_mbs'] = comp_total_parsed['inclusive_tp']
+                if dec_elapsed_s > 0.0:
                     stats['dec_time_s'] = dec_elapsed_s
+                elif dec_total_parsed.get('inclusive_tp'):
+                    stats['dec_total_mbs'] = dec_total_parsed['inclusive_tp']
             finally:
                 safe_remove(tmp_comp)
                 safe_remove(tmp_dec)
 
-            stats['throughput_semantics'] = 'stable_kernel_bench_with_inclusive_total'
+            stats['throughput_semantics'] = 'stable_kernel_bench_with_op_total'
             stats['roundtrip_verified'] = bool(stable['verify_ok']) and (bench_res.returncode == 0) and total_ok
 
             if telemetry:
@@ -1281,14 +1257,12 @@ def run_lz4_hybrid(file_path, bs, gpu_ratio, cpu_threads, local_size, accel, ori
                     cmd_dec_total[1:1] = ["--gpu-ratio", str(gpu_ratio), "-T", str(cpu_threads)]
                 dec_total_res, dec_total_tel = run_command_with_telemetry_cwd(cmd_dec_total, cwd=hybrid_dir, telemetry=telemetry, env=build_gpu_subprocess_env())
 
-                if stats['comp_total_mbs'] > 0.0:
-                    stats['comp_time_s'] = in_sz / (stats['comp_total_mbs'] * 1024.0 * 1024.0)
-                else:
-                    stats['comp_time_s'] = float(comp_total_tel.get('elapsed_s', 0.0) or 0.0)
-                if stats['dec_total_mbs'] > 0.0:
-                    stats['dec_time_s'] = in_sz / (stats['dec_total_mbs'] * 1024.0 * 1024.0)
-                else:
-                    stats['dec_time_s'] = float(dec_total_tel.get('elapsed_s', 0.0) or 0.0)
+                comp_elapsed_s = float(comp_total_tel.get('elapsed_s', 0.0) or 0.0)
+                dec_elapsed_s = float(dec_total_tel.get('elapsed_s', 0.0) or 0.0)
+                if comp_elapsed_s > 0.0:
+                    stats['comp_time_s'] = comp_elapsed_s
+                if dec_elapsed_s > 0.0:
+                    stats['dec_time_s'] = dec_elapsed_s
 
                 total_ok = (
                     comp_total_res.returncode == 0
@@ -1310,7 +1284,7 @@ def run_lz4_hybrid(file_path, bs, gpu_ratio, cpu_threads, local_size, accel, ori
                 safe_remove(tmp_comp)
                 safe_remove(tmp_dec)
 
-            stats['throughput_semantics'] = 'stable_kernel_bench_inprocess_total_with_filebacked_verify'
+            stats['throughput_semantics'] = 'stable_kernel_bench_inprocess_op_total'
             stats['roundtrip_verified'] = bool(stable['verify_ok']) and (bench_res.returncode == 0)
             if total_ok:
                 stats['roundtrip_verified'] = True
@@ -1369,8 +1343,34 @@ def main():
         raise SystemExit('Cannot combine --cpu-only, --gpu-only, --hybrid-only')
 
     run_cpu = not args.gpu_only and not args.hybrid_only
-    run_gpu = not args.cpu_only and not args.hybrid_only
+    run_gpu = args.gpu_only
     run_hybrid = (not args.cpu_only and not args.gpu_only) or args.hybrid_only
+
+    def emit_gpu_row_from_hybrid(sample, point_idx, cpu_freq_target, gpu_freq_target, bs, lsz, accel, hybrid_stats):
+        writer.writerow([
+            sample.name,
+            point_idx,
+            "" if cpu_freq_target is None else cpu_freq_target,
+            "" if gpu_freq_target is None else gpu_freq_target,
+            "GPU", lsz, bs, 14, accel, fmtf(hybrid_stats['ratio'], 2),
+            fmtf(hybrid_stats['comp_mbs'], 2), fmtf(hybrid_stats['dec_mbs'], 2),
+            fmtf(hybrid_stats.get('comp_total_mbs', 0), 2),
+            fmtf(hybrid_stats.get('dec_total_mbs', 0), 2),
+            fmtf(hybrid_stats['comp_time_s'], 6), fmtf(hybrid_stats['dec_time_s'], 6),
+            fmtf(hybrid_stats['cpu_freq_avg_mhz'], 2),
+            fmtf(hybrid_stats['gpu_freq_avg_mhz'], 2),
+            fmtf(hybrid_stats['cpu_energy_j'], 6),
+            fmtf(hybrid_stats['gpu_energy_j'], 6),
+            fmtf(hybrid_stats['comp_cpu_power_w'], 6),
+            fmtf(hybrid_stats['comp_gpu_power_w'], 6),
+            "yes" if hybrid_stats.get('roundtrip_verified') else "no",
+        ])
+        f.flush()
+
+        gpu_cfg_label = f"FP={point_idx};BS={bs};LSZ={lsz};ACC={accel}"
+        emit_case_average(sample.name, "GPU", gpu_cfg_label, hybrid_stats)
+        if hybrid_stats.get("roundtrip_verified", False):
+            summary_records.append(build_summary_record("GPU", gpu_cfg_label, hybrid_stats))
 
     if run_cpu:
         resolved_lz4_bin = resolve_lz4_cpu_binary()
@@ -1613,6 +1613,8 @@ def main():
                                                     emit_case_average(sample.name, "HYBRID", hybrid_cfg_label, hybrid_stats)
                                                     if hybrid_stats.get("roundtrip_verified", False):
                                                         summary_records.append(build_summary_record("HYBRID", hybrid_cfg_label, hybrid_stats))
+                                                    if (not run_gpu and split_mode == "fixed" and abs(float(ratio) - 1.0) < 1e-9):
+                                                        emit_gpu_row_from_hybrid(sample, point_idx, cpu_freq_target, gpu_freq_target, bs, hlsz, accel, hybrid_stats)
             else:
                 freq_combos = [(fp, fp) for fp in freq_points]
 
@@ -1734,6 +1736,8 @@ def main():
                                                     emit_case_average(sample.name, "HYBRID", hybrid_cfg_label, hybrid_stats)
                                                     if hybrid_stats.get("roundtrip_verified", False):
                                                         summary_records.append(build_summary_record("HYBRID", hybrid_cfg_label, hybrid_stats))
+                                                    if (not run_gpu and split_mode == "fixed" and abs(float(ratio) - 1.0) < 1e-9):
+                                                        emit_gpu_row_from_hybrid(sample, point_idx, cpu_freq_target, gpu_freq_target, bs, hlsz, accel, hybrid_stats)
 
         print_and_save_config_summary(summary_records, results_summary_csv)
     finally:

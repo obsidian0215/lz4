@@ -50,7 +50,31 @@ typedef struct {
     cl_kernel kpack;
     cl_kernel kdec;
     lz4_gpu_workspace_t ws;
+    cl_mem cached_kcomp_arg0;
+    cl_mem cached_kcomp_arg1;
+    cl_mem cached_kcomp_arg2;
+    cl_mem cached_kcomp_arg3;
+    cl_mem cached_kcomp_arg4;
+    cl_mem cached_kcomp_arg10;
+    cl_mem cached_kpack_arg0;
+    cl_mem cached_kpack_arg1;
+    cl_mem cached_kpack_arg2;
+    cl_mem cached_kpack_arg3;
+    cl_mem cached_kpack_arg4;
+    cl_mem cached_kdec_arg0;
+    cl_mem cached_kdec_arg1;
+    cl_mem cached_kdec_arg2;
+    cl_mem cached_kdec_arg3;
+    cl_mem cached_kdec_arg4;
+    cl_mem cached_kdec_arg5;
+    cl_mem cached_kdec_arg6;
 } ocl_env_t;
+
+static int set_kernel_mem_arg_if_changed(cl_kernel kernel, cl_uint index, cl_mem* cache, cl_mem value) {
+    if (*cache == value) return CL_SUCCESS;
+    *cache = value;
+    return clSetKernelArg(kernel, index, sizeof(cl_mem), &value);
+}
 
 typedef struct {
     const unsigned char* src;
@@ -1305,17 +1329,17 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
 
     if (!skip_input_upload) {
         err = CL_SUCCESS;
-        err |= clSetKernelArg(ocl->kcomp, 0, sizeof(cl_mem), &ocl->ws.comp_in_buf);
-        err |= clSetKernelArg(ocl->kcomp, 1, sizeof(cl_mem), &ocl->ws.out_buf);
-        err |= clSetKernelArg(ocl->kcomp, 2, sizeof(cl_mem), &ocl->ws.output_size_buf);
-        err |= clSetKernelArg(ocl->kcomp, 3, sizeof(cl_mem), &ocl->ws.block_info_buf);
-        err |= clSetKernelArg(ocl->kcomp, 4, sizeof(cl_mem), &ocl->ws.out_offsets_buf);
+        err |= set_kernel_mem_arg_if_changed(ocl->kcomp, 0, &ocl->cached_kcomp_arg0, ocl->ws.comp_in_buf);
+        err |= set_kernel_mem_arg_if_changed(ocl->kcomp, 1, &ocl->cached_kcomp_arg1, ocl->ws.out_buf);
+        err |= set_kernel_mem_arg_if_changed(ocl->kcomp, 2, &ocl->cached_kcomp_arg2, ocl->ws.output_size_buf);
+        err |= set_kernel_mem_arg_if_changed(ocl->kcomp, 3, &ocl->cached_kcomp_arg3, ocl->ws.block_info_buf);
+        err |= set_kernel_mem_arg_if_changed(ocl->kcomp, 4, &ocl->cached_kcomp_arg4, ocl->ws.out_offsets_buf);
         err |= clSetKernelArg(ocl->kcomp, 5, sizeof(int), &totalBlocks);
         err |= clSetKernelArg(ocl->kcomp, 6, sizeof(int), &inputSize);
         err |= clSetKernelArg(ocl->kcomp, 7, sizeof(int), &tableType);
         err |= clSetKernelArg(ocl->kcomp, 8, sizeof(int), &acceleration);
         err |= clSetKernelArg(ocl->kcomp, 9, sizeof(int), &globalIndexBase);
-        err |= clSetKernelArg(ocl->kcomp, 10, sizeof(cl_mem), &ocl->ws.dict_buf);
+        err |= set_kernel_mem_arg_if_changed(ocl->kcomp, 10, &ocl->cached_kcomp_arg10, ocl->ws.dict_buf);
         if (err != CL_SUCCESS) goto fail;
     }
     err = clSetKernelArg(ocl->kcomp, 11, sizeof(uint32_t), &epoch_base);
@@ -1372,11 +1396,11 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
         }
 
         err = CL_SUCCESS;
-        err |= clSetKernelArg(ocl->kpack, 0, sizeof(cl_mem), &ocl->ws.out_buf);
-        err |= clSetKernelArg(ocl->kpack, 1, sizeof(cl_mem), &ocl->ws.packed_out_buf);
-        err |= clSetKernelArg(ocl->kpack, 2, sizeof(cl_mem), &ocl->ws.out_offsets_buf);
-        err |= clSetKernelArg(ocl->kpack, 3, sizeof(cl_mem), &ocl->ws.packed_offsets_buf);
-        err |= clSetKernelArg(ocl->kpack, 4, sizeof(cl_mem), &ocl->ws.output_size_buf);
+        err |= set_kernel_mem_arg_if_changed(ocl->kpack, 0, &ocl->cached_kpack_arg0, ocl->ws.out_buf);
+        err |= set_kernel_mem_arg_if_changed(ocl->kpack, 1, &ocl->cached_kpack_arg1, ocl->ws.packed_out_buf);
+        err |= set_kernel_mem_arg_if_changed(ocl->kpack, 2, &ocl->cached_kpack_arg2, ocl->ws.out_offsets_buf);
+        err |= set_kernel_mem_arg_if_changed(ocl->kpack, 3, &ocl->cached_kpack_arg3, ocl->ws.packed_offsets_buf);
+        err |= set_kernel_mem_arg_if_changed(ocl->kpack, 4, &ocl->cached_kpack_arg4, ocl->ws.output_size_buf);
         err |= clSetKernelArg(ocl->kpack, 5, sizeof(uint32_t), &totalBlocks32);
         if (err != CL_SUCCESS) goto fail;
 
@@ -1495,13 +1519,13 @@ static int gpu_decompress_blocks(ocl_env_t* ocl,
 
     totalBlocks = (uint32_t)num_blocks;
     err = CL_SUCCESS;
-    err |= clSetKernelArg(ocl->kdec, 0, sizeof(cl_mem), &ocl->ws.in_buf);
-    err |= clSetKernelArg(ocl->kdec, 1, sizeof(cl_mem), &ocl->ws.out_buf);
-    err |= clSetKernelArg(ocl->kdec, 2, sizeof(cl_mem), &ocl->ws.decomp_comp_off_buf);
-    err |= clSetKernelArg(ocl->kdec, 3, sizeof(cl_mem), &ocl->ws.decomp_comp_size_buf);
-    err |= clSetKernelArg(ocl->kdec, 4, sizeof(cl_mem), &ocl->ws.decomp_out_off_buf);
-    err |= clSetKernelArg(ocl->kdec, 5, sizeof(cl_mem), &ocl->ws.decomp_max_out_buf);
-    err |= clSetKernelArg(ocl->kdec, 6, sizeof(cl_mem), &ocl->ws.decomp_sizes_out_buf);
+    err |= set_kernel_mem_arg_if_changed(ocl->kdec, 0, &ocl->cached_kdec_arg0, ocl->ws.in_buf);
+    err |= set_kernel_mem_arg_if_changed(ocl->kdec, 1, &ocl->cached_kdec_arg1, ocl->ws.out_buf);
+    err |= set_kernel_mem_arg_if_changed(ocl->kdec, 2, &ocl->cached_kdec_arg2, ocl->ws.decomp_comp_off_buf);
+    err |= set_kernel_mem_arg_if_changed(ocl->kdec, 3, &ocl->cached_kdec_arg3, ocl->ws.decomp_comp_size_buf);
+    err |= set_kernel_mem_arg_if_changed(ocl->kdec, 4, &ocl->cached_kdec_arg4, ocl->ws.decomp_out_off_buf);
+    err |= set_kernel_mem_arg_if_changed(ocl->kdec, 5, &ocl->cached_kdec_arg5, ocl->ws.decomp_max_out_buf);
+    err |= set_kernel_mem_arg_if_changed(ocl->kdec, 6, &ocl->cached_kdec_arg6, ocl->ws.decomp_sizes_out_buf);
     err |= clSetKernelArg(ocl->kdec, 7, sizeof(uint32_t), &totalBlocks);
     if (err != CL_SUCCESS) goto fail;
 
@@ -2012,11 +2036,10 @@ static void show_help(const char* prog) {
     fprintf(stderr, "  --sample-blocks N        Adaptive sample block count (default: 8)\n");
     fprintf(stderr, "  --gpu-ratio F            Fraction of blocks assigned to GPU (default: 0.7)\n");
     fprintf(stderr, "  --bench [N]              Benchmark mode with optional N seconds (default: 3)\n");
-    fprintf(stderr, "  --bench-io               Include file write/read in bench total throughput\n");
     fprintf(stderr, "  -v, --verbose            Verbose output\n");
 }
 
-static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_seconds, int include_file_io) {
+static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_seconds) {
     unsigned char* input = NULL;
     size_t input_size = 0;
     ocl_env_t ocl;
@@ -2029,8 +2052,6 @@ static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_sec
     double* dec_t = NULL;
     double* ratio = NULL;
     int verify_ok = 1;
-    char tmp_comp_path[PATH_MAX] = {0};
-    char tmp_dec_path[PATH_MAX] = {0};
 
     if (bench_seconds <= 0.0) bench_seconds = 3.0;
     if (read_entire_file(input_path, &input, &input_size) != 0) {
@@ -2042,16 +2063,6 @@ static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_sec
         fprintf(stderr, "bench error: OpenCL init failed\n");
         free(input);
         return 1;
-    }
-
-    if (include_file_io) {
-        if (create_temp_path(tmp_comp_path, sizeof(tmp_comp_path), "/tmp/lz4_hybrid_bench_io_comp_XXXXXX") != 0 ||
-            create_temp_path(tmp_dec_path, sizeof(tmp_dec_path), "/tmp/lz4_hybrid_bench_io_dec_XXXXXX") != 0) {
-            fprintf(stderr, "bench error: failed to create temp paths\n");
-            free(input);
-            ocl_free(&ocl);
-            return 1;
-        }
     }
 
     comp_k = (double*)malloc(cap * sizeof(double));
@@ -2070,67 +2081,20 @@ static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_sec
         size_t dec_size = 0;
         hybrid_metrics_t cm, dm;
         double in_mb;
-        uint64_t comp_write_us = 0;
-        uint64_t comp_read_us = 0;
-        uint64_t dec_write_us = 0;
-
         const uint64_t ctot0 = get_us();
         if (hybrid_compress_memory(&ocl, input, input_size, cfg, &comp_buf, &comp_size, &cm, 0) != 0) {
             verify_ok = 0;
             break;
         }
-
-        if (include_file_io) {
-            const uint64_t t_write0 = get_us();
-            if (write_entire_file(tmp_comp_path, comp_buf, comp_size) != 0) {
-                free(comp_buf);
-                verify_ok = 0;
-                break;
-            }
-            comp_write_us = get_us() - t_write0;
-        }
         cm.total_us = get_us() - ctot0;
-        if (include_file_io && cm.total_us < cm.parallel_us + comp_write_us) {
-            cm.total_us = cm.parallel_us + comp_write_us;
-        }
 
         const uint64_t dtot0 = get_us();
-        if (include_file_io) {
-            unsigned char* comp_file_buf = NULL;
-            size_t comp_file_sz = 0;
-            const uint64_t t_read0 = get_us();
-            if (read_entire_file(tmp_comp_path, &comp_file_buf, &comp_file_sz) != 0) {
-                free(comp_buf);
-                verify_ok = 0;
-                break;
-            }
-            comp_read_us = get_us() - t_read0;
-            free(comp_buf);
-            comp_buf = comp_file_buf;
-            comp_size = comp_file_sz;
-            remove(tmp_comp_path);
-        }
         if (hybrid_decompress_memory(&ocl, comp_buf, comp_size, cfg, &dec_buf, &dec_size, &dm) != 0) {
             free(comp_buf);
             verify_ok = 0;
             break;
         }
-
-        if (include_file_io) {
-            const uint64_t t_write0 = get_us();
-            if (write_entire_file(tmp_dec_path, dec_buf, dec_size) != 0) {
-                free(comp_buf);
-                free(dec_buf);
-                verify_ok = 0;
-                break;
-            }
-            dec_write_us = get_us() - t_write0;
-            remove(tmp_dec_path);
-        }
         dm.total_us = get_us() - dtot0;
-        if (include_file_io && dm.total_us < dm.parallel_us + comp_read_us + dec_write_us) {
-            dm.total_us = dm.parallel_us + comp_read_us + dec_write_us;
-        }
 
         if (dec_size != input_size || memcmp(dec_buf, input, input_size) != 0) {
             free(comp_buf);
@@ -2191,10 +2155,6 @@ static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_sec
     free(dec_t);
     free(ratio);
     free(input);
-    if (include_file_io) {
-        remove(tmp_comp_path);
-        remove(tmp_dec_path);
-    }
     ocl_free(&ocl);
     return verify_ok ? 0 : 1;
 }
@@ -2202,7 +2162,6 @@ static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_sec
 int main(int argc, char** argv) {
     int mode_decompress = 0;
     int bench_mode = 0;
-    int bench_include_io = 0;
     double bench_seconds = 3.0;
     const char* input_path = NULL;
     char output_path[1024] = {0};
@@ -2268,8 +2227,6 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != '-' && is_number_string(argv[i + 1])) {
                 bench_seconds = atof(argv[++i]);
             }
-        } else if (strcmp(argv[i], "--bench-io") == 0) {
-            bench_include_io = 1;
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             cfg.verbose = 1;
         } else if (argv[i][0] == '-') {
@@ -2310,7 +2267,7 @@ int main(int argc, char** argv) {
             fprintf(stderr, "Error: --bench requires compress mode input\n");
             return 1;
         }
-        return run_bench(input_path, &cfg, bench_seconds, bench_include_io);
+        return run_bench(input_path, &cfg, bench_seconds);
     }
 
     if (!output_explicit) {
