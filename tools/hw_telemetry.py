@@ -69,6 +69,15 @@ class TelemetryProbe:
             return ""
 
     @staticmethod
+    def _energy_path_to_power_path(path: str) -> str:
+        if not path:
+            return path
+        suffix = r"\Energy"
+        if path.endswith(suffix):
+            return path[: -len(suffix)] + r"\Power"
+        return path
+
+    @staticmethod
     def _read_windows_counter(path: str, scale: float = 1.0) -> Optional[float]:
         safe_path = path.replace("'", "''")
         cmd = (
@@ -294,6 +303,21 @@ class TelemetryProbe:
 
     def measure_idle_pkg_power_w(self, duration_s: float = 1.0) -> float:
         """Measure idle package power over duration_s seconds. Returns watts."""
+        if self.cpu_domain is not None and self.cpu_domain.source == "windows_counter":
+            power_path = self._energy_path_to_power_path(self.cpu_domain.energy_path)
+            samples = []
+            time.sleep(0.15)
+            window_s = max(0.8, duration_s)
+            t0 = time.time()
+            while time.time() - t0 < window_s:
+                v = self._read_windows_counter(power_path, scale=1e-3)
+                if v is not None and v > 0.0:
+                    samples.append(float(v))
+                time.sleep(0.05)
+            if samples:
+                return float(min(samples))
+            return 0.0
+
         if self.cpu_domain is None:
             return 0.0
         e1 = self._read_rapl_j(self.cpu_domain)
@@ -308,6 +332,9 @@ class TelemetryProbe:
 
     def measure_idle_core_power_w(self, duration_s: float = 1.0) -> float:
         """Measure idle CPU core-domain power over duration_s seconds. Returns watts."""
+        if os.name == "nt" and self.cpu_domain is not None and self.cpu_domain.source == "windows_counter":
+            return self.measure_idle_pkg_power_w(duration_s)
+
         if self.core_domain is None:
             return 0.0
         e1 = self._read_rapl_j(self.core_domain)
@@ -322,6 +349,19 @@ class TelemetryProbe:
 
     def measure_idle_gpu_power_w(self, duration_s: float = 1.0) -> float:
         """Measure idle GPU power over duration_s seconds. Returns watts."""
+        if self.has_nvidia_smi:
+            samples = []
+            time.sleep(0.15)
+            window_s = max(0.5, duration_s)
+            t0 = time.time()
+            while time.time() - t0 < window_s:
+                p = self._nvidia_query("power.draw")
+                if p is not None and p > 0.0:
+                    samples.append(float(p))
+                time.sleep(0.05)
+            if samples:
+                return float(min(samples))
+
         s0 = self.snapshot()
         time.sleep(duration_s)
         s1 = self.snapshot()
@@ -341,9 +381,14 @@ class TelemetryProbe:
             "gpu_freq_mhz": self._gpu_freq_mhz(),
             "cpu_energy_j": self._read_rapl_j(self.cpu_domain),
             "core_energy_j": self._read_rapl_j(self.core_domain),
+            "cpu_power_w": None,
             "gpu_energy_j": None,
             "gpu_power_w": None,
         }
+
+        if self.cpu_domain is not None and self.cpu_domain.source == "windows_counter":
+            power_path = self._energy_path_to_power_path(self.cpu_domain.energy_path)
+            snap["cpu_power_w"] = self._read_windows_counter(power_path, scale=1e-3)
 
         if self.gpu_domain is not None:
             snap["gpu_energy_j"] = self._read_rapl_j(self.gpu_domain)
@@ -409,6 +454,9 @@ class TelemetryProbe:
                 "cpu_pkg_peak_power_w": 0.0,
                 "cpu_core_peak_power_w": 0.0,
                 "gpu_peak_power_w": 0.0,
+                "cpu_pkg_avg_power_w": 0.0,
+                "cpu_core_avg_power_w": 0.0,
+                "gpu_avg_power_w": 0.0,
             }
 
         cpu_freq_vals = [float(s.get("cpu_freq_mhz") or 0.0) for s in samples]
@@ -425,11 +473,15 @@ class TelemetryProbe:
                 "cpu_pkg_peak_power_w": 0.0,
                 "cpu_core_peak_power_w": 0.0,
                 "gpu_peak_power_w": 0.0,
+                "cpu_pkg_avg_power_w": 0.0,
+                "cpu_core_avg_power_w": 0.0,
+                "gpu_avg_power_w": 0.0,
             }
 
         cpu_energy = 0.0
         core_energy = 0.0
         gpu_energy = 0.0
+        cpu_power_energy = 0.0
         cpu_pkg_peak = 0.0
         cpu_core_peak = 0.0
         gpu_peak = 0.0
@@ -481,8 +533,30 @@ class TelemetryProbe:
             if gp_interval > 0.0:
                 gpu_peak = max(gpu_peak, gp_interval)
 
+            p0 = s0.get("cpu_power_w")
+            p1 = s1.get("cpu_power_w")
+            if p0 is not None and p1 is not None:
+                cpu_p_interval = max(0.0, (float(p0) + float(p1)) * 0.5)
+                cpu_power_energy += cpu_p_interval * dt
+                if cpu_p_interval > cpu_pkg_peak:
+                    cpu_pkg_peak = cpu_p_interval
+
         if gpu_peak <= 0.0 and gpu_energy > 0.0 and elapsed_total > 0.0:
             gpu_peak = gpu_energy / elapsed_total
+
+        cpu_pkg_avg = (cpu_energy / elapsed_total) if elapsed_total > 0.0 and cpu_energy > 0.0 else 0.0
+        cpu_core_avg = (core_energy / elapsed_total) if elapsed_total > 0.0 and core_energy > 0.0 else 0.0
+        gpu_avg = (gpu_energy / elapsed_total) if elapsed_total > 0.0 and gpu_energy > 0.0 else 0.0
+
+        if cpu_power_energy > 0.0 and elapsed_total > 0.0:
+            cpu_pkg_avg = float(cpu_power_energy / elapsed_total)
+            if cpu_core_avg <= 0.0:
+                cpu_core_avg = cpu_pkg_avg
+
+        if cpu_pkg_avg <= 0.0:
+            cpu_power_vals = [float(s.get("cpu_power_w") or 0.0) for s in samples if float(s.get("cpu_power_w") or 0.0) > 0.0]
+            if cpu_power_vals:
+                cpu_pkg_avg = float(sum(cpu_power_vals) / len(cpu_power_vals))
 
         return {
             "elapsed_s": float(elapsed_total),
@@ -494,6 +568,9 @@ class TelemetryProbe:
             "cpu_pkg_peak_power_w": float(cpu_pkg_peak),
             "cpu_core_peak_power_w": float(cpu_core_peak),
             "gpu_peak_power_w": float(gpu_peak),
+            "cpu_pkg_avg_power_w": float(cpu_pkg_avg),
+            "cpu_core_avg_power_w": float(cpu_core_avg),
+            "gpu_avg_power_w": float(gpu_avg),
         }
 
 
