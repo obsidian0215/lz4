@@ -104,9 +104,10 @@ static int lz4_should_use_device_compaction(size_t packed_bytes, size_t sparse_b
     int force_value = lz4_env_flag_value("LZ4_GPU_FORCE_COMPACTION", &force_set);
     int enable_set = 0;
     int enable_value = lz4_env_flag_value("LZ4_GPU_ENABLE_COMPACTION", &enable_set);
+    int enable_compaction = enable_set ? enable_value : 1;
     if (!pack_kernel) return 0;
     if (force_set) return force_value;
-    if (!enable_set || !enable_value) return 0;
+    if (!enable_compaction) return 0;
     if (packed_bytes == 0 || sparse_bytes == 0 || packed_bytes >= sparse_bytes) return 0;
     {
         unsigned min_blocks = lz4_env_unsigned_value("LZ4_GPU_COMPACTION_MIN_BLOCKS", 8U);
@@ -194,10 +195,7 @@ static int zero_buffer(cl_command_queue queue, cl_mem buf, size_t bytes) {
     {
         static const cl_uint z = 0;
         cl_int ferr = clEnqueueFillBuffer(queue, buf, &z, sizeof(z), 0, bytes, 0, NULL, NULL);
-        if (ferr == CL_SUCCESS) {
-            clFinish(queue);
-            return 0;
-        }
+        if (ferr == CL_SUCCESS) return 0;
     }
 #endif
     {
@@ -207,7 +205,6 @@ static int zero_buffer(cl_command_queue queue, cl_mem buf, size_t bytes) {
         memset(p, 0, bytes);
         err = clEnqueueUnmapMemObject(queue, buf, p, 0, NULL, NULL);
         if (err != CL_SUCCESS) return -1;
-        clFinish(queue);
     }
     return 0;
 }
@@ -587,12 +584,31 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
     }
 
     if (!skip_input_upload) {
-        if (write_buffer_auto(queue, ws->out_offsets_buf, h_out_offsets, out_offsets_cap, use_standard_copy) != 0 ||
-            write_buffer_auto(queue, ws->block_info_buf, h_block_info, block_info_cap, use_standard_copy) != 0) {
-            fprintf(stderr, "[LZ4] upload block metadata buffers failed\n");
-            free(h_block_info);
-            free(h_out_offsets);
-            return -1;
+        if (use_standard_copy) {
+            cl_event meta_ev[2] = {0};
+            int ev_count = 0;
+            err = clEnqueueWriteBuffer(queue, ws->out_offsets_buf, CL_FALSE, 0, out_offsets_cap, h_out_offsets, 0, NULL, &meta_ev[ev_count]);
+            if (err == CL_SUCCESS) ev_count++;
+            if (err == CL_SUCCESS) {
+                err = clEnqueueWriteBuffer(queue, ws->block_info_buf, CL_FALSE, 0, block_info_cap, h_block_info, 0, NULL, &meta_ev[ev_count]);
+                if (err == CL_SUCCESS) ev_count++;
+            }
+            if (err != CL_SUCCESS || (ev_count > 0 && clWaitForEvents((cl_uint)ev_count, meta_ev) != CL_SUCCESS)) {
+                for (int ei = 0; ei < ev_count; ++ei) if (meta_ev[ei]) clReleaseEvent(meta_ev[ei]);
+                fprintf(stderr, "[LZ4] upload block metadata buffers failed\n");
+                free(h_block_info);
+                free(h_out_offsets);
+                return -1;
+            }
+            for (int ei = 0; ei < ev_count; ++ei) if (meta_ev[ei]) clReleaseEvent(meta_ev[ei]);
+        } else {
+            if (write_buffer_auto(queue, ws->out_offsets_buf, h_out_offsets, out_offsets_cap, 0) != 0 ||
+                write_buffer_auto(queue, ws->block_info_buf, h_block_info, block_info_cap, 0) != 0) {
+                fprintf(stderr, "[LZ4] upload block metadata buffers failed\n");
+                free(h_block_info);
+                free(h_out_offsets);
+                return -1;
+            }
         }
     }
 
@@ -1043,17 +1059,48 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
         return -1;
     }
 
-    if (write_buffer_auto(queue, ws->decomp_comp_off_buf, h_comp_offsets, num_blocks * 4, use_standard_copy) != 0 ||
-        write_buffer_auto(queue, ws->decomp_comp_size_buf, h_comp_sizes_32, num_blocks * 4, use_standard_copy) != 0 ||
-        write_buffer_auto(queue, ws->decomp_out_off_buf, h_out_offsets, num_blocks * 4, use_standard_copy) != 0 ||
-        write_buffer_auto(queue, ws->decomp_max_out_buf, h_max_out_sizes, num_blocks * 4, use_standard_copy) != 0) {
-        fprintf(stderr, "[LZ4] upload decompress metadata buffers failed\n");
-        free(h_comp_sizes);
-        free(h_comp_offsets);
-        free(h_comp_sizes_32);
-        free(h_out_offsets);
-        free(h_max_out_sizes);
-        return -1;
+    if (use_standard_copy) {
+        cl_event meta_ev[4] = {0};
+        int ev_count = 0;
+        err  = clEnqueueWriteBuffer(queue, ws->decomp_comp_off_buf, CL_FALSE, 0, num_blocks * 4, h_comp_offsets, 0, NULL, &meta_ev[ev_count]);
+        if (err == CL_SUCCESS) ev_count++;
+        if (err == CL_SUCCESS) {
+            err = clEnqueueWriteBuffer(queue, ws->decomp_comp_size_buf, CL_FALSE, 0, num_blocks * 4, h_comp_sizes_32, 0, NULL, &meta_ev[ev_count]);
+            if (err == CL_SUCCESS) ev_count++;
+        }
+        if (err == CL_SUCCESS) {
+            err = clEnqueueWriteBuffer(queue, ws->decomp_out_off_buf, CL_FALSE, 0, num_blocks * 4, h_out_offsets, 0, NULL, &meta_ev[ev_count]);
+            if (err == CL_SUCCESS) ev_count++;
+        }
+        if (err == CL_SUCCESS) {
+            err = clEnqueueWriteBuffer(queue, ws->decomp_max_out_buf, CL_FALSE, 0, num_blocks * 4, h_max_out_sizes, 0, NULL, &meta_ev[ev_count]);
+            if (err == CL_SUCCESS) ev_count++;
+        }
+
+        if (err != CL_SUCCESS || (ev_count > 0 && clWaitForEvents((cl_uint)ev_count, meta_ev) != CL_SUCCESS)) {
+            for (int ei = 0; ei < ev_count; ++ei) if (meta_ev[ei]) clReleaseEvent(meta_ev[ei]);
+            fprintf(stderr, "[LZ4] upload decompress metadata buffers failed\n");
+            free(h_comp_sizes);
+            free(h_comp_offsets);
+            free(h_comp_sizes_32);
+            free(h_out_offsets);
+            free(h_max_out_sizes);
+            return -1;
+        }
+        for (int ei = 0; ei < ev_count; ++ei) if (meta_ev[ei]) clReleaseEvent(meta_ev[ei]);
+    } else {
+        if (write_buffer_auto(queue, ws->decomp_comp_off_buf, h_comp_offsets, num_blocks * 4, 0) != 0 ||
+            write_buffer_auto(queue, ws->decomp_comp_size_buf, h_comp_sizes_32, num_blocks * 4, 0) != 0 ||
+            write_buffer_auto(queue, ws->decomp_out_off_buf, h_out_offsets, num_blocks * 4, 0) != 0 ||
+            write_buffer_auto(queue, ws->decomp_max_out_buf, h_max_out_sizes, num_blocks * 4, 0) != 0) {
+            fprintf(stderr, "[LZ4] upload decompress metadata buffers failed\n");
+            free(h_comp_sizes);
+            free(h_comp_offsets);
+            free(h_comp_sizes_32);
+            free(h_out_offsets);
+            free(h_max_out_sizes);
+            return -1;
+        }
     }
     t->buffer_alloc_us = (unsigned long)(get_us() - t1);
 

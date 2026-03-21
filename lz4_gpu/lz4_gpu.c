@@ -50,6 +50,23 @@ static cl_context ctx;
 static cl_command_queue queue;
 static cl_device_id dev;
 
+static cl_int lz4_try_get_device(cl_platform_id* platforms,
+                                 cl_uint num_platforms,
+                                 cl_device_type dtype,
+                                 cl_device_id* out_dev,
+                                 cl_platform_id* out_pf) {
+    for (cl_uint pi = 0; pi < num_platforms; ++pi) {
+        cl_device_id tmp_dev = NULL;
+        cl_int r = clGetDeviceIDs(platforms[pi], dtype, 1, &tmp_dev, NULL);
+        if (r == CL_SUCCESS && tmp_dev != NULL) {
+            *out_dev = tmp_dev;
+            *out_pf = platforms[pi];
+            return CL_SUCCESS;
+        }
+    }
+    return CL_DEVICE_NOT_FOUND;
+}
+
 static cl_device_type preferred_opencl_device_type(void) {
     const char* pref = getenv("FORCE_OPENCL_DEVICE");
     if (!pref || !*pref) return CL_DEVICE_TYPE_GPU;
@@ -62,21 +79,79 @@ static cl_device_type preferred_opencl_device_type(void) {
 
 static void ocl_init() {
     cl_int err;
-    cl_platform_id pf = NULL;
     cl_device_type pref_type = preferred_opencl_device_type();
-    err = clGetPlatformIDs(1, &pf, NULL);
-    if (err != CL_SUCCESS || pf == NULL) {
+
+    cl_uint num_platforms = 0;
+    err = clGetPlatformIDs(0, NULL, &num_platforms);
+    if (err != CL_SUCCESS || num_platforms == 0) {
         fprintf(stderr, "OpenCL init failed: clGetPlatformIDs err=%d\n", err);
+        ctx = NULL;
+        queue = NULL;
         return;
     }
 
-    err = clGetDeviceIDs(pf, pref_type, 1, &dev, NULL);
-    if (err != CL_SUCCESS && pref_type != CL_DEVICE_TYPE_GPU) err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_GPU, 1, &dev, NULL);
-    if (err != CL_SUCCESS && pref_type != CL_DEVICE_TYPE_DEFAULT) err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_DEFAULT, 1, &dev, NULL);
-    if (err != CL_SUCCESS && pref_type != CL_DEVICE_TYPE_ALL) err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_ALL, 1, &dev, NULL);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr, "OpenCL init failed: clGetDeviceIDs err=%d\n", err);
+    cl_platform_id* platforms = (cl_platform_id*)malloc(num_platforms * sizeof(cl_platform_id));
+    if (!platforms) {
+        fprintf(stderr, "OpenCL init failed: malloc platforms\n");
+        ctx = NULL;
+        queue = NULL;
         return;
+    }
+
+    err = clGetPlatformIDs(num_platforms, platforms, NULL);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "OpenCL init failed: clGetPlatformIDs err=%d\n", err);
+        free(platforms);
+        ctx = NULL;
+        queue = NULL;
+        return;
+    }
+
+    dev = NULL;
+    cl_platform_id selected_pf = NULL;
+    cl_int r = CL_DEVICE_NOT_FOUND;
+
+    if (pref_type == CL_DEVICE_TYPE_GPU) {
+        r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_GPU, &dev, &selected_pf);
+        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_DEFAULT, &dev, &selected_pf);
+        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_ALL, &dev, &selected_pf);
+        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_CPU, &dev, &selected_pf);
+    } else if (pref_type == CL_DEVICE_TYPE_CPU) {
+        r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_CPU, &dev, &selected_pf);
+        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_DEFAULT, &dev, &selected_pf);
+        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_ALL, &dev, &selected_pf);
+        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_GPU, &dev, &selected_pf);
+    } else if (pref_type == CL_DEVICE_TYPE_DEFAULT) {
+        r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_DEFAULT, &dev, &selected_pf);
+        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_GPU, &dev, &selected_pf);
+        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_CPU, &dev, &selected_pf);
+        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_ALL, &dev, &selected_pf);
+    } else {
+        r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_ALL, &dev, &selected_pf);
+    }
+
+    free(platforms);
+
+    if (r != CL_SUCCESS || dev == NULL) {
+        fprintf(stderr, "OpenCL init failed: clGetDeviceIDs failed for all type/plat combos\n");
+        ctx = NULL;
+        queue = NULL;
+        return;
+    }
+
+    {
+        char pfname[256] = {0};
+        char devname[256] = {0};
+        cl_device_type devtype = 0;
+        clGetPlatformInfo(selected_pf, CL_PLATFORM_NAME, sizeof(pfname), pfname, NULL);
+        clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof(devname), devname, NULL);
+        clGetDeviceInfo(dev, CL_DEVICE_TYPE, sizeof(devtype), &devtype, NULL);
+        fprintf(stderr, "[OpenCL DEBUG] Selected platform=%s, device=%s (type=%s)\n",
+                pfname,
+                devname,
+                (devtype & CL_DEVICE_TYPE_GPU) ? "GPU" :
+                (devtype & CL_DEVICE_TYPE_CPU) ? "CPU" :
+                (devtype & CL_DEVICE_TYPE_DEFAULT) ? "DEFAULT" : "UNKNOWN");
     }
 
     ctx = clCreateContext(NULL, 1, &dev, NULL, NULL, &err);
@@ -369,7 +444,6 @@ static int run_lz4_bench(const char* input_path,
         }
         memcpy(h_sizes, map_sizes, nblk * sizeof(cl_uint));
         clEnqueueUnmapMemObject(queue, ws.output_size_buf, map_sizes, 0, NULL, NULL);
-        clFinish(queue);
 
         for (size_t i = 0; i < nblk; ++i) {
             size_t csz = (size_t)h_sizes[i];
@@ -466,8 +540,13 @@ static int run_lz4_bench(const char* input_path,
         if (gsz == 0) gsz = 1;
 
         uint64_t td0 = get_us();
-        err = clEnqueueNDRangeKernel(queue, kdec, 1, NULL, &gsz, &lsz, 0, NULL, NULL);
-        if (err == CL_SUCCESS) clFinish(queue);
+        cl_event dec_kernel_evt = NULL;
+        err = clEnqueueNDRangeKernel(queue, kdec, 1, NULL, &gsz, &lsz, 0, NULL, &dec_kernel_evt);
+        if (err == CL_SUCCESS && dec_kernel_evt) {
+            clWaitForEvents(1, &dec_kernel_evt);
+            clReleaseEvent(dec_kernel_evt);
+            dec_kernel_evt = NULL;
+        }
         uint64_t td1 = get_us();
         if (err != CL_SUCCESS) {
             if (d_dbg_dec) clReleaseMemObject(d_dbg_dec);
@@ -492,7 +571,6 @@ static int run_lz4_bench(const char* input_path,
             out_total += (size_t)map_sizes_out[i];
         }
         clEnqueueUnmapMemObject(queue, d_sizes_out, map_sizes_out, 0, NULL, NULL);
-        clFinish(queue);
 
         void* map_out = clEnqueueMapBuffer(queue, d_out, CL_TRUE, CL_MAP_READ, 0, (size_t)tc.in_size, 0, NULL, NULL, &err);
         if (err != CL_SUCCESS || !map_out) {
@@ -502,7 +580,6 @@ static int run_lz4_bench(const char* input_path,
                 verify_ok = 0;
             }
             clEnqueueUnmapMemObject(queue, d_out, map_out, 0, NULL, NULL);
-            clFinish(queue);
         }
 
         if (d_dbg_dec) clReleaseMemObject(d_dbg_dec);
