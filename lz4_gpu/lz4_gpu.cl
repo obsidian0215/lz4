@@ -167,6 +167,23 @@ inline void LZ4_COPY_MATCH(__global BYTE* op, const __global BYTE* m_pos, uint l
             return;
         }
     }
+    if (offset < 8) {
+        while (len >= 8) {
+            op[0] = m_pos[0];
+            op[1] = m_pos[1];
+            op[2] = m_pos[2];
+            op[3] = m_pos[3];
+            op[4] = m_pos[4];
+            op[5] = m_pos[5];
+            op[6] = m_pos[6];
+            op[7] = m_pos[7];
+            op += 8;
+            m_pos += 8;
+            len -= 8;
+        }
+        while (len > 0) { *op++ = *m_pos++; len--; }
+        return;
+    }
     if (offset >= 64) {
         while (len >= 64) {
             vstore16(vload16(0, (const __global uchar*)m_pos), 0, (__global uchar*)op);
@@ -336,7 +353,11 @@ inline U32 LZ4_hashPosition(const __global BYTE* p, int tableType, U32* sequence
     return LZ4_hash4(s, tableType);
 }
 
-inline void LZ4_putIndexOnHash(U32 idx, U32 h, __global U32* tableBase, int tableType, U32 sequence, U32 epoch) __attribute__((always_inline)) {
+inline U32 LZ4_fp8(U32 sequence) __attribute__((always_inline)) {
+    return ((sequence * 0x9E3779B1U) >> 24) & 0xFF;
+}
+
+inline void LZ4_putIndexOnHash(U32 idx, U32 h, __global U32* tableBase, int tableType, U32 fp, U32 epoch) __attribute__((always_inline)) {
     U32 const hashLog = (tableType == 0) ? (LZ4_HASHLOG + 1) : LZ4_HASHLOG;
     U32 const mask = (1U << hashLog) - 1U;
     /* Compact 32-bit entry: [8-bit epoch | 8-bit fingerprint | 16-bit low position]
@@ -344,12 +365,11 @@ inline void LZ4_putIndexOnHash(U32 idx, U32 h, __global U32* tableBase, int tabl
      * position relative to the current byte offset on lookup. This keeps the
      * 8-bit fingerprint filter while allowing blocks > 64KB to continue using
      * the last 64KB search window correctly. */
-    U32 fp = ((sequence * 0x9E3779B1U) >> 24) & 0xFF;
     U32 packed = ((epoch & 0xFF) << 24) | (fp << 16) | (idx & 0xFFFF);
     tableBase[h & mask] = packed;
 }
 
-inline U32 LZ4_getIndexOnHash(U32 h, __global U32* tableBase, int tableType, U32 sequence, int* fp_match, U32 epoch, U32 current) __attribute__((always_inline)) {
+inline U32 LZ4_getIndexOnHash(U32 h, __global U32* tableBase, int tableType, U32 fp, int* fp_match, U32 epoch, U32 current) __attribute__((always_inline)) {
     U32 const hashLog = (tableType == 0) ? (LZ4_HASHLOG + 1) : LZ4_HASHLOG;
     U32 const mask = (1U << hashLog) - 1U;
     U32 const packed = tableBase[h & mask];
@@ -358,7 +378,7 @@ inline U32 LZ4_getIndexOnHash(U32 h, __global U32* tableBase, int tableType, U32
         *fp_match = 0;
         return 0;
     }
-    *fp_match = (((packed >> 16) & 0xFF) == (((sequence * 0x9E3779B1U) >> 24) & 0xFF));
+    *fp_match = (((packed >> 16) & 0xFF) == (fp & 0xFF));
     {
         U32 pos16 = packed & 0xFFFF;
         U32 matchIndex = (current & 0xFFFF0000U) | pos16;
@@ -393,25 +413,23 @@ inline U32 LZ4_NbCommonBytes64(U64 val) {
 inline U32 LZ4_count(const __global BYTE* pIn, const __global BYTE* pMatch, const __global BYTE* pInLimit) {
     const __global BYTE* const pStart = pIn;
 
-    /* Prefer 64-bit compares where available to reduce loop iterations */
-    if (pIn < pInLimit - 7) {
-        U64 diff = LZ4_read64(pMatch) ^ LZ4_read64(pIn);
-        if (diff != 0ULL) return LZ4_NbCommonBytes64(diff);
-        pIn += 8;
-        pMatch += 8;
+    /* Batch 16-byte compares first to reduce loop/branch overhead on long matches,
+     * while keeping overhead low on short matches. */
+    while (pIn < pInLimit - 15) {
+        U64 diff0 = LZ4_read64(pMatch) ^ LZ4_read64(pIn);
+        if (diff0 != 0ULL) return (U32)(pIn - pStart) + LZ4_NbCommonBytes64(diff0);
+
+        U64 diff1 = LZ4_read64(pMatch + 8) ^ LZ4_read64(pIn + 8);
+        if (diff1 != 0ULL) return (U32)(pIn - pStart) + 8 + LZ4_NbCommonBytes64(diff1);
+
+        pIn += 16;
+        pMatch += 16;
     }
 
     while (pIn < pInLimit - 7) {
         U64 diff = LZ4_read64(pMatch) ^ LZ4_read64(pIn);
         if (diff != 0ULL) return (U32)(pIn - pStart) + LZ4_NbCommonBytes64(diff);
         pIn += 8; pMatch += 8;
-    }
-
-    /* Fallback to 32-bit comparisons for remaining bytes */
-    if (pIn < pInLimit - 3) {
-        U32 diff = LZ4_read32(pMatch) ^ LZ4_read32(pIn);
-        if (diff != 0) return LZ4_NbCommonBytes(diff) + (U32)(pIn - pStart);
-        pIn += 4; pMatch += 4;
     }
 
     while (pIn < pInLimit - 3) {
@@ -452,7 +470,7 @@ int lz4_compress_core_accelerated(
 
     U32 ipValue, forwardIpValue;
     U32 h_init = LZ4_hashPosition(ip, tableType, &ipValue);
-    LZ4_putIndexOnHash(0, h_init, hashTable, tableType, ipValue, epoch);
+    LZ4_putIndexOnHash(0, h_init, hashTable, tableType, LZ4_fp8(ipValue), epoch);
     ip++;
     U32 forwardH = LZ4_hashPosition(ip, tableType, &forwardIpValue);
 
@@ -467,14 +485,15 @@ int lz4_compress_core_accelerated(
                 U32 h_iter = forwardH;
                 ipValue = forwardIpValue;
                 U32 current = (U32)(forwardIp - src);
+                U32 fp = LZ4_fp8(ipValue);
                 int fp_match;
-                U32 matchIndex = LZ4_getIndexOnHash(h_iter, hashTable, tableType, ipValue, &fp_match, epoch, current);
+                U32 matchIndex = LZ4_getIndexOnHash(h_iter, hashTable, tableType, fp, &fp_match, epoch, current);
                 ip = forwardIp;
                 forwardIp += step;
                 step = (searchMatchNb++ >> 6);
                 if (forwardIp > mflimitPlusOne) goto _last_literals_g;
                 forwardH = LZ4_hashPosition(forwardIp, tableType, &forwardIpValue);
-                LZ4_putIndexOnHash(current, h_iter, hashTable, tableType, ipValue, epoch);
+                LZ4_putIndexOnHash(current, h_iter, hashTable, tableType, fp, epoch);
                 if (fp_match && (matchIndex < current) && (current - matchIndex < LZ4_DISTANCE_MAX)) {
                     match = src + matchIndex;
                     if (LZ4_read32(match) == ipValue) break;
@@ -514,13 +533,16 @@ _next_match_g:
         anchor = ip;
         if (ip >= mflimitPlusOne) break;
         U32 seq2, seq_ip, seq_f;
+        U32 fp2, fp_ip;
         U32 h2 = LZ4_hashPosition(ip - 2, tableType, &seq2);
-        LZ4_putIndexOnHash((U32)(ip - 2 - src), h2, hashTable, tableType, seq2, epoch);
+        fp2 = LZ4_fp8(seq2);
+        LZ4_putIndexOnHash((U32)(ip - 2 - src), h2, hashTable, tableType, fp2, epoch);
         U32 h_ip = LZ4_hashPosition(ip, tableType, &seq_ip);
+        fp_ip = LZ4_fp8(seq_ip);
         U32 current = (U32)(ip - src);
         int fp_match;
-        U32 matchIndex = LZ4_getIndexOnHash(h_ip, hashTable, tableType, seq_ip, &fp_match, epoch, current);
-        LZ4_putIndexOnHash(current, h_ip, hashTable, tableType, seq_ip, epoch);
+        U32 matchIndex = LZ4_getIndexOnHash(h_ip, hashTable, tableType, fp_ip, &fp_match, epoch, current);
+        LZ4_putIndexOnHash(current, h_ip, hashTable, tableType, fp_ip, epoch);
         if (fp_match && (matchIndex < current) && (current - matchIndex < LZ4_DISTANCE_MAX)) {
             if (LZ4_read32(src + matchIndex) == seq_ip) {
                 token = op++; *token = 0; match = src + matchIndex; goto _next_match_g;
@@ -673,10 +695,10 @@ __kernel void lz4_compress_block(
     __global const BYTE* input,
     __global BYTE* output,
     __global U32* blockSizes,
-    __global const U32* blockOffsets,
-    __global const U32* outputOffsets,
     int totalBlocks,
     int inputSize,
+    int blockSize,
+    int singleBlockMaxOut,
     int tableType,
     int acceleration,
     int globalIndexBase,
@@ -691,13 +713,14 @@ __kernel void lz4_compress_block(
     U32 epoch = epoch_base + 1U;
 
     for (uint b = wi; b < (uint)totalBlocks; b += total_wi, ++epoch) {
-        int start = blockOffsets[b * 2];
-        int blockSize = blockOffsets[b * 2 + 1];
-        if (start < inputSize && blockSize > 0) {
-            int dstCapacity = blockSize + (blockSize / 255) + 256;
-            __global BYTE* dst = output + outputOffsets[b];
+        int start = (int)b * blockSize;
+        int remain = inputSize - start;
+        int thisBlockSize = (remain > blockSize) ? blockSize : remain;
+        if (start < inputSize && thisBlockSize > 0) {
+            int dstCapacity = singleBlockMaxOut;
+            __global BYTE* dst = output + (size_t)b * (size_t)singleBlockMaxOut;
             blockSizes[globalIndexBase + b] = lz4_compress_core_accelerated(
-                input + start, dst, blockSize, dstCapacity, tableType, dict, acceleration, epoch
+                input + start, dst, thisBlockSize, dstCapacity, tableType, dict, acceleration, epoch
             );
         } else {
             blockSizes[globalIndexBase + b] = 0;
@@ -729,9 +752,8 @@ __kernel void lz4_decompress_blocks(
     __global BYTE* output,
     __global const U32* comp_offsets,
     __global const U32* comp_sizes,
-    __global const U32* out_offsets,
-    __global const U32* max_out_sizes,
     __global U32* sizes_out,
+    U32 block_size,
     U32 totalBlocks
 ) {
     int gid = get_global_id(0);
@@ -740,9 +762,9 @@ __kernel void lz4_decompress_blocks(
     for (int idx = gid; idx < (int)totalBlocks; idx += gsz) {
         lz4_decompress_generic(
             input + comp_offsets[idx],
-            output + out_offsets[idx],
+            output + (size_t)idx * (size_t)block_size,
             (int)comp_sizes[idx],
-            (int)max_out_sizes[idx],
+            (int)block_size,
             &sizes_out[idx]
         );
     }
@@ -751,18 +773,30 @@ __kernel void lz4_decompress_blocks(
 __kernel void lz4_pack_blocks(
     const __global BYTE* sparse_output,
     __global BYTE* packed_output,
-    __global const U32* sparse_offsets,
     __global const U32* packed_offsets,
     __global const U32* block_sizes,
+    U32 singleBlockMaxOut,
     U32 totalBlocks
 ) {
-    uint gid = get_global_id(0);
-    uint gsz = get_global_size(0);
+    uint blk = get_group_id(0);
+    uint lane = get_local_id(0);
+    uint lanes = get_local_size(0);
 
-    for (uint idx = gid; idx < totalBlocks; idx += gsz) {
-        U32 sz = block_sizes[idx];
-        if (sz == 0) continue;
-        LZ4_UA_COPYN(packed_output + packed_offsets[idx], sparse_output + sparse_offsets[idx], sz);
+    if (blk >= totalBlocks) return;
+
+    {
+        U32 sz = block_sizes[blk];
+        U32 vec_end = sz & ~15U;
+        __global BYTE* dst = packed_output + packed_offsets[blk];
+        const __global BYTE* src = sparse_output + (size_t)blk * (size_t)singleBlockMaxOut;
+
+        for (U32 pos = lane * 16U; pos < vec_end; pos += lanes * 16U) {
+            uchar16 c = vload16(0, (const __global uchar*)(src + pos));
+            vstore16(c, 0, (__global uchar*)(dst + pos));
+        }
+        for (U32 pos = vec_end + lane; pos < sz; pos += lanes) {
+            dst[pos] = src[pos];
+        }
     }
 }
 

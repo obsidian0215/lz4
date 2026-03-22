@@ -35,6 +35,10 @@ typedef struct {
     size_t current_decomp_out_off_capacity;
     size_t current_decomp_max_out_capacity;
     size_t current_decomp_sizes_out_capacity;
+    uint32_t comp_meta_cached_blocks;
+    uint32_t comp_meta_cached_block_size;
+    uint32_t comp_meta_cached_single_block_max_out;
+    int comp_meta_cached_valid;
 } lz4_gpu_workspace_t;
 
 void lz4_gpu_workspace_init(lz4_gpu_workspace_t* ws);

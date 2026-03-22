@@ -111,10 +111,14 @@ static int lz4_should_use_device_compaction(size_t packed_bytes, size_t sparse_b
     if (packed_bytes == 0 || sparse_bytes == 0 || packed_bytes >= sparse_bytes) return 0;
     {
         unsigned min_blocks = lz4_env_unsigned_value("LZ4_GPU_COMPACTION_MIN_BLOCKS", 8U);
-        unsigned min_gain_pct = lz4_env_unsigned_value("LZ4_GPU_COMPACTION_MIN_GAIN_PCT", 5U);
+        unsigned min_gain_pct = lz4_env_unsigned_value("LZ4_GPU_COMPACTION_MIN_GAIN_PCT", 8U);
+        unsigned min_sparse_kb = lz4_env_unsigned_value("LZ4_GPU_COMPACTION_MIN_SPARSE_KB", 1024U);
+        unsigned min_saved_kb = lz4_env_unsigned_value("LZ4_GPU_COMPACTION_MIN_SAVED_KB", 512U);
         size_t saved_bytes;
         if (num_blocks < (size_t)min_blocks) return 0;
+        if (sparse_bytes < (size_t)min_sparse_kb * 1024ULL) return 0;
         saved_bytes = sparse_bytes - packed_bytes;
+        if (saved_bytes < (size_t)min_saved_kb * 1024ULL) return 0;
         return saved_bytes * 100U >= sparse_bytes * (size_t)min_gain_pct;
     }
 }
@@ -263,7 +267,8 @@ static size_t choose_comp_worker_count(cl_command_queue queue, size_t num_blocks
     }
     if (cu == 0) cu = 1;
 
-    size_t default_wi_per_cu = (num_blocks >= 4096) ? 16 : 24;
+    /* Raise default compression occupancy on iGPU-heavy paths; still overridable by env. */
+    size_t default_wi_per_cu = (num_blocks >= 4096) ? 48 : 64;
     size_t wi_per_cu = parse_wi_per_cu_env("LZ4_GPU_COMP_WI_PER_CU", "LZ4_GPU_WI_PER_CU", default_wi_per_cu);
 
     size_t target = (size_t)cu * wi_per_cu;
@@ -369,16 +374,21 @@ static int lz4_write_blocks_packed(FILE* fout,
                                    size_t count) {
     size_t pack_kb = 1024;
     const char* env_pack_kb = getenv("LZ4_GPU_PACK_WRITE_KB");
+    uint8_t* pack = NULL;
+    int temp_pack = 0;
+    size_t fill = 0;
+
     if (env_pack_kb && *env_pack_kb) {
         long v = strtol(env_pack_kb, NULL, 10);
         if (v > 64 && v <= 16384) pack_kb = (size_t)v;
     }
 
     size_t pack_cap = pack_kb * 1024;
-    uint8_t* pack = (uint8_t*)malloc(pack_cap);
-    size_t fill = 0;
 
     if (!fout || !base || !offsets || !sizes) return -1;
+
+    pack = (uint8_t*)malloc(pack_cap);
+    temp_pack = (pack != NULL);
 
     if (!pack) {
         for (size_t i = 0; i < count; ++i) {
@@ -424,12 +434,12 @@ static int lz4_write_blocks_packed(FILE* fout,
 
     if (fill > 0) {
         if (fwrite(pack, 1, fill, fout) != fill) {
-            free(pack);
+            if (temp_pack) free(pack);
             return -1;
         }
     }
 
-    free(pack);
+    if (temp_pack) free(pack);
     return 0;
 }
 
@@ -447,6 +457,37 @@ static int lz4_write_blocks_direct(FILE* fout,
     return 0;
 }
 
+static int lz4_write_blocks_from_mapped_buffer(cl_command_queue queue,
+                                                cl_mem src_buf,
+                                                size_t mapped_bytes,
+                                                FILE* fout,
+                                                const uint32_t* offsets,
+                                                const uint32_t* sizes,
+                                                size_t count,
+                                                unsigned long* map_read_us) {
+    cl_int err;
+    void* mapped;
+    uint64_t t0;
+
+    if (!queue || !src_buf || !fout || !offsets || !sizes) return -1;
+
+    t0 = get_us();
+    mapped = clEnqueueMapBuffer(queue, src_buf, CL_TRUE, CL_MAP_READ, 0, mapped_bytes, 0, NULL, NULL, &err);
+    if (err != CL_SUCCESS || !mapped) {
+        return -1;
+    }
+    if (map_read_us) *map_read_us = (unsigned long)(get_us() - t0);
+
+    if (lz4_write_blocks_packed(fout, (const uint8_t*)mapped, offsets, sizes, count) != 0) {
+        (void)clEnqueueUnmapMemObject(queue, src_buf, mapped, 0, NULL, NULL);
+        return -1;
+    }
+
+    err = clEnqueueUnmapMemObject(queue, src_buf, mapped, 0, NULL, NULL);
+    if (err != CL_SUCCESS) return -1;
+    return 0;
+}
+
 static void lz4_set_stream_buffer(FILE* f) {
     char* vbuf;
     if (!f) return;
@@ -455,6 +496,69 @@ static void lz4_set_stream_buffer(FILE* f) {
     if (setvbuf(f, vbuf, _IOFBF, 2U * 1024U * 1024U) != 0) {
         free(vbuf);
     }
+}
+
+static int lz4_readback_to_file_chunked(cl_command_queue queue,
+                                        cl_mem src_buf,
+                                        size_t total_bytes,
+                                        FILE* fout,
+                                        size_t chunk_bytes) {
+    cl_int err;
+    uint8_t* staging;
+    size_t off = 0;
+
+    if (!src_buf || !fout) return -1;
+    if (total_bytes == 0) return 0;
+    if (chunk_bytes < 256U * 1024U) chunk_bytes = 256U * 1024U;
+
+    staging = (uint8_t*)malloc(chunk_bytes);
+    if (!staging) return -1;
+
+    while (off < total_bytes) {
+        size_t step = total_bytes - off;
+        if (step > chunk_bytes) step = chunk_bytes;
+
+        err = clEnqueueReadBuffer(queue, src_buf, CL_TRUE, off, step, staging, 0, NULL, NULL);
+        if (err != CL_SUCCESS) {
+            free(staging);
+            return -1;
+        }
+        if (fwrite(staging, 1, step, fout) != step) {
+            free(staging);
+            return -1;
+        }
+        off += step;
+    }
+
+    free(staging);
+    return 0;
+}
+
+static int lz4_write_contiguous_from_mapped_buffer(cl_command_queue queue,
+                                                   cl_mem src_buf,
+                                                   size_t mapped_bytes,
+                                                   FILE* fout,
+                                                   unsigned long* map_read_us) {
+    cl_int err;
+    void* mapped;
+    uint64_t t0;
+
+    if (!queue || !src_buf || !fout) return -1;
+    if (mapped_bytes == 0) return 0;
+
+    t0 = get_us();
+    mapped = clEnqueueMapBuffer(queue, src_buf, CL_TRUE, CL_MAP_READ, 0, mapped_bytes, 0, NULL, NULL, &err);
+    if (err != CL_SUCCESS || !mapped) return -1;
+    if (map_read_us) *map_read_us = (unsigned long)(get_us() - t0);
+
+    if (fwrite(mapped, 1, mapped_bytes, fout) != mapped_bytes) {
+        (void)clEnqueueUnmapMemObject(queue, src_buf, mapped, 0, NULL, NULL);
+        return -1;
+    }
+
+    err = clEnqueueUnmapMemObject(queue, src_buf, mapped, 0, NULL, NULL);
+    if (err != CL_SUCCESS) return -1;
+    return 0;
 }
 
 int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kernel, cl_kernel pack_kernel,
@@ -564,53 +668,7 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
         t->data_upload_us = 0;
     }
 
-    size_t out_offsets_cap = num_blocks * sizeof(uint32_t);
-    size_t block_info_cap = num_blocks * 2 * sizeof(uint32_t);
-
-    ws->out_offsets_buf = ensure_buffer_ex(context, ws->out_offsets_buf, out_offsets_cap, &ws->current_out_offsets_capacity, CL_MEM_READ_ONLY, !use_standard_copy, &err);
-    if (err != CL_SUCCESS || !ws->out_offsets_buf) {
-        fprintf(stderr, "[LZ4] allocate out_offsets buffer failed: %d\n", err);
-        free(h_block_info);
-        free(h_out_offsets);
-        return -1;
-    }
-
-    ws->block_info_buf = ensure_buffer_ex(context, ws->block_info_buf, block_info_cap, &ws->current_blocks_capacity, CL_MEM_READ_ONLY, !use_standard_copy, &err);
-    if (err != CL_SUCCESS || !ws->block_info_buf) {
-        fprintf(stderr, "[LZ4] allocate block_info buffer failed: %d\n", err);
-        free(h_block_info);
-        free(h_out_offsets);
-        return -1;
-    }
-
-    if (!skip_input_upload) {
-        if (use_standard_copy) {
-            cl_event meta_ev[2] = {0};
-            int ev_count = 0;
-            err = clEnqueueWriteBuffer(queue, ws->out_offsets_buf, CL_FALSE, 0, out_offsets_cap, h_out_offsets, 0, NULL, &meta_ev[ev_count]);
-            if (err == CL_SUCCESS) ev_count++;
-            if (err == CL_SUCCESS) {
-                err = clEnqueueWriteBuffer(queue, ws->block_info_buf, CL_FALSE, 0, block_info_cap, h_block_info, 0, NULL, &meta_ev[ev_count]);
-                if (err == CL_SUCCESS) ev_count++;
-            }
-            if (err != CL_SUCCESS || (ev_count > 0 && clWaitForEvents((cl_uint)ev_count, meta_ev) != CL_SUCCESS)) {
-                for (int ei = 0; ei < ev_count; ++ei) if (meta_ev[ei]) clReleaseEvent(meta_ev[ei]);
-                fprintf(stderr, "[LZ4] upload block metadata buffers failed\n");
-                free(h_block_info);
-                free(h_out_offsets);
-                return -1;
-            }
-            for (int ei = 0; ei < ev_count; ++ei) if (meta_ev[ei]) clReleaseEvent(meta_ev[ei]);
-        } else {
-            if (write_buffer_auto(queue, ws->out_offsets_buf, h_out_offsets, out_offsets_cap, 0) != 0 ||
-                write_buffer_auto(queue, ws->block_info_buf, h_block_info, block_info_cap, 0) != 0) {
-                fprintf(stderr, "[LZ4] upload block metadata buffers failed\n");
-                free(h_block_info);
-                free(h_out_offsets);
-                return -1;
-            }
-        }
-    }
+    ws->comp_meta_cached_valid = 0;
 
     ws->output_size_buf = ensure_buffer_ex(context, ws->output_size_buf, num_blocks * sizeof(uint32_t), &ws->current_osize_capacity, CL_MEM_READ_WRITE, !use_standard_copy, &err);
     if (dbg_comp_enabled) {
@@ -658,10 +716,10 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
         err  = clSetKernelArg(kernel, 0, sizeof(cl_mem), &ws->in_buf);
         err |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &ws->out_buf);
         err |= clSetKernelArg(kernel, 2, sizeof(cl_mem), &ws->output_size_buf);
-        err |= clSetKernelArg(kernel, 3, sizeof(cl_mem), &ws->block_info_buf);
-        err |= clSetKernelArg(kernel, 4, sizeof(cl_mem), &ws->out_offsets_buf);
-        err |= clSetKernelArg(kernel, 5, sizeof(int), &num_blocks);
-        err |= clSetKernelArg(kernel, 6, sizeof(int), &inputSize);
+        err |= clSetKernelArg(kernel, 3, sizeof(int), &num_blocks);
+        err |= clSetKernelArg(kernel, 4, sizeof(int), &inputSize);
+        err |= clSetKernelArg(kernel, 5, sizeof(int), &block_size);
+        err |= clSetKernelArg(kernel, 6, sizeof(uint32_t), &single_block_max_out);
         err |= clSetKernelArg(kernel, 7, sizeof(int), &tableType);
         err |= clSetKernelArg(kernel, 8, sizeof(int), &acceleration);
         err |= clSetKernelArg(kernel, 9, sizeof(int), &globalIndexBase);
@@ -738,7 +796,6 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
         int use_compaction = lz4_should_use_device_compaction(total_compressed_size, total_out_read, (size_t)num_blocks, pack_kernel);
         if (use_compaction) {
             uint32_t* h_packed_offsets = (uint32_t*)malloc((size_t)num_blocks * sizeof(uint32_t));
-            uint8_t* h_packed_out = NULL;
             if (!h_packed_offsets) {
                 fclose(fout);
                 if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
@@ -773,16 +830,16 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
             }
 
             {
-                size_t pack_lws = sanitize_local_size(queue, l_ws, (size_t)num_blocks);
-                size_t pack_gws = round_up_size((size_t)num_blocks, pack_lws);
+                size_t pack_lws = sanitize_local_size(queue, 64, 256);
+                size_t pack_gws = ((size_t)num_blocks > 0) ? ((size_t)num_blocks * pack_lws) : pack_lws;
                 cl_event pack_ev = NULL;
                 uint32_t total_blocks_u32 = (uint32_t)num_blocks;
 
                 err  = clSetKernelArg(pack_kernel, 0, sizeof(cl_mem), &ws->out_buf);
                 err |= clSetKernelArg(pack_kernel, 1, sizeof(cl_mem), &ws->packed_out_buf);
-                err |= clSetKernelArg(pack_kernel, 2, sizeof(cl_mem), &ws->out_offsets_buf);
-                err |= clSetKernelArg(pack_kernel, 3, sizeof(cl_mem), &ws->packed_offsets_buf);
-                err |= clSetKernelArg(pack_kernel, 4, sizeof(cl_mem), &ws->output_size_buf);
+                err |= clSetKernelArg(pack_kernel, 2, sizeof(cl_mem), &ws->packed_offsets_buf);
+                err |= clSetKernelArg(pack_kernel, 3, sizeof(cl_mem), &ws->output_size_buf);
+                err |= clSetKernelArg(pack_kernel, 4, sizeof(uint32_t), &single_block_max_out);
                 err |= clSetKernelArg(pack_kernel, 5, sizeof(uint32_t), &total_blocks_u32);
                 if (err != CL_SUCCESS) {
                     free(h_packed_offsets);
@@ -807,19 +864,15 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
             }
 
             if (total_compressed_size > 0) {
-                h_packed_out = (uint8_t*)malloc(total_compressed_size);
-                if (!h_packed_out) {
-                    free(h_packed_offsets);
-                    fclose(fout);
-                    if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
-                    free(h_block_info); free(h_osizes); free(h_out_offsets);
-                    return -1;
-                }
                 {
                     uint64_t t_down0 = get_us();
-                    if (read_buffer_auto(queue, ws->packed_out_buf, h_packed_out, total_compressed_size, use_standard_copy) != 0) {
-                        fprintf(stderr, "[LZ4] read compacted payload buffer failed\n");
-                        free(h_packed_out);
+                    size_t read_chunk_kb = (size_t)lz4_env_unsigned_value("LZ4_GPU_PACK_READBACK_KB", 8192U);
+                    if (lz4_readback_to_file_chunked(queue,
+                                                     ws->packed_out_buf,
+                                                     total_compressed_size,
+                                                     fout,
+                                                     read_chunk_kb * 1024ULL) != 0) {
+                        fprintf(stderr, "[LZ4] chunked readback/write for compacted payload failed\n");
                         free(h_packed_offsets);
                         fclose(fout);
                         if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
@@ -828,38 +881,46 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
                     }
                     t->download_total_us = (unsigned long)(get_us() - t_down0);
                 }
-                if (fwrite(h_packed_out, 1, total_compressed_size, fout) != total_compressed_size) {
-                    free(h_packed_out);
-                    free(h_packed_offsets);
-                    fclose(fout);
-                    if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
-                    free(h_block_info); free(h_osizes); free(h_out_offsets);
-                    return -1;
-                }
-                free(h_packed_out);
             }
             free(h_packed_offsets);
         } else {
-            uint8_t* h_out = (uint8_t*)malloc(total_out_read);
-            if (h_out) {
-                uint64_t t_down0 = get_us();
-                if (read_buffer_auto(queue, ws->out_buf, h_out, total_out_read, use_standard_copy) != 0) {
-                    fprintf(stderr, "[LZ4] read compressed payload buffer failed\n");
-                    free(h_out);
+            if (!use_standard_copy) {
+                if (lz4_write_blocks_from_mapped_buffer(queue,
+                                                        ws->out_buf,
+                                                        total_out_read,
+                                                        fout,
+                                                        h_out_offsets,
+                                                        h_osizes,
+                                                        (size_t)num_blocks,
+                                                        &t->download_total_us) != 0) {
+                    fprintf(stderr, "[LZ4] mapped write for sparse payload failed\n");
                     fclose(fout);
                     if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
                     free(h_block_info); free(h_osizes); free(h_out_offsets);
                     return -1;
                 }
-                t->download_total_us = (unsigned long)(get_us() - t_down0);
-                if (lz4_write_blocks_packed(fout, h_out, h_out_offsets, h_osizes, (size_t)num_blocks) != 0) {
+            } else {
+                uint8_t* h_out = (uint8_t*)malloc(total_out_read);
+                if (h_out) {
+                    uint64_t t_down0 = get_us();
+                    if (read_buffer_auto(queue, ws->out_buf, h_out, total_out_read, use_standard_copy) != 0) {
+                        fprintf(stderr, "[LZ4] read compressed payload buffer failed\n");
+                        free(h_out);
+                        fclose(fout);
+                        if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
+                        free(h_block_info); free(h_osizes); free(h_out_offsets);
+                        return -1;
+                    }
+                    t->download_total_us = (unsigned long)(get_us() - t_down0);
+                    if (lz4_write_blocks_packed(fout, h_out, h_out_offsets, h_osizes, (size_t)num_blocks) != 0) {
+                        free(h_out);
+                        fclose(fout);
+                        if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
+                        free(h_block_info); free(h_osizes); free(h_out_offsets);
+                        return -1;
+                    }
                     free(h_out);
-                    fclose(fout);
-                    if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
-                    free(h_block_info); free(h_osizes); free(h_out_offsets);
-                    return -1;
                 }
-                free(h_out);
             }
         }
         fclose(fout);
@@ -1028,26 +1089,6 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
         free(h_max_out_sizes);
         return -1;
     }
-    ws->decomp_out_off_buf = ensure_buffer_ex(context, ws->decomp_out_off_buf, num_blocks * 4,
-                                           &ws->current_decomp_out_off_capacity, CL_MEM_READ_ONLY, !use_standard_copy, &err);
-    if (err != CL_SUCCESS || !ws->decomp_out_off_buf) {
-        free(h_comp_sizes);
-        free(h_comp_offsets);
-        free(h_comp_sizes_32);
-        free(h_out_offsets);
-        free(h_max_out_sizes);
-        return -1;
-    }
-    ws->decomp_max_out_buf = ensure_buffer_ex(context, ws->decomp_max_out_buf, num_blocks * 4,
-                                           &ws->current_decomp_max_out_capacity, CL_MEM_READ_ONLY, !use_standard_copy, &err);
-    if (err != CL_SUCCESS || !ws->decomp_max_out_buf) {
-        free(h_comp_sizes);
-        free(h_comp_offsets);
-        free(h_comp_sizes_32);
-        free(h_out_offsets);
-        free(h_max_out_sizes);
-        return -1;
-    }
     ws->decomp_sizes_out_buf = ensure_buffer_ex(context, ws->decomp_sizes_out_buf, num_blocks * 4,
                                              &ws->current_decomp_sizes_out_capacity, CL_MEM_READ_WRITE, !use_standard_copy, &err);
     if (err != CL_SUCCESS || !ws->decomp_sizes_out_buf) {
@@ -1060,20 +1101,12 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
     }
 
     if (use_standard_copy) {
-        cl_event meta_ev[4] = {0};
+        cl_event meta_ev[2] = {0};
         int ev_count = 0;
         err  = clEnqueueWriteBuffer(queue, ws->decomp_comp_off_buf, CL_FALSE, 0, num_blocks * 4, h_comp_offsets, 0, NULL, &meta_ev[ev_count]);
         if (err == CL_SUCCESS) ev_count++;
         if (err == CL_SUCCESS) {
             err = clEnqueueWriteBuffer(queue, ws->decomp_comp_size_buf, CL_FALSE, 0, num_blocks * 4, h_comp_sizes_32, 0, NULL, &meta_ev[ev_count]);
-            if (err == CL_SUCCESS) ev_count++;
-        }
-        if (err == CL_SUCCESS) {
-            err = clEnqueueWriteBuffer(queue, ws->decomp_out_off_buf, CL_FALSE, 0, num_blocks * 4, h_out_offsets, 0, NULL, &meta_ev[ev_count]);
-            if (err == CL_SUCCESS) ev_count++;
-        }
-        if (err == CL_SUCCESS) {
-            err = clEnqueueWriteBuffer(queue, ws->decomp_max_out_buf, CL_FALSE, 0, num_blocks * 4, h_max_out_sizes, 0, NULL, &meta_ev[ev_count]);
             if (err == CL_SUCCESS) ev_count++;
         }
 
@@ -1090,9 +1123,7 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
         for (int ei = 0; ei < ev_count; ++ei) if (meta_ev[ei]) clReleaseEvent(meta_ev[ei]);
     } else {
         if (write_buffer_auto(queue, ws->decomp_comp_off_buf, h_comp_offsets, num_blocks * 4, 0) != 0 ||
-            write_buffer_auto(queue, ws->decomp_comp_size_buf, h_comp_sizes_32, num_blocks * 4, 0) != 0 ||
-            write_buffer_auto(queue, ws->decomp_out_off_buf, h_out_offsets, num_blocks * 4, 0) != 0 ||
-            write_buffer_auto(queue, ws->decomp_max_out_buf, h_max_out_sizes, num_blocks * 4, 0) != 0) {
+            write_buffer_auto(queue, ws->decomp_comp_size_buf, h_comp_sizes_32, num_blocks * 4, 0) != 0) {
             fprintf(stderr, "[LZ4] upload decompress metadata buffers failed\n");
             free(h_comp_sizes);
             free(h_comp_offsets);
@@ -1111,7 +1142,7 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
     cl_uint kernel_num_args = 0;
     int kernel_has_dbg = 0;
     if (clGetKernelInfo(kernel, CL_KERNEL_NUM_ARGS, sizeof(kernel_num_args), &kernel_num_args, NULL) == CL_SUCCESS) {
-        kernel_has_dbg = (kernel_num_args >= 10U);
+        kernel_has_dbg = (kernel_num_args >= 9U);
     }
     int dbg_dec_requested = lz4_debug_counters_enabled();
     int dbg_dec_enabled = dbg_dec_requested && kernel_has_dbg;
@@ -1122,10 +1153,9 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
     clSetKernelArg(kernel, 1, sizeof(cl_mem), &ws->out_buf);
     clSetKernelArg(kernel, 2, sizeof(cl_mem), &ws->decomp_comp_off_buf);
     clSetKernelArg(kernel, 3, sizeof(cl_mem), &ws->decomp_comp_size_buf);
-    clSetKernelArg(kernel, 4, sizeof(cl_mem), &ws->decomp_out_off_buf);
-    clSetKernelArg(kernel, 5, sizeof(cl_mem), &ws->decomp_max_out_buf);
-    clSetKernelArg(kernel, 6, sizeof(cl_mem), &ws->decomp_sizes_out_buf);
-    clSetKernelArg(kernel, 7, sizeof(uint32_t), &num_blocks);
+    clSetKernelArg(kernel, 4, sizeof(cl_mem), &ws->decomp_sizes_out_buf);
+    clSetKernelArg(kernel, 5, sizeof(uint32_t), &block_size_val);
+    clSetKernelArg(kernel, 6, sizeof(uint32_t), &num_blocks);
 
     if (dbg_dec_enabled) {
         size_t dbg_dec_bytes = (size_t)num_blocks * LZ4_DBG_DEC_N * sizeof(uint32_t);
@@ -1141,8 +1171,8 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
     if (kernel_has_dbg) {
         cl_mem dbg_dec_arg = dbg_dec_enabled ? dbg_dec_buf : ws->decomp_sizes_out_buf;
         uint32_t dbg_dec_flag = dbg_dec_enabled ? 1U : 0U;
-        clSetKernelArg(kernel, 8, sizeof(cl_mem), &dbg_dec_arg);
-        clSetKernelArg(kernel, 9, sizeof(uint32_t), &dbg_dec_flag);
+        clSetKernelArg(kernel, 7, sizeof(cl_mem), &dbg_dec_arg);
+        clSetKernelArg(kernel, 8, sizeof(uint32_t), &dbg_dec_flag);
     }
 
     size_t l_ws = (size_t)t->local_size;
@@ -1191,28 +1221,43 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
     FILE* fout = fopen(output_path, "wb");
     if (fout) {
         lz4_set_stream_buffer(fout);
-        uint8_t* h_out = (uint8_t*)malloc(total_decomp_sz);
-        if (h_out) {
-            uint64_t t_down0 = get_us();
-            if (read_buffer_auto(queue, ws->out_buf, h_out, total_decomp_sz, use_standard_copy) != 0) {
-                fprintf(stderr, "[LZ4] read decompressed payload failed\n");
-                free(h_out);
+        if (!use_standard_copy && !lz4_env_flag_value("LZ4_GPU_DISABLE_DECOMP_MAPPED_WRITE", NULL)) {
+            if (lz4_write_contiguous_from_mapped_buffer(queue,
+                                                        ws->out_buf,
+                                                        total_decomp_sz,
+                                                        fout,
+                                                        &t->download_total_us) != 0) {
+                fprintf(stderr, "[LZ4] mapped write for decompressed payload failed\n");
                 fclose(fout);
                 if (dbg_dec_buf) clReleaseMemObject(dbg_dec_buf);
                 free(h_comp_sizes); free(h_comp_offsets); free(h_comp_sizes_32);
                 free(h_out_offsets); free(h_max_out_sizes); free(h_final_sizes);
                 return -1;
             }
-            t->download_total_us = (unsigned long)(get_us() - t_down0);
-            if (fwrite(h_out, 1, total_decomp_sz, fout) != total_decomp_sz) {
+        } else {
+            uint8_t* h_out = (uint8_t*)malloc(total_decomp_sz);
+            if (h_out) {
+                uint64_t t_down0 = get_us();
+                if (read_buffer_auto(queue, ws->out_buf, h_out, total_decomp_sz, use_standard_copy) != 0) {
+                    fprintf(stderr, "[LZ4] read decompressed payload failed\n");
+                    free(h_out);
+                    fclose(fout);
+                    if (dbg_dec_buf) clReleaseMemObject(dbg_dec_buf);
+                    free(h_comp_sizes); free(h_comp_offsets); free(h_comp_sizes_32);
+                    free(h_out_offsets); free(h_max_out_sizes); free(h_final_sizes);
+                    return -1;
+                }
+                t->download_total_us = (unsigned long)(get_us() - t_down0);
+                if (fwrite(h_out, 1, total_decomp_sz, fout) != total_decomp_sz) {
+                    free(h_out);
+                    fclose(fout);
+                    if (dbg_dec_buf) clReleaseMemObject(dbg_dec_buf);
+                    free(h_comp_sizes); free(h_comp_offsets); free(h_comp_sizes_32);
+                    free(h_out_offsets); free(h_max_out_sizes); free(h_final_sizes);
+                    return -1;
+                }
                 free(h_out);
-                fclose(fout);
-                if (dbg_dec_buf) clReleaseMemObject(dbg_dec_buf);
-                free(h_comp_sizes); free(h_comp_offsets); free(h_comp_sizes_32);
-                free(h_out_offsets); free(h_max_out_sizes); free(h_final_sizes);
-                return -1;
             }
-            free(h_out);
         }
         fclose(fout);
     }

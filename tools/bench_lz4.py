@@ -51,7 +51,7 @@ HYBRID_ACCELS = [1, 2]
 
 # Default frequency configs (for intel iGPU)
 DEFAULT_CPU_FREQ_MHZ = "800,1900,3000,5000"
-DEFAULT_GPU_FREQ_MHZ = "300,1500"
+DEFAULT_GPU_FREQ_MHZ = "500,1000,1500"
 
 BASELINE_IDLE_PKG_W = None
 BASELINE_IDLE_CORE_W = None
@@ -749,10 +749,15 @@ def apply_wall_energy(stats, tel_window, comp_elapsed_s, dec_elapsed_s, energy_s
     gpu_idle_power_w = float(idle_gpu_power_w or 0.0)
     cpu_peak_power_w = float(tel_window.get('cpu_core_peak_power_w', 0.0) or tel_window.get('cpu_pkg_peak_power_w', 0.0) or cpu_avg_power_w)
     gpu_peak_power_w = float(tel_window.get('gpu_peak_power_w', 0.0) or gpu_avg_power_w)
-    cpu_ref_power_w = max(cpu_avg_power_w, cpu_peak_power_w)
-    gpu_ref_power_w = max(gpu_avg_power_w, gpu_peak_power_w)
-    cpu_delta_power_w = max(0.0, cpu_ref_power_w - cpu_idle_power_w)
-    gpu_delta_power_w = max(0.0, gpu_ref_power_w - gpu_idle_power_w)
+
+    # 功率口径修正：优先输出“动态功率(Active-Idle)”，
+    # 若因计量域不一致导致为负/不可用，再回退到活动功率，避免低频被截断为 0。
+    cpu_active_power_w = max(0.0, cpu_avg_power_w, cpu_peak_power_w)
+    gpu_active_power_w = max(0.0, gpu_avg_power_w, gpu_peak_power_w)
+    cpu_dynamic_power_w = max(0.0, cpu_avg_power_w - cpu_idle_power_w, cpu_peak_power_w - cpu_idle_power_w)
+    gpu_dynamic_power_w = max(0.0, gpu_avg_power_w - gpu_idle_power_w, gpu_peak_power_w - gpu_idle_power_w)
+    cpu_export_power_w = cpu_dynamic_power_w if cpu_dynamic_power_w > 3.0 else cpu_active_power_w
+    gpu_export_power_w = gpu_dynamic_power_w if gpu_dynamic_power_w > 0.0 else gpu_active_power_w
 
     comp_phase_s = max(0.0, float(comp_elapsed_s or 0.0))
     dec_phase_s = max(0.0, float(dec_elapsed_s or 0.0))
@@ -765,11 +770,11 @@ def apply_wall_energy(stats, tel_window, comp_elapsed_s, dec_elapsed_s, energy_s
     stats['dec_cpu_energy_j'] = cpu_peak_power_w
     stats['dec_gpu_energy_j'] = gpu_peak_power_w
 
-    # 对外功率字段统一输出“增量功率 (Active - Idle)”
-    stats['comp_cpu_power_w'] = cpu_delta_power_w
-    stats['comp_gpu_power_w'] = gpu_delta_power_w
-    stats['dec_cpu_power_w'] = None
-    stats['dec_gpu_power_w'] = None
+    # 对外功率字段：动态功率优先；当前无法稳定区分 dec phase 时，回填 comp power。
+    stats['comp_cpu_power_w'] = cpu_export_power_w
+    stats['comp_gpu_power_w'] = gpu_export_power_w
+    stats['dec_cpu_power_w'] = cpu_export_power_w
+    stats['dec_gpu_power_w'] = gpu_export_power_w
     stats['cpu_peak_power_w'] = cpu_peak_power_w
     stats['gpu_peak_power_w'] = gpu_peak_power_w
     stats['cpu_idle_power_w'] = cpu_idle_power_w
@@ -777,7 +782,7 @@ def apply_wall_energy(stats, tel_window, comp_elapsed_s, dec_elapsed_s, energy_s
     stats['cpu_active_power_w'] = cpu_avg_power_w
     stats['gpu_active_power_w'] = gpu_avg_power_w
 
-    comp_total_power = max(0.0, cpu_delta_power_w + gpu_delta_power_w)
+    comp_total_power = max(0.0, cpu_export_power_w + gpu_export_power_w)
     dec_total_power = comp_total_power
     comp_total_mbs = float(stats.get('comp_total_mbs', 0.0) or 0.0)
     dec_total_mbs = float(stats.get('dec_total_mbs', 0.0) or 0.0)
@@ -1131,8 +1136,6 @@ def run_lz4_cpu(file_path, bs, threads, orig_hash, telemetry=None, bench_seconds
                     and file_matches_hash(tmp_dec, expected_hash)
                 )
 
-                apply_total_throughput_from_elapsed(stats, in_sz, comp_elapsed_s, dec_elapsed_s)
-
             finally:
                 safe_remove(tmp_comp)
                 safe_remove(tmp_dec)
@@ -1228,6 +1231,11 @@ def run_lz4_gpu(file_path, bs, lsz, accel, orig_hash, telemetry=None, bench_seco
             stats['dec_mbs'] = stable['dec_kernel_tp']
             stats['comp_total_mbs'] = stable.get('comp_total_tp', 0.0)
             stats['dec_total_mbs'] = stable.get('dec_total_tp', 0.0)
+            if in_sz > 0:
+                if float(stats.get('comp_total_mbs', 0.0) or 0.0) > 0.0:
+                    stats['comp_time_s'] = in_sz / (float(stats['comp_total_mbs']) * 1024.0 * 1024.0)
+                if float(stats.get('dec_total_mbs', 0.0) or 0.0) > 0.0:
+                    stats['dec_time_s'] = in_sz / (float(stats['dec_total_mbs']) * 1024.0 * 1024.0)
 
             tmp_comp = make_temp_file_path("lz4_gpu_total", ".lz4")
             tmp_dec = f"{tmp_comp}.dec"
@@ -1279,8 +1287,6 @@ def run_lz4_gpu(file_path, bs, lsz, accel, orig_hash, telemetry=None, bench_seco
                     and dec_total_res.returncode == 0
                     and file_matches_hash(tmp_dec, orig_hash)
                 )
-
-                apply_total_throughput_from_elapsed(stats, in_sz, comp_elapsed_s, dec_elapsed_s)
             finally:
                 safe_remove(tmp_comp)
                 safe_remove(tmp_dec)
@@ -1447,7 +1453,6 @@ def run_lz4_hybrid(file_path, bs, gpu_ratio, cpu_threads, local_size, accel, ori
 
                 comp_elapsed_s = float(comp_total_tel.get('elapsed_s', 0.0) or 0.0)
                 dec_elapsed_s = float(dec_total_tel.get('elapsed_s', 0.0) or 0.0)
-                apply_total_throughput_from_elapsed(stats, in_sz, comp_elapsed_s, dec_elapsed_s)
 
                 total_ok = (
                     comp_total_res.returncode == 0
