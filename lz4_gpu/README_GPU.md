@@ -71,6 +71,18 @@ FORCE_OPENCL_DEVICE=CPU ./lz4_gpu --bench 3 -b 64K file
 
 Accepted values: `GPU`, `CPU`, `DEFAULT`, `ALL`.
 
+### Host-memory copy mode
+
+```bash
+LZ4_STANDARD_COPY=0 ./lz4_gpu --bench 3 -b 64K file
+LZ4_STANDARD_COPY=1 ./lz4_gpu --bench 3 -b 64K file
+```
+
+- `0`: map/zero-copy 优先（统一内存设备常用）
+- `1`: standard host->device copy
+
+当前主线仅保留以上两类环境控制（设备选择与 host 内存拷贝模式）。
+
 ## Current implementation notes
 
 - Recent fixes corrected the 64KB `tableType==0` dict sizing/mask mismatch.

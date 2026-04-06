@@ -728,6 +728,45 @@ __kernel void lz4_compress_block(
     }
 }
 
+__kernel void lz4_compress_blocks_mapped(
+    __global const BYTE* input,
+    __global BYTE* output,
+    __global U32* blockSizes,
+    __global const U32* blockIndices,
+    int totalBlocks,
+    int inputSize,
+    int blockSize,
+    int singleBlockMaxOut,
+    int tableType,
+    int acceleration,
+    int globalIndexBase,
+    __global U32* globalHashTablePool,
+    U32 epoch_base
+) {
+    const uint wi = get_global_id(0);
+    const uint total_wi = get_global_size(0);
+    const uint dict_entries = (tableType == 0) ? (1U << (LZ4_HASHLOG + 1)) : (1U << LZ4_HASHLOG);
+
+    __global U32* dict = globalHashTablePool + (size_t)wi * dict_entries;
+    U32 epoch = epoch_base + 1U;
+
+    for (uint b = wi; b < (uint)totalBlocks; b += total_wi, ++epoch) {
+        int srcBlock = (int)blockIndices[b];
+        int start = srcBlock * blockSize;
+        int remain = inputSize - start;
+        int thisBlockSize = (remain > blockSize) ? blockSize : remain;
+        if (start < inputSize && thisBlockSize > 0) {
+            int dstCapacity = singleBlockMaxOut;
+            __global BYTE* dst = output + (size_t)b * (size_t)singleBlockMaxOut;
+            blockSizes[globalIndexBase + b] = lz4_compress_core_accelerated(
+                input + start, dst, thisBlockSize, dstCapacity, tableType, dict, acceleration, epoch
+            );
+        } else {
+            blockSizes[globalIndexBase + b] = 0;
+        }
+    }
+}
+
 __kernel void lz4_decompress_block(
     const __global BYTE* input,
     __global BYTE* output,
@@ -770,6 +809,31 @@ __kernel void lz4_decompress_blocks(
     }
 }
 
+__kernel void lz4_decompress_blocks_mapped(
+    const __global BYTE* input,
+    __global BYTE* output,
+    __global const U32* comp_offsets,
+    __global const U32* comp_sizes,
+    __global const U32* block_indices,
+    __global U32* sizes_out,
+    U32 block_size,
+    U32 totalMappedBlocks
+) {
+    int gid = get_global_id(0);
+    int gsz = get_global_size(0);
+
+    for (int idx = gid; idx < (int)totalMappedBlocks; idx += gsz) {
+        U32 src_idx = block_indices[idx];
+        lz4_decompress_generic(
+            input + comp_offsets[src_idx],
+            output + (size_t)idx * (size_t)block_size,
+            (int)comp_sizes[src_idx],
+            (int)block_size,
+            &sizes_out[idx]
+        );
+    }
+}
+
 __kernel void lz4_pack_blocks(
     const __global BYTE* sparse_output,
     __global BYTE* packed_output,
@@ -786,15 +850,56 @@ __kernel void lz4_pack_blocks(
 
     {
         U32 sz = block_sizes[blk];
-        U32 vec_end = sz & ~15U;
         __global BYTE* dst = packed_output + packed_offsets[blk];
         const __global BYTE* src = sparse_output + (size_t)blk * (size_t)singleBlockMaxOut;
 
-        for (U32 pos = lane * 16U; pos < vec_end; pos += lanes * 16U) {
+        if (sz == 0) return;
+
+        if (sz <= 32U) {
+            if (lane == 0) {
+                U32 pos = 0;
+                if (sz >= 16U) {
+                    uchar16 c16 = vload16(0, (const __global uchar*)src);
+                    vstore16(c16, 0, (__global uchar*)dst);
+                    pos = 16U;
+                }
+                if (sz - pos >= 8U) {
+                    uchar8 c8 = vload8(0, (const __global uchar*)(src + pos));
+                    vstore8(c8, 0, (__global uchar*)(dst + pos));
+                    pos += 8U;
+                }
+                for (; pos < sz; ++pos) dst[pos] = src[pos];
+            }
+            return;
+        }
+
+        if (sz <= 128U) {
+            U32 vec16_end = sz & ~15U;
+            for (U32 pos = lane * 16U; pos < vec16_end; pos += lanes * 16U) {
+                uchar16 c = vload16(0, (const __global uchar*)(src + pos));
+                vstore16(c, 0, (__global uchar*)(dst + pos));
+            }
+            for (U32 pos = vec16_end + lane; pos < sz; pos += lanes) {
+                dst[pos] = src[pos];
+            }
+            return;
+        }
+
+        U32 vec32_end = sz & ~31U;
+        for (U32 pos = lane * 32U; pos < vec32_end; pos += lanes * 32U) {
+            uchar16 c0 = vload16(0, (const __global uchar*)(src + pos));
+            uchar16 c1 = vload16(0, (const __global uchar*)(src + pos + 16U));
+            vstore16(c0, 0, (__global uchar*)(dst + pos));
+            vstore16(c1, 0, (__global uchar*)(dst + pos + 16U));
+        }
+
+        U32 vec16_end = sz & ~15U;
+        for (U32 pos = vec32_end + lane * 16U; pos < vec16_end; pos += lanes * 16U) {
             uchar16 c = vload16(0, (const __global uchar*)(src + pos));
             vstore16(c, 0, (__global uchar*)(dst + pos));
         }
-        for (U32 pos = vec_end + lane; pos < sz; pos += lanes) {
+
+        for (U32 pos = vec16_end + lane; pos < sz; pos += lanes) {
             dst[pos] = src[pos];
         }
     }

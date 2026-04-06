@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <time.h>
 #include <CL/cl.h>
 #include "lz4_gpu_protocol.h"
 #include "lz4_gpu_core.h"
@@ -135,7 +136,10 @@ int init_resources(void) {
 
     for (int i = 0; i < MAX_WORKERS; i++) {
         g_state.workers[i].id = i;
-        g_state.workers[i].queue = clCreateCommandQueue(g_state.context, g_state.device, 0, &err);
+        {
+            cl_queue_properties props[] = { CL_QUEUE_PROPERTIES, 0, 0 };
+            g_state.workers[i].queue = clCreateCommandQueueWithProperties(g_state.context, g_state.device, props, &err);
+        }
         lz4_gpu_workspace_init(&g_state.workers[i].ws);
         pthread_mutex_init(&g_state.workers[i].lock, NULL);
         pthread_cond_init(&g_state.workers[i].cond, NULL);
@@ -233,20 +237,26 @@ int run_daemon() {
     while (g_state.running) {
         int client = accept(g_state.server_sock, NULL, NULL);
         if (client < 0) { if (errno == EINTR) continue; break; }
-        int found = 0;
-        for (int i = 0; i < MAX_WORKERS; i++) {
-            if (pthread_mutex_trylock(&g_state.workers[i].lock) == 0) {
-                if (!g_state.workers[i].has_work) {
-                    g_state.workers[i].client_fd = client;
-                    g_state.workers[i].has_work = 1;
-                    pthread_cond_signal(&g_state.workers[i].cond);
-                    found = 1;
+        int assigned = 0;
+        while (g_state.running && !assigned) {
+            for (int i = 0; i < MAX_WORKERS; i++) {
+                if (pthread_mutex_trylock(&g_state.workers[i].lock) == 0) {
+                    if (!g_state.workers[i].has_work) {
+                        g_state.workers[i].client_fd = client;
+                        g_state.workers[i].has_work = 1;
+                        pthread_cond_signal(&g_state.workers[i].cond);
+                        assigned = 1;
+                    }
+                    pthread_mutex_unlock(&g_state.workers[i].lock);
+                    if (assigned) break;
                 }
-                pthread_mutex_unlock(&g_state.workers[i].lock);
-                if (found) break;
+            }
+            if (!assigned) {
+                struct timespec ts = {0, 1000000};
+                nanosleep(&ts, NULL);
             }
         }
-        if (!found) close(client);
+        if (!assigned) close(client);
     }
     remove_pidfile();
     return 0;

@@ -99,27 +99,142 @@ static unsigned lz4_env_unsigned_value(const char* name, unsigned defv) {
     return (unsigned)parsed;
 }
 
-static int lz4_should_use_device_compaction(size_t packed_bytes, size_t sparse_bytes, size_t num_blocks, cl_kernel pack_kernel) {
+typedef struct {
+    double mean_bytes;
+    double mad_ratio;
+    double fill_ratio;
+    double active_ratio;
+} lz4_compaction_stats_t;
+
+static lz4_compaction_stats_t lz4_collect_compaction_stats(const uint32_t* block_sizes,
+                                                           size_t num_blocks,
+                                                           size_t packed_bytes,
+                                                           size_t sparse_bytes) {
+    lz4_compaction_stats_t s;
+    unsigned long long sum_abs = 0;
+    unsigned long long mean_int = 0;
+    size_t active_blocks = 0;
+
+    s.mean_bytes = 0.0;
+    s.mad_ratio = 0.0;
+    s.fill_ratio = 0.0;
+    s.active_ratio = 0.0;
+
+    if (!block_sizes || num_blocks == 0 || sparse_bytes == 0) {
+        return s;
+    }
+
+    mean_int = (unsigned long long)(packed_bytes / num_blocks);
+    s.mean_bytes = (double)packed_bytes / (double)num_blocks;
+    s.fill_ratio = (double)packed_bytes / (double)sparse_bytes;
+
+    for (size_t i = 0; i < num_blocks; ++i) {
+        unsigned long long v = (unsigned long long)block_sizes[i];
+        if (v > 0) active_blocks++;
+        if (v >= mean_int) {
+            sum_abs += (v - mean_int);
+        } else {
+            sum_abs += (mean_int - v);
+        }
+    }
+
+    s.active_ratio = (double)active_blocks / (double)num_blocks;
+    if (mean_int > 0) {
+        s.mad_ratio = ((double)sum_abs / (double)num_blocks) / (double)mean_int;
+    }
+
+    return s;
+}
+
+static unsigned lz4_compaction_adaptive_gain_pct(unsigned base_gain_pct,
+                                                 int use_standard_copy,
+                                                 const lz4_compaction_stats_t* stats) {
+    int gain = (int)base_gain_pct;
+
+    if (use_standard_copy) {
+        gain -= 2;
+    } else {
+        gain += 1;
+    }
+
+    if (stats) {
+        if (stats->fill_ratio <= 0.60) gain -= 3;
+        else if (stats->fill_ratio <= 0.72) gain -= 2;
+        else if (stats->fill_ratio >= 0.90) gain += 2;
+
+        if (stats->active_ratio <= 0.65) gain -= 2;
+        else if (stats->active_ratio <= 0.85) gain -= 1;
+
+        if (stats->mad_ratio >= 0.65) gain -= 1;
+        else if (stats->mad_ratio <= 0.18) gain += 1;
+    }
+
+    if (gain < 2) gain = 2;
+    if (gain > 35) gain = 35;
+    return (unsigned)gain;
+}
+
+static int lz4_compaction_trace_enabled(void) {
+    int is_set = 0;
+    int v = lz4_env_flag_value("LZ4_GPU_TRACE_COMPACTION", &is_set);
+    return is_set ? v : 0;
+}
+
+static int lz4_should_use_device_compaction(size_t packed_bytes,
+                                            size_t sparse_bytes,
+                                            size_t num_blocks,
+                                            cl_kernel pack_kernel,
+                                            int use_standard_copy,
+                                            const lz4_compaction_stats_t* stats,
+                                            unsigned* out_gain_pct) {
     int force_set = 0;
     int force_value = lz4_env_flag_value("LZ4_GPU_FORCE_COMPACTION", &force_set);
     int enable_set = 0;
     int enable_value = lz4_env_flag_value("LZ4_GPU_ENABLE_COMPACTION", &enable_set);
     int enable_compaction = enable_set ? enable_value : 1;
+    unsigned adaptive_gain_pct = 0;
+    size_t saved_bytes;
+
     if (!pack_kernel) return 0;
-    if (force_set) return force_value;
+    if (force_set) {
+        if (out_gain_pct) *out_gain_pct = 0;
+        return force_value;
+    }
     if (!enable_compaction) return 0;
     if (packed_bytes == 0 || sparse_bytes == 0 || packed_bytes >= sparse_bytes) return 0;
+
     {
         unsigned min_blocks = lz4_env_unsigned_value("LZ4_GPU_COMPACTION_MIN_BLOCKS", 8U);
         unsigned min_gain_pct = lz4_env_unsigned_value("LZ4_GPU_COMPACTION_MIN_GAIN_PCT", 8U);
         unsigned min_sparse_kb = lz4_env_unsigned_value("LZ4_GPU_COMPACTION_MIN_SPARSE_KB", 1024U);
         unsigned min_saved_kb = lz4_env_unsigned_value("LZ4_GPU_COMPACTION_MIN_SAVED_KB", 512U);
-        size_t saved_bytes;
+
         if (num_blocks < (size_t)min_blocks) return 0;
         if (sparse_bytes < (size_t)min_sparse_kb * 1024ULL) return 0;
+
         saved_bytes = sparse_bytes - packed_bytes;
         if (saved_bytes < (size_t)min_saved_kb * 1024ULL) return 0;
-        return saved_bytes * 100U >= sparse_bytes * (size_t)min_gain_pct;
+
+        adaptive_gain_pct = lz4_compaction_adaptive_gain_pct(min_gain_pct, use_standard_copy, stats);
+        if (out_gain_pct) *out_gain_pct = adaptive_gain_pct;
+
+        if (saved_bytes * 100U < sparse_bytes * (size_t)adaptive_gain_pct) {
+            return 0;
+        }
+
+        /*
+         * 统一且致密的块分布下，pack 内核额外调度可能覆盖掉微小节省收益；
+         * 对这种模式增加一个收益下限，避免在“几乎无洞”的布局上误触发 compaction。
+         */
+        if (stats &&
+            stats->fill_ratio >= 0.93 &&
+            stats->active_ratio >= 0.95 &&
+            stats->mad_ratio <= 0.10 &&
+            saved_bytes < num_blocks * 96ULL) {
+            return 0;
+        }
+
+        return 1;
     }
 }
 
@@ -267,8 +382,8 @@ static size_t choose_comp_worker_count(cl_command_queue queue, size_t num_blocks
     }
     if (cu == 0) cu = 1;
 
-    /* Raise default compression occupancy on iGPU-heavy paths; still overridable by env. */
-    size_t default_wi_per_cu = (num_blocks >= 4096) ? 48 : 64;
+    /* Compression default tuned by fixed-baseline 50x5: wi_per_cu=24 gives better comp/dec balance on current target. */
+    size_t default_wi_per_cu = 24;
     size_t wi_per_cu = parse_wi_per_cu_env("LZ4_GPU_COMP_WI_PER_CU", "LZ4_GPU_WI_PER_CU", default_wi_per_cu);
 
     size_t target = (size_t)cu * wi_per_cu;
@@ -299,9 +414,7 @@ static size_t choose_decomp_worker_count(cl_command_queue queue, size_t num_bloc
 }
 
 static int lz4_debug_counters_enabled(void) {
-    const char* env = getenv("LZ4_GPU_DEBUG_COUNTERS");
-    if (!env || !*env) return 0;
-    return strcmp(env, "0") != 0;
+    return 0;
 }
 
 static void lz4_print_comp_debug_stats(const uint32_t* stats, int num_blocks) {
@@ -373,15 +486,9 @@ static int lz4_write_blocks_packed(FILE* fout,
                                    const uint32_t* sizes,
                                    size_t count) {
     size_t pack_kb = 1024;
-    const char* env_pack_kb = getenv("LZ4_GPU_PACK_WRITE_KB");
     uint8_t* pack = NULL;
     int temp_pack = 0;
     size_t fill = 0;
-
-    if (env_pack_kb && *env_pack_kb) {
-        long v = strtol(env_pack_kb, NULL, 10);
-        if (v > 64 && v <= 16384) pack_kb = (size_t)v;
-    }
 
     size_t pack_cap = pack_kb * 1024;
 
@@ -558,6 +665,61 @@ static int lz4_write_contiguous_from_mapped_buffer(cl_command_queue queue,
 
     err = clEnqueueUnmapMemObject(queue, src_buf, mapped, 0, NULL, NULL);
     if (err != CL_SUCCESS) return -1;
+    return 0;
+}
+
+static int lz4_write_compacted_payload_auto(cl_command_queue queue,
+                                            cl_mem src_buf,
+                                            size_t total_bytes,
+                                            FILE* fout,
+                                            int use_standard_copy,
+                                            const lz4_compaction_stats_t* stats,
+                                            unsigned long* download_us) {
+    uint64_t t0;
+    size_t read_chunk_kb;
+
+    if (!queue || !src_buf || !fout) return -1;
+    if (total_bytes == 0) {
+        if (download_us) *download_us = 0;
+        return 0;
+    }
+
+    if (!use_standard_copy) {
+        size_t mapped_max_mb = (size_t)lz4_env_unsigned_value("LZ4_GPU_PACK_MAPPED_MAX_MB", 256U);
+        size_t mapped_soft_limit = mapped_max_mb * 1024ULL * 1024ULL;
+        int prefer_mapped = (total_bytes <= mapped_soft_limit);
+
+        if (stats) {
+            if (stats->fill_ratio <= 0.80 || stats->mad_ratio >= 0.35) {
+                prefer_mapped = 1;
+            }
+        }
+
+        if (prefer_mapped) {
+            if (lz4_write_contiguous_from_mapped_buffer(queue,
+                                                        src_buf,
+                                                        total_bytes,
+                                                        fout,
+                                                        download_us) == 0) {
+                return 0;
+            }
+        }
+    }
+
+    read_chunk_kb = (size_t)lz4_env_unsigned_value("LZ4_GPU_PACK_READBACK_KB", 8192U);
+    if (stats && stats->fill_ratio <= 0.55 && read_chunk_kb > 4096U) {
+        read_chunk_kb = 4096U;
+    }
+
+    t0 = get_us();
+    if (lz4_readback_to_file_chunked(queue,
+                                     src_buf,
+                                     total_bytes,
+                                     fout,
+                                     read_chunk_kb * 1024ULL) != 0) {
+        return -1;
+    }
+    if (download_us) *download_us = (unsigned long)(get_us() - t0);
     return 0;
 }
 
@@ -768,6 +930,16 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
     for (int i=0; i<num_blocks; i++) total_compressed_size += h_osizes[i];
     t->out_size = total_compressed_size;
 
+    size_t total_out_read = (size_t)num_blocks * single_block_max_out;
+    lz4_compaction_stats_t compaction_stats = lz4_collect_compaction_stats(
+        h_osizes,
+        (size_t)num_blocks,
+        total_compressed_size,
+        total_out_read
+    );
+    unsigned compaction_gain_pct = 0;
+    int compaction_trace = lz4_compaction_trace_enabled();
+
     t->download_total_us = (unsigned long)(get_us() - t1);
 
     if (dbg_comp_enabled && dbg_comp_buf) {
@@ -792,8 +964,32 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
         fwrite(&bsize_u32, 1, 4, fout);
         fwrite(h_osizes, 1, num_blocks * 4, fout);
 
-        size_t total_out_read = (size_t)num_blocks * single_block_max_out;
-        int use_compaction = lz4_should_use_device_compaction(total_compressed_size, total_out_read, (size_t)num_blocks, pack_kernel);
+        int use_compaction = lz4_should_use_device_compaction(total_compressed_size,
+                                                              total_out_read,
+                                                              (size_t)num_blocks,
+                                                              pack_kernel,
+                                                              use_standard_copy,
+                                                              &compaction_stats,
+                                                              &compaction_gain_pct);
+
+        if (compaction_trace) {
+            size_t saved_bytes = (total_out_read > total_compressed_size) ? (total_out_read - total_compressed_size) : 0;
+            double saved_pct = (total_out_read > 0) ? ((double)saved_bytes * 100.0 / (double)total_out_read) : 0.0;
+            fprintf(stderr,
+                    "[LZ4][compaction] blocks=%d packed=%zu sparse=%zu saved=%zu saved_pct=%.2f gain_gate=%u fill=%.3f active=%.3f mad=%.3f stdcopy=%d decision=%d\n",
+                    num_blocks,
+                    total_compressed_size,
+                    total_out_read,
+                    saved_bytes,
+                    saved_pct,
+                    compaction_gain_pct,
+                    compaction_stats.fill_ratio,
+                    compaction_stats.active_ratio,
+                    compaction_stats.mad_ratio,
+                    use_standard_copy,
+                    use_compaction);
+        }
+
         if (use_compaction) {
             uint32_t* h_packed_offsets = (uint32_t*)malloc((size_t)num_blocks * sizeof(uint32_t));
             if (!h_packed_offsets) {
@@ -864,22 +1060,19 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
             }
 
             if (total_compressed_size > 0) {
-                {
-                    uint64_t t_down0 = get_us();
-                    size_t read_chunk_kb = (size_t)lz4_env_unsigned_value("LZ4_GPU_PACK_READBACK_KB", 8192U);
-                    if (lz4_readback_to_file_chunked(queue,
+                if (lz4_write_compacted_payload_auto(queue,
                                                      ws->packed_out_buf,
                                                      total_compressed_size,
                                                      fout,
-                                                     read_chunk_kb * 1024ULL) != 0) {
-                        fprintf(stderr, "[LZ4] chunked readback/write for compacted payload failed\n");
-                        free(h_packed_offsets);
-                        fclose(fout);
-                        if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
-                        free(h_block_info); free(h_osizes); free(h_out_offsets);
-                        return -1;
-                    }
-                    t->download_total_us = (unsigned long)(get_us() - t_down0);
+                                                     use_standard_copy,
+                                                     &compaction_stats,
+                                                     &t->download_total_us) != 0) {
+                    fprintf(stderr, "[LZ4] compacted payload writeback failed\n");
+                    free(h_packed_offsets);
+                    fclose(fout);
+                    if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
+                    free(h_block_info); free(h_osizes); free(h_out_offsets);
+                    return -1;
                 }
             }
             free(h_packed_offsets);
@@ -1301,18 +1494,8 @@ static int lz4_get_executable_path(char* out, size_t outlen) {
 static int lz4_find_file_path(const char* name, char* out, size_t outlen) {
     char path[PATH_MAX];
     char base[PATH_MAX];
-    const char* env = getenv("LZ4_GPU_DIR");
 
     if (!name || !out || outlen == 0) return -1;
-
-    if (env && env[0]) {
-        snprintf(path, sizeof(path), "%s/%s", env, name);
-        if (access(path, R_OK) == 0) {
-            strncpy(out, path, outlen - 1);
-            out[outlen - 1] = '\0';
-            return 0;
-        }
-    }
 
     {
         char exe_path[PATH_MAX] = {0};
@@ -1365,7 +1548,7 @@ cl_program lz4_load_program(cl_context context, cl_device_id device) {
     const int hash_log = 14;
     int dbg_enabled = lz4_debug_counters_enabled();
 
-    if (!dbg_enabled && !(getenv("LZ4_GPU_NO_CLBIN") && strcmp(getenv("LZ4_GPU_NO_CLBIN"), "1") == 0)) {
+    if (!dbg_enabled) {
         char bin_name[128];
         char resolved_path[PATH_MAX];
         snprintf(bin_name, sizeof(bin_name), "lz4_gpu_%d.clbin", hash_log);

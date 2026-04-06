@@ -19,11 +19,16 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <errno.h>
+#include <limits.h>
 #include <time.h>
 #include "lz4_gpu_core.h"
 #include "lz4_gpu_protocol.h"
 #include "lz4_gpu_utils.h"
 #include "timing.h"
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 /* Forward declarations */
 #if defined(_WIN32)
@@ -173,7 +178,7 @@ static void ocl_init() {
 static void show_help(const char* prog_name) {
     fprintf(stderr, "Unified LZ4 GPU Tool\n");
     fprintf(stderr, "Usage Modes:\n");
-    fprintf(stderr, "  1. Standalone:   %s [options] <input_file>\n", prog_name);
+    fprintf(stderr, "  1. Standalone:   %s [options] <input_file|->\n", prog_name);
     fprintf(stderr, "  2. Run Daemon:   %s --daemon [options]\n", prog_name);
     fprintf(stderr, "  3. Use Daemon:   %s --use-daemon [options] <input_file>\n", prog_name);
     fprintf(stderr, "  4. Stop Daemon:  %s --stop-daemon\n", prog_name);
@@ -181,12 +186,16 @@ static void show_help(const char* prog_name) {
     fprintf(stderr, "\nBasic Options:\n");
     fprintf(stderr, "  -c                   Compress mode (default)\n");
     fprintf(stderr, "  -d, --decompress     Decompress mode\n");
-    fprintf(stderr, "  -o, --output FILE    Output file\n");
+    fprintf(stderr, "  -o, --output FILE    Output file (use '-' for stdout)\n");
     fprintf(stderr, "  -B, --block-size N   Block size in bytes (default: 64KB)\n");
     fprintf(stderr, "  -a, --acceleration N Acceleration factor (default: 1)\n");
     fprintf(stderr, "  --local N            Local work-group size (default: 1)\n");
     fprintf(stderr, "  -v, --verbose        Enable performance statistics\n");
     fprintf(stderr, "  --bench [N]          Stable benchmark (compress+decompress+verify), optional N seconds (default: 3)\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Streaming:\n");
+    fprintf(stderr, "  input '-'            Read input from stdin (standalone mode only)\n");
+    fprintf(stderr, "  output '-'           Write output to stdout (standalone mode only)\n");
 }
 
 static int stop_daemon_cmd() {
@@ -220,6 +229,90 @@ static size_t parse_size_bytes(const char* s) {
     if (*endptr == 'k' || *endptr == 'K') val *= 1024;
     else if (*endptr == 'm' || *endptr == 'M') val *= 1024 * 1024;
     return val;
+}
+
+static int path_is_dash(const char* path) {
+    return path && strcmp(path, "-") == 0;
+}
+
+static int create_temp_path(char* path_buf, size_t path_buf_size, const char* templ) {
+    if (!path_buf || path_buf_size == 0 || !templ) return -1;
+#if defined(_WIN32)
+    (void)path_buf_size;
+    (void)templ;
+    return -1;
+#else
+    {
+        int fd;
+        size_t n = strlen(templ);
+        if (n + 1 > path_buf_size) return -1;
+        memcpy(path_buf, templ, n + 1);
+        fd = mkstemp(path_buf);
+        if (fd < 0) return -1;
+        close(fd);
+        unlink(path_buf);
+        return 0;
+    }
+#endif
+}
+
+static int copy_stream_to_path(FILE* in, const char* path) {
+    FILE* out;
+    unsigned char buf[1 << 20];
+    size_t nread;
+
+    if (!in || !path) return -1;
+    out = fopen(path, "wb");
+    if (!out) return -1;
+
+    while ((nread = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, nread, out) != nread) {
+            fclose(out);
+            return -1;
+        }
+    }
+    if (ferror(in)) {
+        fclose(out);
+        return -1;
+    }
+
+    if (fclose(out) != 0) return -1;
+    return 0;
+}
+
+static int copy_path_to_stream(const char* path, FILE* out) {
+    FILE* in;
+    unsigned char buf[1 << 20];
+    size_t nread;
+
+    if (!path || !out) return -1;
+    in = fopen(path, "rb");
+    if (!in) return -1;
+
+    while ((nread = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, nread, out) != nread) {
+            fclose(in);
+            return -1;
+        }
+    }
+    if (ferror(in)) {
+        fclose(in);
+        return -1;
+    }
+
+    if (fclose(in) != 0) return -1;
+    if (fflush(out) != 0) return -1;
+    return 0;
+}
+
+static unsigned parse_unsigned_env_with_default(const char* name, unsigned defv) {
+    const char* env = getenv(name);
+    char* end = NULL;
+    unsigned long parsed;
+    if (!env || !*env) return defv;
+    parsed = strtoul(env, &end, 10);
+    if (end == env || *end != '\0') return defv;
+    return (unsigned)parsed;
 }
 
 static int cmp_double_asc(const void* a, const void* b) {
@@ -343,6 +436,13 @@ static int run_lz4_bench(const char* input_path,
     cl_uint* h_comp_off = NULL;
     cl_uint* h_sizes_out = NULL;
     size_t h_blocks_capacity = 0;
+    cl_uint* h_prev_sizes = NULL;
+    cl_uint* h_prev_comp_off = NULL;
+    size_t h_prev_blocks_capacity = 0;
+    size_t prev_meta_nblk = 0;
+    size_t prev_meta_blk = 0;
+    size_t prev_meta_in_size = 0;
+    int prev_meta_valid = 0;
 
     cl_uint kernel_num_args_dec = 0;
     int kernel_has_dbg_dec = 0;
@@ -374,8 +474,15 @@ static int run_lz4_bench(const char* input_path,
         fprintf(stderr, "bench error: failed to allocate reusable decomp buffers\n");
     }
 
+    unsigned warmup_rounds = parse_unsigned_env_with_default("LZ4_GPU_BENCH_WARMUP_ROUNDS", 1U);
+    unsigned warmup_done = 0;
+    int timer_started = 0;
+
     struct timespec ts0, ts1;
-    clock_gettime(CLOCK_MONOTONIC, &ts0);
+    if (warmup_rounds == 0) {
+        clock_gettime(CLOCK_MONOTONIC, &ts0);
+        timer_started = 1;
+    }
 
     while (verify_ok) {
         timing_t tc;
@@ -420,7 +527,23 @@ static int run_lz4_bench(const char* input_path,
             }
             h_sizes_out = nh_sizes_out;
 
+            cl_uint* nh_prev_sizes = (cl_uint*)realloc(h_prev_sizes, nblk * sizeof(cl_uint));
+            if (!nh_prev_sizes) {
+                verify_ok = 0;
+                break;
+            }
+            h_prev_sizes = nh_prev_sizes;
+
+            cl_uint* nh_prev_comp_off = (cl_uint*)realloc(h_prev_comp_off, nblk * sizeof(cl_uint));
+            if (!nh_prev_comp_off) {
+                verify_ok = 0;
+                break;
+            }
+            h_prev_comp_off = nh_prev_comp_off;
+
             h_blocks_capacity = nblk;
+            h_prev_blocks_capacity = nblk;
+            prev_meta_valid = 0;
         }
         void* map_sizes = clEnqueueMapBuffer(queue, ws.output_size_buf, CL_TRUE, CL_MAP_READ,
                                              0, nblk * sizeof(cl_uint), 0, NULL, NULL, &err);
@@ -450,6 +573,8 @@ static int run_lz4_bench(const char* input_path,
             break;
         }
 
+        size_t prev_comp_off_cap = ws.current_decomp_comp_off_capacity;
+        size_t prev_comp_size_cap = ws.current_decomp_comp_size_capacity;
         ws.decomp_comp_off_buf = ensure_buffer(ctx, ws.decomp_comp_off_buf, nblk * sizeof(cl_uint),
                                                &ws.current_decomp_comp_off_capacity, &err);
         ws.decomp_comp_size_buf = ensure_buffer(ctx, ws.decomp_comp_size_buf, nblk * sizeof(cl_uint),
@@ -465,6 +590,34 @@ static int run_lz4_bench(const char* input_path,
         if (!d_comp_off || !d_comp_sz || !d_sizes_out || err != CL_SUCCESS) {
             verify_ok = 0;
             break;
+        }
+
+        int meta_buffers_recreated =
+            (ws.current_decomp_comp_off_capacity != prev_comp_off_cap) ||
+            (ws.current_decomp_comp_size_capacity != prev_comp_size_cap);
+
+        size_t meta_bytes = nblk * sizeof(cl_uint);
+        int dec_meta_changed = 1;
+        if (!meta_buffers_recreated &&
+            prev_meta_valid &&
+            h_prev_sizes &&
+            h_prev_comp_off &&
+            h_prev_blocks_capacity >= nblk &&
+            prev_meta_nblk == nblk &&
+            prev_meta_blk == blk &&
+            prev_meta_in_size == (size_t)tc.in_size &&
+            memcmp(h_prev_sizes, h_sizes, meta_bytes) == 0 &&
+            memcmp(h_prev_comp_off, h_comp_off, meta_bytes) == 0) {
+            dec_meta_changed = 0;
+        }
+
+        if (dec_meta_changed) {
+            memcpy(h_prev_sizes, h_sizes, meta_bytes);
+            memcpy(h_prev_comp_off, h_comp_off, meta_bytes);
+            prev_meta_nblk = nblk;
+            prev_meta_blk = blk;
+            prev_meta_in_size = (size_t)tc.in_size;
+            prev_meta_valid = 1;
         }
 
         if (kernel_has_dbg_dec) {
@@ -483,13 +636,17 @@ static int run_lz4_bench(const char* input_path,
         }
 
         cl_event write_ev[2] = { NULL, NULL };
-        cl_int ew0 = clEnqueueWriteBuffer(queue, d_comp_off, CL_FALSE, 0, nblk * sizeof(cl_uint), h_comp_off, 0, NULL, &write_ev[0]);
-        cl_int ew1 = clEnqueueWriteBuffer(queue, d_comp_sz, CL_FALSE, 0, nblk * sizeof(cl_uint), h_sizes, 0, NULL, &write_ev[1]);
-        if (ew0 != CL_SUCCESS || ew1 != CL_SUCCESS) {
-            for (int wi = 0; wi < 2; ++wi) if (write_ev[wi]) clReleaseEvent(write_ev[wi]);
-            if (d_dbg_dec) clReleaseMemObject(d_dbg_dec);
-            verify_ok = 0;
-            break;
+        cl_uint write_event_count = 0;
+        if (dec_meta_changed) {
+            cl_int ew0 = clEnqueueWriteBuffer(queue, d_comp_off, CL_FALSE, 0, meta_bytes, h_comp_off, 0, NULL, &write_ev[0]);
+            cl_int ew1 = clEnqueueWriteBuffer(queue, d_comp_sz, CL_FALSE, 0, meta_bytes, h_sizes, 0, NULL, &write_ev[1]);
+            if (ew0 != CL_SUCCESS || ew1 != CL_SUCCESS) {
+                for (int wi = 0; wi < 2; ++wi) if (write_ev[wi]) clReleaseEvent(write_ev[wi]);
+                if (d_dbg_dec) clReleaseMemObject(d_dbg_dec);
+                verify_ok = 0;
+                break;
+            }
+            write_event_count = 2;
         }
 
         cl_uint totalBlocks = (cl_uint)nblk;
@@ -519,7 +676,10 @@ static int run_lz4_bench(const char* input_path,
         if (gsz == 0) gsz = 1;
 
         cl_event dec_kernel_evt = NULL;
-        err = clEnqueueNDRangeKernel(queue, kdec, 1, NULL, &gsz, &lsz, 2, write_ev, &dec_kernel_evt);
+        err = clEnqueueNDRangeKernel(queue, kdec, 1, NULL, &gsz, &lsz,
+                         write_event_count,
+                         (write_event_count > 0) ? write_ev : NULL,
+                         &dec_kernel_evt);
         double dec_upload_us = 0.0;
         for (int wi = 0; wi < 2; ++wi) {
             if (write_ev[wi]) {
@@ -576,6 +736,15 @@ static int run_lz4_bench(const char* input_path,
         if (!verify_ok) break;
         double dec_total_us = dec_upload_us + dec_kernel_us + dec_read_us;
 
+        if (warmup_done < warmup_rounds) {
+            warmup_done++;
+            if (warmup_done == warmup_rounds) {
+                clock_gettime(CLOCK_MONOTONIC, &ts0);
+                timer_started = 1;
+            }
+            continue;
+        }
+
         if (n == cap) {
             size_t new_cap = cap * 2;
             double* nc = (double*)realloc(comp_tp, new_cap * sizeof(double));
@@ -626,11 +795,11 @@ static int run_lz4_bench(const char* input_path,
         n++;
 
         clock_gettime(CLOCK_MONOTONIC, &ts1);
-        if (elapsed_sec(&ts0, &ts1) >= bench_seconds && n > 0) break;
+        if (timer_started && elapsed_sec(&ts0, &ts1) >= bench_seconds && n > 0) break;
     }
 
     clock_gettime(CLOCK_MONOTONIC, &ts1);
-    double sec = elapsed_sec(&ts0, &ts1);
+    double sec = timer_started ? elapsed_sec(&ts0, &ts1) : 0.0;
 
     if (n > 0) {
         printf("Bench Compress : kernel_tp=%.2f MB/s total_tp=%.2f MB/s ratio=%.2f%%\n",
@@ -651,6 +820,8 @@ static int run_lz4_bench(const char* input_path,
     free(h_sizes);
     free(h_comp_off);
     free(h_sizes_out);
+    free(h_prev_sizes);
+    free(h_prev_comp_off);
     if (d_out) clReleaseMemObject(d_out);
     free(input_ref);
     lz4_gpu_workspace_free(&ws);
@@ -668,13 +839,31 @@ int run_lz4_standalone(int argc, char** argv) {
     int bench_mode = 0;
     double bench_seconds = 3.0;
     const char* input_path = NULL;
+    const char* effective_input_path = NULL;
+    const char* effective_output_path = NULL;
     char output_path[512] = {0};
+    char temp_input_path[PATH_MAX] = {0};
+    char temp_output_path[PATH_MAX] = {0};
     int output_explicit = 0;
+    int input_from_stdin;
+    int output_to_stdout;
+    int have_temp_input = 0;
+    int have_temp_output = 0;
+    int ret = -1;
+    cl_program prog = NULL;
+    cl_kernel kernel = NULL;
+    cl_kernel pack_kernel = NULL;
+    cl_int err = CL_SUCCESS;
+    lz4_gpu_workspace_t ws;
+    int ws_inited = 0;
+    timing_t t_out;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             show_help(argv[0]);
             return 0;
+        } else if (strcmp(argv[i], "-c") == 0) {
+            mode = mode_compress;
         } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--decompress") == 0) {
             mode = mode_decompress;
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
@@ -701,7 +890,7 @@ int run_lz4_standalone(int argc, char** argv) {
         } else if (strcmp(argv[i], "--local") == 0) {
             if (i + 1 < argc) g_cli_local_size = atoi(argv[++i]);
             else { fprintf(stderr, "Error: --local requires an argument\n"); return 1; }
-        } else if (argv[i][0] == '-') {
+        } else if (argv[i][0] == '-' && strcmp(argv[i], "-") != 0) {
             fprintf(stderr, "Error: Unknown option %s\n", argv[i]);
             show_help(argv[0]); return 1;
         } else {
@@ -726,6 +915,10 @@ int run_lz4_standalone(int argc, char** argv) {
             fprintf(stderr, "Error: --bench only supports compress mode input (it runs compress+decompress internally)\n");
             return 1;
         }
+        if (path_is_dash(input_path)) {
+            fprintf(stderr, "Error: --bench does not support stdin input ('-')\n");
+            return 1;
+        }
         return run_lz4_bench(input_path,
                             (int)g_cli_fixed_block_bytes,
                             g_cli_acceleration,
@@ -734,8 +927,43 @@ int run_lz4_standalone(int argc, char** argv) {
     }
 
     if (!output_explicit) {
-        if (mode == mode_compress) snprintf(output_path, sizeof(output_path), "%s.lz4", input_path);
-        else snprintf(output_path, sizeof(output_path), "%s.dec", input_path);
+        if (path_is_dash(input_path)) {
+            strncpy(output_path, "-", sizeof(output_path) - 1);
+            output_explicit = 1;
+        } else if (mode == mode_compress) {
+            snprintf(output_path, sizeof(output_path), "%s.lz4", input_path);
+        } else {
+            snprintf(output_path, sizeof(output_path), "%s.dec", input_path);
+        }
+    }
+
+    input_from_stdin = path_is_dash(input_path);
+    output_to_stdout = path_is_dash(output_path);
+    effective_input_path = input_path;
+    effective_output_path = output_path;
+
+    if (input_from_stdin) {
+        if (create_temp_path(temp_input_path, sizeof(temp_input_path), "/tmp/lz4_gpu_stdin_XXXXXX") != 0) {
+            fprintf(stderr, "Error: failed to create temporary input path for stdin stream\n");
+            return 1;
+        }
+        if (copy_stream_to_path(stdin, temp_input_path) != 0) {
+            fprintf(stderr, "Error: failed to capture stdin into temporary input file\n");
+            unlink(temp_input_path);
+            return 1;
+        }
+        effective_input_path = temp_input_path;
+        have_temp_input = 1;
+    }
+
+    if (output_to_stdout) {
+        if (create_temp_path(temp_output_path, sizeof(temp_output_path), "/tmp/lz4_gpu_stdout_XXXXXX") != 0) {
+            fprintf(stderr, "Error: failed to create temporary output path for stdout stream\n");
+            if (have_temp_input) unlink(temp_input_path);
+            return 1;
+        }
+        effective_output_path = temp_output_path;
+        have_temp_output = 1;
     }
 
     uint64_t t_total_start = get_us();
@@ -745,21 +973,23 @@ int run_lz4_standalone(int argc, char** argv) {
     ocl_init();
     if (!ctx || !queue) {
         fprintf(stderr, "Failed to initialize OpenCL runtime\n");
-        return 1;
+        ret = 1;
+        goto cleanup;
     }
     t2 = get_us();
     g_ocl_init_us = t2 - t1;
 
     t1 = get_us();
-    cl_program prog = lz4_load_program(ctx, dev);
+    prog = lz4_load_program(ctx, dev);
     t2 = get_us();
     g_kernel_load_us = t2 - t1;
 
-    if (!prog) { fprintf(stderr, "Failed to load OCL program\n"); return 1; }
+    if (!prog) {
+        fprintf(stderr, "Failed to load OCL program\n");
+        ret = 1;
+        goto cleanup;
+    }
 
-    cl_kernel kernel;
-    cl_kernel pack_kernel = NULL;
-    cl_int err;
     if (mode == mode_compress) {
         kernel = clCreateKernel(prog, "lz4_compress_block", &err);
         if (err == CL_SUCCESS && kernel) {
@@ -771,24 +1001,37 @@ int run_lz4_standalone(int argc, char** argv) {
 
     if (err != CL_SUCCESS || !kernel) {
         fprintf(stderr, "Failed to create kernel: %d\n", err);
-        return 1;
+        ret = 1;
+        goto cleanup;
     }
 
-    lz4_gpu_workspace_t ws;
     lz4_gpu_workspace_init(&ws);
-    timing_t t_out;
+    ws_inited = 1;
     memset(&t_out, 0, sizeof(t_out));
 
-    int ret = -1;
     if (mode == mode_compress) {
-        ret = lz4_compress_core(ctx, queue, kernel, pack_kernel, input_path, output_path, (int)g_cli_fixed_block_bytes, g_cli_acceleration, &ws, &t_out, (int)g_cli_local_size, 0);
+        ret = lz4_compress_core(ctx, queue, kernel, pack_kernel,
+                                effective_input_path,
+                                effective_output_path,
+                                (int)g_cli_fixed_block_bytes,
+                                g_cli_acceleration,
+                                &ws,
+                                &t_out,
+                                (int)g_cli_local_size,
+                                0);
     } else {
-        ret = lz4_decompress_core(ctx, queue, kernel, input_path, output_path, &ws, &t_out, (int)g_cli_local_size);
+        ret = lz4_decompress_core(ctx, queue, kernel,
+                                  effective_input_path,
+                                  effective_output_path,
+                                  &ws,
+                                  &t_out,
+                                  (int)g_cli_local_size);
     }
 
     uint64_t t_total_end = get_us();
 
     if (ret == 0) {
+        FILE* msg = output_to_stdout ? stderr : stdout;
         t_out.ocl_setup_us = (unsigned long)(g_ocl_init_us + g_kernel_load_us);
         response_t resp;
         memset(&resp, 0, sizeof(resp));
@@ -796,20 +1039,43 @@ int run_lz4_standalone(int argc, char** argv) {
         resp.out_size = t_out.out_size;
         resp.timing = t_out;
         resp.time_us = (unsigned long)(t_total_end - t_total_start);
-        if (g_verbose) {
+        if (g_verbose && !output_to_stdout) {
             print_response_stats(&resp, input_path, mode);
+        } else if (g_verbose && output_to_stdout) {
+            double ratio = (double)t_out.in_size / (t_out.out_size > 0 ? t_out.out_size : 1);
+            fprintf(msg, "%s : %zu -> %zu (%.2f:1) in %.2f ms\n",
+                    input_path,
+                    (size_t)t_out.in_size,
+                    (size_t)resp.out_size,
+                    ratio,
+                    resp.time_us / 1000.0);
         } else {
             double ratio = (double)t_out.in_size / (t_out.out_size > 0 ? t_out.out_size : 1);
-            printf("%s : %zu -> %zu (%.2f:1) in %.2f ms\n", input_path, (size_t)t_out.in_size, (size_t)resp.out_size, ratio, resp.time_us / 1000.0);
+            fprintf(msg, "%s : %zu -> %zu (%.2f:1) in %.2f ms\n",
+                    input_path,
+                    (size_t)t_out.in_size,
+                    (size_t)resp.out_size,
+                    ratio,
+                    resp.time_us / 1000.0);
+        }
+
+        if (output_to_stdout) {
+            if (copy_path_to_stream(effective_output_path, stdout) != 0) {
+                fprintf(stderr, "Error: failed to emit streamed output to stdout\n");
+                ret = 1;
+            }
         }
     }
 
-    lz4_gpu_workspace_free(&ws);
+cleanup:
+    if (ws_inited) lz4_gpu_workspace_free(&ws);
     if (pack_kernel) clReleaseKernel(pack_kernel);
-    clReleaseKernel(kernel);
-    clReleaseProgram(prog);
-    clReleaseCommandQueue(queue);
-    clReleaseContext(ctx);
+    if (kernel) clReleaseKernel(kernel);
+    if (prog) clReleaseProgram(prog);
+    if (queue) { clReleaseCommandQueue(queue); queue = NULL; }
+    if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+    if (have_temp_input) unlink(temp_input_path);
+    if (have_temp_output) unlink(temp_output_path);
     return ret;
 }
 
@@ -833,6 +1099,7 @@ int main(int argc, char** argv) {
                     show_help(argv[0]);
                     return 0;
                 }
+                else if (strcmp(argv[i], "-c") == 0) mode = mode_compress;
                 else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--decompress") == 0) mode = mode_decompress;
                 else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) g_verbose = 1;
                 else if (strcmp(argv[i], "--bench") == 0) {
@@ -850,7 +1117,7 @@ int main(int argc, char** argv) {
                     g_cli_acceleration = atoi(argv[++i]);
                 } else if ((strcmp(argv[i], "--local") == 0) && i + 1 < argc) {
                     g_cli_local_size = atoi(argv[++i]);
-                } else if (argv[i][0] == '-') {
+                } else if (argv[i][0] == '-' && strcmp(argv[i], "-") != 0) {
                     fprintf(stderr, "Error: Unknown option %s\n", argv[i]);
                     return 1;
                 } else {
@@ -873,6 +1140,10 @@ int main(int argc, char** argv) {
                     fprintf(stderr, "Error: --bench only supports compress mode input (it runs compress+decompress internally)\n");
                     return 1;
                 }
+                if (path_is_dash(input)) {
+                    fprintf(stderr, "Error: --bench does not support stdin input ('-')\n");
+                    return 1;
+                }
                 return run_lz4_bench(input,
                                     (int)g_cli_fixed_block_bytes,
                                     g_cli_acceleration,
@@ -882,6 +1153,10 @@ int main(int argc, char** argv) {
             if (!output_explicit) {
                 if (mode == mode_compress) snprintf(output, sizeof(output), "%s.lz4", input);
                 else snprintf(output, sizeof(output), "%s.dec", input);
+            }
+            if (path_is_dash(input) || path_is_dash(output)) {
+                fprintf(stderr, "Error: '-' stream I/O is only supported in standalone mode\n");
+                return 1;
             }
             return run_lz4_client(mode, input, output, (int)g_cli_fixed_block_bytes, g_cli_acceleration, (int)g_cli_local_size);
         }
