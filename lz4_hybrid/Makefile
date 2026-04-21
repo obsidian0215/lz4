@@ -1,3 +1,11 @@
+ifeq ($(OS),Windows_NT)
+MSYS2_USR_BIN ?= C:/msys64/usr/bin
+ifneq ($(wildcard $(MSYS2_USR_BIN)/sh.exe),)
+SHELL := $(MSYS2_USR_BIN)/sh.exe
+export PATH := $(MSYS2_USR_BIN);$(PATH)
+endif
+endif
+
 CC ?= cc
 
 ifeq ($(OS),Windows_NT)

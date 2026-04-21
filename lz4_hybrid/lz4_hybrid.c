@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,9 +41,14 @@ typedef struct {
 } hybrid_cfg_t;
 
 typedef struct {
+    uint64_t file_read_us;
+    uint64_t ocl_setup_us;
+    uint64_t data_upload_us;
     uint64_t cpu_kernel_us;
     uint64_t gpu_kernel_us;
     uint64_t parallel_us;
+    uint64_t data_download_us;
+    uint64_t file_write_us;
     uint64_t total_us;
 } hybrid_metrics_t;
 
@@ -53,7 +59,6 @@ typedef struct {
     cl_program prog;
     cl_kernel kcomp;
     cl_kernel kcomp_mapped;
-    cl_kernel kpack;
     cl_kernel kdec;
     cl_kernel kdec_mapped;
     lz4_gpu_workspace_t ws;
@@ -63,11 +68,6 @@ typedef struct {
     cl_mem cached_kcomp_arg3;
     cl_mem cached_kcomp_arg4;
     cl_mem cached_kcomp_arg10;
-    cl_mem cached_kpack_arg0;
-    cl_mem cached_kpack_arg1;
-    cl_mem cached_kpack_arg2;
-    cl_mem cached_kpack_arg3;
-    cl_mem cached_kpack_arg4;
     cl_mem cached_kdec_arg0;
     cl_mem cached_kdec_arg1;
     cl_mem cached_kdec_arg2;
@@ -179,7 +179,7 @@ static double read_sysfs_double(const char* path) {
 static uint64_t read_rapl_energy_uj(const char* domain_path) {
     FILE* f = fopen(domain_path, "r");
     uint64_t val = 0;
-    if (f) { if (fscanf(f, "%lu", &val) != 1) val = 0; fclose(f); }
+    if (f) { if (fscanf(f, "%" SCNu64, &val) != 1) val = 0; fclose(f); }
     return val;
 }
 
@@ -205,7 +205,9 @@ static double read_cpu_availability(void) {
     if (!f) return 1.0;
     if (!fgets(buf, sizeof(buf), f)) { fclose(f); return 1.0; }
     fclose(f);
-    if (sscanf(buf, "cpu %lu %lu %lu %lu %lu %lu %lu %lu",
+    if (sscanf(buf,
+               "cpu %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64
+               " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64,
                &user, &nice, &sys, &idle, &iowait, &irq, &softirq, &steal) < 4)
         return 1.0;
     total = user + nice + sys + idle + iowait + irq + softirq + steal;
@@ -311,6 +313,8 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
                                unsigned char** out_slots,
                                size_t* out_slot_size,
                                uint64_t* kernel_us,
+                               uint64_t* upload_us,
+                               uint64_t* download_us,
                                int skip_input_upload);
 
 static void calibrate_device_profile(ocl_env_t* ocl, const hybrid_cfg_t* cfg) {
@@ -372,10 +376,17 @@ static void calibrate_device_profile(ocl_env_t* ocl, const hybrid_cfg_t* cfg) {
                                     cfg->local_size,
                                     NULL,
                                     0,
-                                    &gp_sizes, &gp_offsets, &gp_slots, &gp_slot_size, &gp_kernel_us, 0) == 0) {
+                                    &gp_sizes, &gp_offsets, &gp_slots, &gp_slot_size,
+                                    &gp_kernel_us, NULL, NULL, 0) == 0) {
                 t1 = get_us();
-                g_dev_profile.gpu_throughput = (double)cal_size / ((double)(t1 - t0) * 1e-6);
-                g_dev_profile.gpu_overhead_s = ((double)(t1 - t0) * 1e-6) - ((double)gp_kernel_us * 1e-6);
+                {
+                    double total_s = (double)(t1 - t0) * 1e-6;
+                    double kernel_s = (double)gp_kernel_us * 1e-6;
+                    if (kernel_s <= 0.0) kernel_s = total_s;
+                    if (kernel_s <= 0.0) kernel_s = 1e-6;
+                    g_dev_profile.gpu_throughput = (double)cal_size / kernel_s;
+                    g_dev_profile.gpu_overhead_s = total_s - kernel_s;
+                }
                 if (g_dev_profile.gpu_overhead_s < 0.0) g_dev_profile.gpu_overhead_s = 0.0;
 
                 {
@@ -418,14 +429,11 @@ static int gpu_decompress_blocks(ocl_env_t* ocl,
                                  int local_size,
                                  unsigned char* out_full,
                                  uint32_t* out_sizes,
-                                 uint64_t* kernel_us);
+                                 uint64_t* kernel_us,
+                                 uint64_t* upload_us,
+                                 uint64_t* download_us);
 
 static uint64_t lz4_hash_u32_array(const uint32_t* data, size_t count);
-static double lz4_adaptive_ratio_scale(double sample_ratio_pct,
-                                       double target_ratio_pct,
-                                       double max_penalty,
-                                       double span_pct,
-                                       double min_scale);
 static void lz4_adaptive_choose_objective_weights(size_t input_size,
                                                   size_t num_blocks,
                                                   double sample_ratio_pct,
@@ -501,16 +509,6 @@ static double median_double(const double* vals, size_t n) {
     }
 }
 
-static double max_double(const double* vals, size_t n) {
-    double best;
-    if (!vals || n == 0) return 0.0;
-    best = vals[0];
-    for (size_t i = 1; i < n; ++i) {
-        if (vals[i] > best) best = vals[i];
-    }
-    return best;
-}
-
 static double elapsed_sec(const struct timespec* start, const struct timespec* end) {
     return (double)(end->tv_sec - start->tv_sec) + (double)(end->tv_nsec - start->tv_nsec) / 1000000000.0;
 }
@@ -546,6 +544,53 @@ static size_t sampled_block_index(size_t sample_pos, size_t sample_count, size_t
     return (sample_pos * (num_blocks - 1)) / (sample_count - 1);
 }
 
+static double lz4_entropy_bits_per_byte(const unsigned char* src, size_t len) {
+    unsigned counts[256];
+    double inv_len;
+    double h = 0.0;
+
+    if (!src || len == 0) return 0.0;
+    memset(counts, 0, sizeof(counts));
+
+    for (size_t i = 0; i < len; ++i) {
+        counts[src[i]]++;
+    }
+
+    inv_len = 1.0 / (double)len;
+    for (size_t i = 0; i < 256; ++i) {
+        if (counts[i] == 0) continue;
+        {
+            double p = (double)counts[i] * inv_len;
+            h -= p * (log(p) / log(2.0));
+        }
+    }
+
+    if (h < 0.0) h = 0.0;
+    if (h > 8.0) h = 8.0;
+    return h;
+}
+
+static double lz4_clamp_double(double v, double lo, double hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static double lz4_norm_from_bytes(double bytes, double ref_mb, double span) {
+    double ref_bytes;
+    double v;
+
+    if (bytes <= 0.0) return 0.0;
+    if (ref_mb <= 0.0) ref_mb = 1.0;
+    if (span <= 0.0) span = 1.0;
+
+    ref_bytes = ref_mb * 1024.0 * 1024.0;
+    if (ref_bytes <= 0.0) ref_bytes = 1024.0 * 1024.0;
+
+    v = log2(bytes / ref_bytes + 1.0) / span;
+    return lz4_clamp_double(v, 0.0, 1.0);
+}
+
 static double lz4_cpu_thread_scale(long thread_count, int is_unified_memory) {
     double gain;
     double scale;
@@ -573,89 +618,113 @@ static double lz4_refine_ratio_candidate(size_t total_input_sz,
                                          double seed_ratio,
                                          double min_ratio,
                                          double max_ratio) {
-    static const double cands[] = {0.0, 0.08, 0.16, 0.24, 0.32, 0.40, 0.50, 0.62, 0.74, 0.86, 1.0};
+    static const double cands[] = {0.0, 0.04, 0.08, 0.12, 0.16, 0.22, 0.28, 0.34, 0.40, 0.46, 0.52, 0.58, 0.64, 0.70, 0.76, 0.82, 0.88, 0.94, 1.0};
     const size_t nc = sizeof(cands) / sizeof(cands[0]);
     double best_r = seed_ratio;
     double best_obj = 1e300;
     double B = (double)total_input_sz;
     double pc = (Pc_eff > 1.0) ? Pc_eff : 1.0;
     double pg = (Pg_eff > 1.0) ? Pg_eff : 1.0;
+    double block_bytes;
+    double size_norm;
+    double block_norm;
+    double ratio_norm;
+    double compressibility;
+    double device_adv;
 
     if (B <= 0.0 || num_blocks == 0) return seed_ratio;
-    if (seed_ratio < 0.0) seed_ratio = 0.0;
-    if (seed_ratio > 1.0) seed_ratio = 1.0;
-    if (min_ratio < 0.0) min_ratio = 0.0;
-    if (min_ratio > 1.0) min_ratio = 1.0;
-    if (max_ratio < 0.0) max_ratio = 0.0;
-    if (max_ratio > 1.0) max_ratio = 1.0;
+    seed_ratio = lz4_clamp_double(seed_ratio, 0.0, 1.0);
+    min_ratio = lz4_clamp_double(min_ratio, 0.0, 1.0);
+    max_ratio = lz4_clamp_double(max_ratio, 0.0, 1.0);
     if (max_ratio < min_ratio) max_ratio = min_ratio;
 
+    block_bytes = B / (double)num_blocks;
+    if (block_bytes < 4096.0) block_bytes = 4096.0;
+
+    size_norm = lz4_norm_from_bytes(B, 1.0, 8.0);
+    block_norm = lz4_norm_from_bytes(block_bytes, 0.0625, 2.5);
+    ratio_norm = lz4_clamp_double(sample_ratio_pct / 100.0, 0.0, 1.0);
+    compressibility = 1.0 - ratio_norm;
+    device_adv = (pg - pc) / (pg + pc);
+
     for (size_t i = 0; i < nc; ++i) {
-        double r = cands[i];
-        double bytes_gpu = B * r;
-        double bytes_cpu = B - bytes_gpu;
-        size_t gpu_blocks = (size_t)((double)num_blocks * r + 0.5);
+        size_t gpu_blocks;
         size_t cpu_blocks;
-        double mix_pen_s = 0.0;
+        double r;
+        double bytes_gpu;
+        double bytes_cpu;
+        double split_mix;
+        double gpu_overhead_scale;
+        double gpu_comp_overhead_s = 0.0;
+        double gpu_dec_overhead_s = 0.0;
+        double mix_host_s = 0.0;
         double comp_cpu_s;
         double comp_gpu_s;
         double comp_s;
-        double dec_cpu_thr;
-        double dec_gpu_thr;
+        double dec_cpu_tp;
+        double dec_gpu_tp;
         double dec_cpu_s;
         double dec_gpu_s;
         double dec_s;
-        double cpu_pow;
-        double gpu_pow;
-        double energy;
-        double ratio_pen = 0.0;
+        double load_risk_s = 0.0;
+        double ratio_pen_s = 0.0;
         double smooth_pen;
+        double direction_bonus;
         double obj;
 
+        gpu_blocks = (size_t)((double)num_blocks * cands[i] + 0.5);
+        if (gpu_blocks > num_blocks) gpu_blocks = num_blocks;
+        cpu_blocks = num_blocks - gpu_blocks;
+        r = (double)gpu_blocks / (double)num_blocks;
         if (r < min_ratio || r > max_ratio) {
             continue;
         }
 
-        if (gpu_blocks > num_blocks) gpu_blocks = num_blocks;
-        cpu_blocks = num_blocks - gpu_blocks;
+        bytes_gpu = B * r;
+        bytes_cpu = B - bytes_gpu;
+        split_mix = 4.0 * r * (1.0 - r);
 
-        if (gpu_blocks > 0 && cpu_blocks > 0) {
-            size_t mix_blocks = (gpu_blocks < cpu_blocks) ? gpu_blocks : cpu_blocks;
-            double per_block_us = 0.32 + ((gpu_freq_scale > cpu_freq_scale) ? 0.06 : 0.12);
-            mix_pen_s = (150.0 + per_block_us * (double)mix_blocks) / 1000000.0;
+        gpu_overhead_scale = 0.85 + (1.0 - size_norm) * (0.95 - 0.35 * block_norm);
+        gpu_overhead_scale = lz4_clamp_double(gpu_overhead_scale, 0.45, 1.90);
+
+        if (gpu_blocks > 0) {
+            gpu_comp_overhead_s = t0 * gpu_overhead_scale;
+            gpu_dec_overhead_s = 0.52 * t0 * gpu_overhead_scale;
         }
 
         comp_cpu_s = bytes_cpu / pc;
-        comp_gpu_s = (gpu_blocks > 0) ? (t0 + bytes_gpu / pg) : 0.0;
-        if (gpu_blocks > 0 && cpu_blocks > 0) {
-            comp_s = (comp_cpu_s > comp_gpu_s ? comp_cpu_s : comp_gpu_s) + mix_pen_s;
-        } else {
-            comp_s = comp_cpu_s + comp_gpu_s;
+        comp_gpu_s = (gpu_blocks > 0) ? (gpu_comp_overhead_s + bytes_gpu / pg) : 0.0;
+        comp_s = (gpu_blocks > 0 && cpu_blocks > 0)
+            ? ((comp_cpu_s > comp_gpu_s) ? comp_cpu_s : comp_gpu_s)
+            : (comp_cpu_s + comp_gpu_s);
+
+        dec_cpu_tp = pc * (1.28 + 0.10 * (1.0 - size_norm));
+        dec_gpu_tp = pg * (0.96 + 0.06 * gpu_freq_scale);
+        if (dec_cpu_tp < 1.0) dec_cpu_tp = 1.0;
+        if (dec_gpu_tp < 1.0) dec_gpu_tp = 1.0;
+        dec_cpu_s = bytes_cpu / dec_cpu_tp;
+        dec_gpu_s = (gpu_blocks > 0) ? (gpu_dec_overhead_s + bytes_gpu / dec_gpu_tp) : 0.0;
+        dec_s = (gpu_blocks > 0 && cpu_blocks > 0)
+            ? ((dec_cpu_s > dec_gpu_s) ? dec_cpu_s : dec_gpu_s)
+            : (dec_cpu_s + dec_gpu_s);
+
+        mix_host_s = split_mix * (0.00004 + (1.0 - size_norm) * 0.00012 + (1.0 - block_norm) * 0.00007);
+
+        if (thread_util < 0.45) {
+            load_risk_s += split_mix * (0.45 - thread_util) * 0.00018;
+        }
+        if (cpu_freq_scale < 0.75 && cpu_blocks > 0) {
+            load_risk_s += (0.75 - cpu_freq_scale) * (1.0 - r) * 0.00016;
+        }
+        if (gpu_freq_scale < 0.72 && gpu_blocks > 0) {
+            load_risk_s += (0.72 - gpu_freq_scale) * r * 0.00012;
         }
 
-        dec_cpu_thr = pc * 1.35;
-        dec_gpu_thr = pg * 0.95;
-        dec_cpu_s = bytes_cpu / dec_cpu_thr;
-        dec_gpu_s = (gpu_blocks > 0) ? (0.45 * t0 + bytes_gpu / dec_gpu_thr) : 0.0;
-        if (gpu_blocks > 0 && cpu_blocks > 0) {
-            dec_s = (dec_cpu_s > dec_gpu_s ? dec_cpu_s : dec_gpu_s) + 0.85 * mix_pen_s;
-        } else {
-            dec_s = dec_cpu_s + dec_gpu_s;
-        }
+        ratio_pen_s = split_mix * (0.00011 * compressibility * r + 0.00004 * ratio_norm * (1.0 - r));
 
-        cpu_pow = (0.35 + 0.65 * cpu_freq_scale * cpu_freq_scale) * (0.45 + 0.55 * thread_util);
-        gpu_pow = (0.45 + 0.55 * gpu_freq_scale * gpu_freq_scale);
-        energy = cpu_pow * (comp_cpu_s + 0.60 * dec_cpu_s) + gpu_pow * (comp_gpu_s + 0.60 * dec_gpu_s);
-
-        if (sample_ratio_pct > 52.0) {
-            double sev = (sample_ratio_pct - 52.0) / 30.0;
-            if (sev < 0.0) sev = 0.0;
-            if (sev > 1.0) sev = 1.0;
-            ratio_pen = sev * r * 0.12;
-        }
-
-        smooth_pen = fabs(r - seed_ratio) * 0.0015;
-        obj = comp_s + 0.75 * dec_s + 0.08 * energy + ratio_pen + smooth_pen;
+        smooth_pen = fabs(r - seed_ratio) * 0.0012;
+        direction_bonus = 0.00011 * device_adv * (r - 0.5);
+        obj = 0.58 * comp_s + 0.42 * dec_s + mix_host_s + load_risk_s + ratio_pen_s + smooth_pen - direction_bonus;
 
         if (obj < best_obj) {
             best_obj = obj;
@@ -673,41 +742,6 @@ static double lz4_refine_ratio_candidate(size_t total_input_sz,
     return best_r;
 }
 
-static int partition_blocks_prefix(size_t num_blocks,
-                                   size_t gpu_blocks,
-                                   size_t** gpu_indices,
-                                   size_t* gpu_count,
-                                   size_t** cpu_indices,
-                                   size_t* cpu_count) {
-    size_t* gpu = NULL;
-    size_t* cpu = NULL;
-    size_t cpu_blocks;
-
-    if (!gpu_indices || !gpu_count || !cpu_indices || !cpu_count) return -1;
-    if (gpu_blocks > num_blocks) gpu_blocks = num_blocks;
-    cpu_blocks = num_blocks - gpu_blocks;
-
-    if (gpu_blocks > 0) {
-        gpu = (size_t*)malloc(gpu_blocks * sizeof(size_t));
-        if (!gpu) return -1;
-        for (size_t i = 0; i < gpu_blocks; ++i) gpu[i] = i;
-    }
-    if (cpu_blocks > 0) {
-        cpu = (size_t*)malloc(cpu_blocks * sizeof(size_t));
-        if (!cpu) {
-            free(gpu);
-            return -1;
-        }
-        for (size_t i = 0; i < cpu_blocks; ++i) cpu[i] = gpu_blocks + i;
-    }
-
-    *gpu_indices = gpu;
-    *gpu_count = gpu_blocks;
-    *cpu_indices = cpu;
-    *cpu_count = cpu_blocks;
-    return 0;
-}
-
 static int collect_lz4_sample_stats(const unsigned char* input,
                                     size_t input_size,
                                     size_t num_blocks,
@@ -715,64 +749,78 @@ static int collect_lz4_sample_stats(const unsigned char* input,
                                     lz4_sample_stats_t* stats,
                                     double* sample_ratio_pct_out) {
     size_t sample_blocks;
+    double ratio_sum = 0.0;
     size_t sample_bytes = 0;
-    size_t sample_comp_bytes = 0;
-    char* tmp = NULL;
     size_t prev_block = SIZE_MAX;
+    char* tmp = NULL;
+    int tmp_cap = 0;
+    uint64_t t0 = 0;
 
     if (sample_ratio_pct_out) *sample_ratio_pct_out = 0.0;
     if (!input || !cfg || !stats || input_size == 0 || num_blocks == 0) return -1;
     memset(stats, 0, sizeof(*stats));
 
     sample_blocks = cfg->adaptive_sample_blocks ? cfg->adaptive_sample_blocks : 8;
+    if (sample_blocks > 6) sample_blocks = 6;
     if (sample_blocks > num_blocks) sample_blocks = num_blocks;
     if (sample_blocks == 0) return -1;
 
-    tmp = (char*)malloc((size_t)LZ4_compressBound((int)cfg->block_size));
-    if (!tmp) return -1;
-
-    {
-        const uint64_t sample_t0 = get_us();
-
-        for (size_t i = 0; i < sample_blocks; ++i) {
-            const size_t blk_idx = sampled_block_index(i, sample_blocks, num_blocks);
-            const size_t blk_sz = block_input_size(input_size, cfg->block_size, blk_idx);
-            const char* src;
-            int comp_sz;
-            double blk_ratio_pct;
-
-            if (blk_idx == prev_block || blk_sz == 0) continue;
-            src = (const char*)(const void*)(input + blk_idx * cfg->block_size);
-            comp_sz = LZ4_compress_fast(src,
-                                        tmp,
-                                        (int)blk_sz,
-                                        LZ4_compressBound((int)cfg->block_size),
-                                        cfg->acceleration > 0 ? cfg->acceleration : 1);
-            if (comp_sz <= 0) continue;
-
-            blk_ratio_pct = 100.0 * (double)comp_sz / (double)blk_sz;
-            if (blk_ratio_pct < 35.0) stats->low_ratio_blocks++;
-            else if (blk_ratio_pct > 70.0) stats->high_ratio_blocks++;
-
-            sample_bytes += blk_sz;
-            sample_comp_bytes += (size_t)comp_sz;
-            stats->sample_count++;
-            prev_block = blk_idx;
-        }
-
-        {
-            const uint64_t sample_t1 = get_us();
-            if (sample_bytes > 0 && sample_t1 > sample_t0)
-                stats->sample_cpu_throughput = (double)sample_bytes / ((double)(sample_t1 - sample_t0) * 1e-6);
-            else
-                stats->sample_cpu_throughput = 0.0;
-        }
+    tmp_cap = LZ4_compressBound((int)cfg->block_size);
+    if (tmp_cap > 0) {
+        tmp = (char*)malloc((size_t)tmp_cap);
+        if (tmp) t0 = get_us();
     }
 
-    free(tmp);
-    if (stats->sample_count == 0 || sample_bytes == 0) return -1;
+    for (size_t i = 0; i < sample_blocks; ++i) {
+        size_t blk_idx = sampled_block_index(i, sample_blocks, num_blocks);
+        size_t blk_sz = block_input_size(input_size, cfg->block_size, blk_idx);
+        size_t scan_sz;
+        double ent;
+        double est_ratio_pct;
 
-    stats->mean_ratio_pct = 100.0 * (double)sample_comp_bytes / (double)sample_bytes;
+        if (blk_idx == prev_block || blk_sz == 0) continue;
+
+        scan_sz = blk_sz;
+        if (scan_sz > 16384U) scan_sz = 16384U;
+        ent = lz4_entropy_bits_per_byte(input + blk_idx * cfg->block_size, scan_sz);
+
+        if (tmp) {
+            int comp_sz = LZ4_compress_fast((const char*)(const void*)(input + blk_idx * cfg->block_size),
+                                            tmp,
+                                            (int)blk_sz,
+                                            tmp_cap,
+                                            cfg->acceleration > 0 ? cfg->acceleration : 1);
+            if (comp_sz > 0) {
+                est_ratio_pct = 100.0 * (double)comp_sz / (double)blk_sz;
+                sample_bytes += blk_sz;
+            } else {
+                est_ratio_pct = 18.0 + ent * 8.8;
+            }
+        } else {
+            est_ratio_pct = 18.0 + ent * 8.8;
+        }
+
+        est_ratio_pct = lz4_clamp_double(est_ratio_pct, 16.0, 95.0);
+
+        if (est_ratio_pct < 35.0) stats->low_ratio_blocks++;
+        else if (est_ratio_pct > 70.0) stats->high_ratio_blocks++;
+
+        ratio_sum += est_ratio_pct;
+        stats->sample_count++;
+        prev_block = blk_idx;
+    }
+
+    if (tmp) {
+        uint64_t t1 = get_us();
+        if (sample_bytes > 0 && t1 > t0) {
+            stats->sample_cpu_throughput = (double)sample_bytes / ((double)(t1 - t0) * 1e-6);
+        }
+        free(tmp);
+    }
+
+    if (stats->sample_count == 0) return -1;
+
+    stats->mean_ratio_pct = ratio_sum / (double)stats->sample_count;
     if (sample_ratio_pct_out) *sample_ratio_pct_out = stats->mean_ratio_pct;
     return 0;
 }
@@ -784,18 +832,14 @@ static double choose_adaptive_gpu_ratio(ocl_env_t* ocl,
                                         const hybrid_cfg_t* cfg,
                                         double* sample_ratio_pct_out) {
     /*
-     * Device-aware adaptive scheduler using makespan minimization.
+     * 端到端时延模型（压缩+解压）驱动的异构比例决策：
+     *   obj(r) = 0.56*max(Tc_cpu, Tc_gpu) + 0.44*max(Td_cpu, Td_gpu) + HostMix(r)
+     * 其中 Tc/Td 由设备吞吐、频率、负载、输入规模、块大小共同决定。
      *
-     * Model:
-     *   Pc_eff = Pc0_per_thread * gC(data) * sC(runtime) * thread_count
-     *   Pg_eff = Pg0 * gG(data) * sG(runtime)
-     *   r* = Pg_eff / (Pc_eff + Pg_eff) - t0 * Pc_eff * Pg_eff / (B * (Pc_eff + Pg_eff))
-     *   gpu_ratio = clamp(r*, 0, 1)
-     *
-     * Factor categories:
-     *   1. Device capability (Pc0, Pg0, t0) — one-time calibration micro-benchmark
-     *   2. Data characteristics (gC, gG) — from block sampling
-     *   3. Runtime state (sC, sG) — CPU availability, GPU busy percent
+     * 设计目标：
+     *   1) 轻量建模（避免每轮 sample 压缩探测）
+     *   2) 对 T=1 场景更激进地使用 GPU
+     *   3) 显式计入混合调度主机端开销，避免“理论比率高、实测时延差”
      */
     lz4_sample_stats_t stats;
     double Pc0, Pg0, t0;
@@ -803,21 +847,36 @@ static double choose_adaptive_gpu_ratio(ocl_env_t* ocl,
     double sC, sG;
     double Pc_eff, Pg_eff;
     double r_star;
+    double r_perf = 0.0;
+    double r_energy = 0.0;
     double cpu_freq_scale = 1.0;
     double gpu_freq_scale = 1.0;
     double thread_util = 1.0;
     double cpu_thread_scale = 1.0;
+    double cpu_thread_penalty = 1.0;
     double cpu_power_proxy = 0.0;
     double gpu_power_proxy = 0.0;
     double eC_eff = 0.0;
     double eG_eff = 0.0;
-    double perf_weight_pct = 70.0;
-    double energy_weight_pct = 30.0;
+    double perf_weight_pct = 82.0;
+    double energy_weight_pct = 18.0;
     double ratio_weight_pct = 0.0;
     double target_ratio_pct = 45.0;
     double dec_host_penalty_pct = 0.0;
     double min_ratio = 0.0;
     double max_ratio = 1.0;
+    double block_bytes;
+    double size_norm;
+    double block_norm;
+    double parallel_norm;
+    double pg_parallel_scale;
+    double ratio_norm = 0.5;
+    double compressibility = 0.5;
+    double gpu_overhead_scale;
+    double t0_eff;
+    double device_adv;
+    double center;
+    double width;
     long thread_count;
     long total_cores;
     double B = (double)input_size;
@@ -843,9 +902,15 @@ static double choose_adaptive_gpu_ratio(ocl_env_t* ocl,
 
     /* --- 1. Device capability profile (cached) --- */
     calibrate_device_profile(ocl, cfg);
-    Pc0 = g_dev_profile.cpu_throughput;   /* single-thread throughput (bytes/s) */
-    Pg0 = g_dev_profile.gpu_throughput;   /* GPU throughput (bytes/s) */
-    t0  = g_dev_profile.gpu_overhead_s;   /* GPU fixed overhead (seconds) */
+    Pc0 = g_dev_profile.cpu_throughput;
+    Pg0 = g_dev_profile.gpu_throughput;
+    t0  = g_dev_profile.gpu_overhead_s;
+
+    if (Pc0 > 0.0 && Pg0 > 0.0) {
+        double rel = Pc0 / Pg0;
+        if (rel > 3.0) Pc0 = Pg0 * 3.0;
+        if (rel < 0.25) Pc0 = Pg0 * 0.25;
+    }
 
     /* --- Determine thread count --- */
     total_cores = get_online_cpu_count();
@@ -863,32 +928,16 @@ static double choose_adaptive_gpu_ratio(ocl_env_t* ocl,
     gC = 1.0;
     gG = 1.0;
     if (collect_lz4_sample_stats(input, input_size, num_blocks, cfg, &stats, sample_ratio_pct_out) == 0) {
-        /* gC: ratio of sample CPU throughput to calibration throughput */
+        ratio_norm = lz4_clamp_double(stats.mean_ratio_pct / 100.0, 0.0, 1.0);
+        compressibility = 1.0 - ratio_norm;
         if (stats.sample_cpu_throughput > 0.0 && Pc0 > 0.0) {
-            gC = stats.sample_cpu_throughput / Pc0;
-            if (gC < 0.3) gC = 0.3;
-            if (gC > 3.0) gC = 3.0;
+            gC = lz4_clamp_double(stats.sample_cpu_throughput / Pc0, 0.30, 1.25);
+        } else {
+            gC = lz4_clamp_double(1.0 + 0.24 * (compressibility - 0.5), 0.72, 1.32);
         }
-
-        /*
-         * gG: GPU data-dependent factor.
-         * GPU compression throughput is primarily memory-bandwidth-bound,
-         * but compression ratio affects output write volume.
-         * gG = (1 + m + Rref) / (1 + m + R)
-         * where m = memory-bandwidth weight (~2.0 for iGPU),
-         *       Rref = reference compression ratio from calibration (~0.5),
-         *       R = actual sample compression ratio.
-         */
-        {
-            const double m = 2.0;
-            const double Rref = 0.50;
-            double R = stats.mean_ratio_pct / 100.0;
-            if (R < 0.05) R = 0.05;
-            if (R > 1.0) R = 1.0;
-            gG = (1.0 + m + Rref) / (1.0 + m + R);
-            if (gG < 0.5) gG = 0.5;
-            if (gG > 2.0) gG = 2.0;
-        }
+        gC *= (0.92 + 0.16 * compressibility);
+        gC = lz4_clamp_double(gC, 0.30, 1.32);
+        gG = lz4_clamp_double(1.0 + 0.18 * (0.5 - compressibility), 0.70, 1.28);
     }
 
     /* --- 3. Runtime state --- */
@@ -913,75 +962,57 @@ static double choose_adaptive_gpu_ratio(ocl_env_t* ocl,
                                           &target_ratio_pct,
                                           &dec_host_penalty_pct);
 
-    /*
-     * Scale CPU availability relative to the thread count being used.
-     * System-wide idle fraction represents total_cores worth of capacity.
-     * If we use fewer threads, effective availability scales accordingly.
-     */
     if (cfg->cpu_threads > 0 && cfg->cpu_threads < total_cores) {
-        /*
-         * sC from /proc/stat is system-wide. Scale: even if system reports
-         * 50% idle across all cores, our thread_count threads might still
-         * find enough capacity. Approximate: sC_eff = min(sC * total/used, 1.0)
-         */
         double scale = (double)total_cores / (double)cfg->cpu_threads;
         sC = sC * scale;
         if (sC > 1.0) sC = 1.0;
     }
 
-    /* --- Effective throughputs --- */
-    Pc_eff = Pc0 * gC * sC * cpu_thread_scale * cpu_freq_scale;
-    Pg_eff = Pg0 * gG * sG * gpu_freq_scale;
+    block_bytes = (cfg->block_size > 0)
+        ? (double)cfg->block_size
+        : ((num_blocks > 0) ? (B / (double)num_blocks) : 65536.0);
+    if (block_bytes < 4096.0) block_bytes = 4096.0;
 
-    /* --- 3.5 Coordination cost estimation for makespan model --- */
-    double coord_overhead_estimate = 0.0;
-    if (num_blocks > 0 && B > 0.0) {
-        double pack_overhead_per_block_us = 1.0 + (65536.0 * 0.001);
-        double total_pack_us = pack_overhead_per_block_us * (double)num_blocks * 0.01;
-        double merge_overhead_per_byte_ns = 0.1;
-        double total_merge_us = (B * merge_overhead_per_byte_ns) / 1000.0;
-        coord_overhead_estimate = (total_pack_us + total_merge_us) / 1000000.0;
+    size_norm = lz4_norm_from_bytes(B, 1.0, 8.0);
+    block_norm = lz4_norm_from_bytes(block_bytes, 0.0625, 2.5);
+    parallel_norm = 1.0 - exp(-(double)num_blocks / 192.0);
+    pg_parallel_scale = 0.55 + 2.45 * parallel_norm;
+
+    if (thread_count <= 2) {
+        cpu_thread_penalty = 1.0 - (0.20 + 0.08 * (1.0 - size_norm)) * (1.0 - thread_util);
     }
+    cpu_thread_penalty = lz4_clamp_double(cpu_thread_penalty, 0.58, 1.08);
 
-    double T_cpu_estimated = B / Pc_eff;
-    double T_gpu_estimated = B / Pg_eff;
-    double T_max = (T_cpu_estimated > T_gpu_estimated) ? T_cpu_estimated : T_gpu_estimated;
+    gpu_overhead_scale = 0.85 + (1.0 - size_norm) * (0.95 - 0.35 * block_norm);
+    gpu_overhead_scale = lz4_clamp_double(gpu_overhead_scale, 0.45, 1.90);
 
-    /* --- Small input soft guard: keep a small but non-zero GPU share --- */
-    if (B <= t0 * Pg_eff && t0 > 0.0) {
-        double overlap = B / (t0 * Pg_eff);
-        double small_ratio;
-        if (overlap < 0.0) overlap = 0.0;
-        if (overlap > 1.0) overlap = 1.0;
-        small_ratio = 0.10 + 0.16 * overlap;
-        if (thread_util >= 0.75) small_ratio += 0.04;
-        if (gpu_freq_scale > cpu_freq_scale + 0.08) small_ratio += 0.03;
-        if (small_ratio > 0.32) small_ratio = 0.32;
-        if (cfg->verbose) {
-            fprintf(stderr,
-                    "Adaptive: small-input soft guard (B=%.0f <= overhead %.6f s * %.0f B/s), r*=%.4f\n",
-                    B, t0, Pg_eff, small_ratio);
-        }
-        return small_ratio;
-    }
+    Pc_eff = Pc0 * gC * sC * cpu_thread_scale * cpu_freq_scale * cpu_thread_penalty;
+    Pg_eff = Pg0 * gG * sG * gpu_freq_scale * (0.76 + 0.24 * size_norm + 0.14 * block_norm) * pg_parallel_scale;
 
-    /* --- Makespan-optimal ratio with coordination cost --- */
+    if (Pc_eff < 1.0) Pc_eff = 1.0;
+    if (Pg_eff < 1.0) Pg_eff = 1.0;
+
+    t0_eff = t0 * gpu_overhead_scale;
+
     if (Pc_eff + Pg_eff <= 0.0) return 0.5;
     r_star = Pg_eff / (Pc_eff + Pg_eff);
-    if (B > 0.0 && t0 > 0.0) {
-        r_star -= (t0 * Pc_eff * Pg_eff) / (B * (Pc_eff + Pg_eff));
+    if (B > 0.0 && t0_eff > 0.0) {
+        r_star -= (t0_eff * Pc_eff * Pg_eff) / (B * (Pc_eff + Pg_eff));
+    }
+    r_perf = r_star;
+
+    if (gpu_freq_scale > cpu_freq_scale + 0.05) {
+        r_star += 0.05 * (gpu_freq_scale - cpu_freq_scale);
+    } else if (gpu_freq_scale + 0.10 < cpu_freq_scale) {
+        r_star -= 0.05 * (cpu_freq_scale - gpu_freq_scale);
     }
 
-    if (coord_overhead_estimate > 0.0 && T_max > 0.0) {
-        double overhead_ratio = coord_overhead_estimate / (T_max + 0.001);
-        if (overhead_ratio > 0.35) {
-            double dampen = 1.0 - (overhead_ratio * 0.08);
-            if (dampen < 0.82) dampen = 0.82;
-            r_star *= dampen;
-        }
+    if (stats.sample_count > 0 && ratio_weight_pct > 0.0) {
+        double ratio_shift = (ratio_weight_pct / 100.0) * (0.14 * compressibility - 0.06 * ratio_norm);
+        r_star -= ratio_shift * (0.35 + 0.65 * size_norm);
     }
 
-    /* --- 4. Energy-aware correction --- */
+    /* 轻量能耗项只做弱正则，主目标仍是时延最短 */
     {
         cpu_power_proxy = (0.35 + 0.65 * cpu_freq_scale * cpu_freq_scale) * (0.45 + 0.55 * thread_util);
         gpu_power_proxy = (0.45 + 0.55 * gpu_freq_scale * gpu_freq_scale);
@@ -992,119 +1023,40 @@ static double choose_adaptive_gpu_ratio(ocl_env_t* ocl,
         if (eG_eff <= 0.0 && Pg_eff > 0.0) eG_eff = gpu_power_proxy / Pg_eff;
 
         if (eC_eff > 0.0 && eG_eff > 0.0) {
-            double r_energy = (Pg_eff * eC_eff) / (Pc_eff * eG_eff + Pg_eff * eC_eff);
+            r_energy = (Pg_eff * eC_eff) / (Pc_eff * eG_eff + Pg_eff * eC_eff);
             double sum_w = perf_weight_pct + energy_weight_pct;
             if (sum_w <= 0.0) {
-                perf_weight_pct = 65.0;
-                energy_weight_pct = 35.0;
+                perf_weight_pct = 82.0;
+                energy_weight_pct = 18.0;
                 sum_w = 100.0;
             }
-            r_star = (perf_weight_pct * r_star + energy_weight_pct * r_energy) / sum_w;
+            r_star = (perf_weight_pct * r_perf + energy_weight_pct * r_energy) / sum_w;
         }
     }
 
-    /* --- 4.5 Frequency-mode bias (performance/power mode simulation) --- */
-    if (cpu_freq_scale < 0.80 && gpu_freq_scale > cpu_freq_scale + 0.05) {
-        double bias = (0.80 - cpu_freq_scale) * 0.25;
-        r_star += bias;
-    }
-    if (gpu_freq_scale < 0.70 && cpu_freq_scale > gpu_freq_scale + 0.05) {
-        double bias = (0.70 - gpu_freq_scale) * 0.20;
-        r_star -= bias;
-    }
-
-    /* --- 5. Optional ratio soft objective (adaptive candidate H) --- */
-    {
-        if (ratio_weight_pct > 0.0 && stats.sample_count > 0) {
-            double max_penalty = 0.22;
-            double span_pct = 40.0;
-            double min_scale = 0.45;
-            double ratio_scale = lz4_adaptive_ratio_scale(stats.mean_ratio_pct,
-                                                          target_ratio_pct,
-                                                          max_penalty,
-                                                          span_pct,
-                                                          min_scale);
-            double ratio_candidate = r_star * ratio_scale;
-            double keep_weight = 100.0 - ratio_weight_pct;
-            if (keep_weight < 0.0) keep_weight = 0.0;
-            r_star = (keep_weight * r_star + ratio_weight_pct * ratio_candidate) / (keep_weight + ratio_weight_pct);
-        }
-    }
-
-    /* --- 6. Optional hard ratio guard (adaptive candidate F) --- */
-    {
-        /* ratio hard guard disabled in deterministic runtime mode */
-    }
-
-    /* --- 7. Decompress host-coordination correction --- */
     if (dec_host_penalty_pct > 0.0) {
-        double factor = 1.0 - dec_host_penalty_pct / 100.0;
-        if (factor < 0.93) factor = 0.93;
-        r_star *= factor;
-    }
-
-    if (stats.sample_count > 0) {
-        double perf_adv = (Pc_eff > 1.0) ? (Pg_eff / Pc_eff) : 1.0;
-        double gpu_floor = 0.20;
-        double neutral_floor = 0.38;
-
-        if (perf_adv > 0.90) gpu_floor += 0.04;
-        if (perf_adv > 1.05) gpu_floor += 0.08;
-        if (gpu_freq_scale > cpu_freq_scale + 0.08) gpu_floor += 0.08;
-        if (thread_util >= 0.75) gpu_floor += 0.05;
-        if (B >= (8.0 * 1024.0 * 1024.0)) gpu_floor += 0.08;
-        if (B >= (32.0 * 1024.0 * 1024.0)) gpu_floor += 0.06;
-        if (B >= (128.0 * 1024.0 * 1024.0)) gpu_floor += 0.04;
-        if (stats.mean_ratio_pct > 65.0) gpu_floor -= 0.04;
-        if (stats.mean_ratio_pct > 0.0 && stats.mean_ratio_pct < 45.0) gpu_floor += 0.03;
-
-        if (B >= (4.0 * 1024.0 * 1024.0)) neutral_floor = 0.44;
-        if (B >= (16.0 * 1024.0 * 1024.0)) neutral_floor = 0.48;
-        if (B >= (64.0 * 1024.0 * 1024.0)) neutral_floor = 0.50;
-        if (thread_util >= 0.70) neutral_floor += 0.02;
-        if (gpu_freq_scale > cpu_freq_scale + 0.05) neutral_floor += 0.02;
-        if (stats.mean_ratio_pct > 68.0) neutral_floor -= 0.03;
-        if (stats.mean_ratio_pct > 0.0 && stats.mean_ratio_pct < 45.0) neutral_floor += 0.02;
-        if (neutral_floor < 0.28) neutral_floor = 0.28;
-        if (neutral_floor > 0.58) neutral_floor = 0.58;
-        if (gpu_floor < neutral_floor) gpu_floor = neutral_floor;
-
-        if (gpu_floor < 0.12) gpu_floor = 0.12;
-        if (gpu_floor > 0.64) gpu_floor = 0.64;
-
-        min_ratio = gpu_floor;
-
-        max_ratio = 0.92;
-        if (B < (64.0 * 1024.0 * 1024.0)) {
-            max_ratio = 0.72;
-        } else if (B < (256.0 * 1024.0 * 1024.0)) {
-            max_ratio = 0.80;
-        }
-        if (stats.mean_ratio_pct > 70.0 && max_ratio > 0.78) {
-            max_ratio = 0.78;
-        }
-        if (thread_util >= 0.75 && max_ratio > 0.84) {
-            max_ratio = 0.84;
-        }
-        if (max_ratio < min_ratio) max_ratio = min_ratio;
-
-        if (r_star < min_ratio) r_star = min_ratio;
-        if (r_star > max_ratio) r_star = max_ratio;
-    }
-
-    {
-        double freq_gap = gpu_freq_scale - cpu_freq_scale;
-        if (freq_gap > 0.05) {
-            double boost = freq_gap * 0.18;
-            if (thread_util >= 0.70) boost += 0.02;
-            if (boost > 0.18) boost = 0.18;
-            r_star += boost;
-        } else if (freq_gap < -0.10) {
-            double cut = (-freq_gap) * 0.08;
-            if (cut > 0.10) cut = 0.10;
-            r_star -= cut;
+        double host_pen = (dec_host_penalty_pct / 100.0) * (0.55 + 0.45 * (1.0 - size_norm));
+        host_pen = lz4_clamp_double(host_pen, 0.0, 0.20);
+        {
+            double factor = 1.0 - host_pen;
+            if (factor < 0.80) factor = 0.80;
+            r_star *= factor;
         }
     }
+
+    device_adv = (Pg_eff - Pc_eff) / (Pg_eff + Pc_eff);
+    center = 0.50 + 0.44 * device_adv;
+    center += 0.05 * (gpu_freq_scale - cpu_freq_scale);
+    center += 0.04 * (0.5 - ratio_norm);
+    center = lz4_clamp_double(center, 0.02, 0.98);
+
+    width = 0.16 + 0.24 * size_norm + 0.10 * (1.0 - fabs(device_adv));
+    width -= 0.06 * (1.0 - block_norm);
+    width = lz4_clamp_double(width, 0.12, 0.42);
+
+    min_ratio = lz4_clamp_double(center - width, 0.0, 0.94);
+    max_ratio = lz4_clamp_double(center + width, 0.06, 1.0);
+    if (max_ratio < min_ratio) max_ratio = min_ratio;
 
     if (r_star < min_ratio) r_star = min_ratio;
     if (r_star > max_ratio) r_star = max_ratio;
@@ -1113,7 +1065,7 @@ static double choose_adaptive_gpu_ratio(ocl_env_t* ocl,
                                         num_blocks,
                                         Pc_eff,
                                         Pg_eff,
-                                        t0,
+                                        t0_eff,
                                         cpu_freq_scale,
                                         gpu_freq_scale,
                                         thread_util,
@@ -1124,30 +1076,44 @@ static double choose_adaptive_gpu_ratio(ocl_env_t* ocl,
 
     if (r_star < min_ratio) r_star = min_ratio;
     if (r_star > max_ratio) r_star = max_ratio;
-    if (r_star < 0.0) r_star = 0.0;
-    if (r_star > 1.0) r_star = 1.0;
+    r_star = lz4_clamp_double(r_star, 0.0, 1.0);
 
     if (cfg->verbose) {
         fprintf(stderr,
-                "Adaptive: Pc0=%.0f gC=%.2f sC=%.2f threads=%ld cpuScale=%.2f Pc_eff=%.0f | "
+                "Adaptive(E2E): Pc0=%.0f gC=%.2f sC=%.2f threads=%ld cpuScale=%.2f cpuPen=%.2f Pc_eff=%.0f | "
                 "Pg0=%.0f gG=%.2f sG=%.2f Pg_eff=%.0f | "
-            "freqC=%.2f freqG=%.2f util=%.2f pC=%.3f pG=%.3f | "
-            "eC=%.2e eG=%.2e perfW=%.1f energyW=%.1f ratioW=%.1f decHostPen=%.1f | "
-            "t0=%.6f B=%.0f r*=%.4f\n",
-                Pc0, gC, sC, thread_count, cpu_thread_scale, Pc_eff,
+                "freqC=%.2f freqG=%.2f util=%.2f sizeN=%.2f blockN=%.2f parN=%.2f pScale=%.2f ratioN=%.2f pC=%.3f pG=%.3f | "
+                "eC=%.2e eG=%.2e rPerf=%.4f rEnergy=%.4f perfW=%.1f energyW=%.1f ratioW=%.1f targetR=%.1f decHostPen=%.1f | "
+                "t0=%.6f t0eff=%.6f B=%.0f center=%.4f width=%.4f min=%.4f max=%.4f r*=%.4f\n",
+                Pc0, gC, sC, thread_count, cpu_thread_scale, cpu_thread_penalty, Pc_eff,
                 Pg0, gG, sG, Pg_eff,
-            cpu_freq_scale,
-            gpu_freq_scale,
-            thread_util,
-            cpu_power_proxy,
-            gpu_power_proxy,
-            eC_eff,
-            eG_eff,
+                cpu_freq_scale,
+                gpu_freq_scale,
+                thread_util,
+                size_norm,
+                block_norm,
+                parallel_norm,
+                pg_parallel_scale,
+                ratio_norm,
+                cpu_power_proxy,
+                gpu_power_proxy,
+                eC_eff,
+                eG_eff,
+                r_perf,
+                r_energy,
                 perf_weight_pct,
                 energy_weight_pct,
                 ratio_weight_pct,
+                target_ratio_pct,
                 dec_host_penalty_pct,
-                t0, B, r_star);
+                t0,
+                t0_eff,
+                B,
+                center,
+                width,
+                min_ratio,
+                max_ratio,
+                r_star);
     }
 
     ocl->adaptive_ratio_cache_valid = 1;
@@ -1252,7 +1218,6 @@ static void ocl_release_kernels_only(ocl_env_t* ocl) {
     if (!ocl) return;
     if (ocl->kdec_mapped) { clReleaseKernel(ocl->kdec_mapped); ocl->kdec_mapped = NULL; }
     if (ocl->kdec) { clReleaseKernel(ocl->kdec); ocl->kdec = NULL; }
-    if (ocl->kpack) { clReleaseKernel(ocl->kpack); ocl->kpack = NULL; }
     if (ocl->kcomp_mapped) { clReleaseKernel(ocl->kcomp_mapped); ocl->kcomp_mapped = NULL; }
     if (ocl->kcomp) { clReleaseKernel(ocl->kcomp); ocl->kcomp = NULL; }
 }
@@ -1266,9 +1231,6 @@ static int ocl_create_required_kernels(ocl_env_t* ocl) {
 
     ocl->kcomp_mapped = clCreateKernel(ocl->prog, "lz4_compress_blocks_mapped", &err);
     if (err != CL_SUCCESS || !ocl->kcomp_mapped) return -1;
-
-    ocl->kpack = clCreateKernel(ocl->prog, "lz4_pack_blocks", &err);
-    if (err != CL_SUCCESS || !ocl->kpack) return -1;
 
     ocl->kdec = clCreateKernel(ocl->prog, "lz4_decompress_blocks", &err);
     if (err != CL_SUCCESS || !ocl->kdec) return -1;
@@ -1308,7 +1270,16 @@ static int ocl_init(ocl_env_t* ocl) {
         return -1;
     }
 
+#if defined(CL_VERSION_2_0)
+    {
+        const cl_queue_properties props[] = {
+            CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0
+        };
+        ocl->queue = clCreateCommandQueueWithProperties(ocl->ctx, ocl->dev, props, &err);
+    }
+#else
     ocl->queue = clCreateCommandQueue(ocl->ctx, ocl->dev, CL_QUEUE_PROFILING_ENABLE, &err);
+#endif
     if (err != CL_SUCCESS || !ocl->queue) {
         fprintf(stderr, "OpenCL init failed: clCreateCommandQueue err=%d\n", err);
         return -1;
@@ -1321,22 +1292,8 @@ static int ocl_init(ocl_env_t* ocl) {
     }
 
     if (ocl_create_required_kernels(ocl) != 0) {
-        fprintf(stderr, "OpenCL init: cached binary may be stale, retrying with source build\n");
-        ocl_release_kernels_only(ocl);
-        if (ocl->prog) {
-            clReleaseProgram(ocl->prog);
-            ocl->prog = NULL;
-        }
-        setenv("LZ4_GPU_NO_CLBIN", "1", 1);
-        ocl->prog = lz4_load_program(ocl->ctx, ocl->dev);
-        if (!ocl->prog) {
-            fprintf(stderr, "OpenCL init failed: source reload returned NULL\n");
-            return -1;
-        }
-        if (ocl_create_required_kernels(ocl) != 0) {
-            fprintf(stderr, "OpenCL init failed: create required kernels after source reload\n");
-            return -1;
-        }
+        fprintf(stderr, "OpenCL init failed: missing required kernels in loaded program (please regenerate matching .clbin with Makefile precompile)\n");
+        return -1;
     }
 
     return 0;
@@ -1427,34 +1384,6 @@ static uint64_t lz4_hash_u32_array(const uint32_t* data, size_t count) {
         h *= 1099511628211ULL;
     }
     return h;
-}
-
-static double lz4_adaptive_ratio_scale(double sample_ratio_pct,
-                                       double target_ratio_pct,
-                                       double max_penalty,
-                                       double span_pct,
-                                       double min_scale) {
-    double over;
-    double norm;
-    double scale;
-
-    if (max_penalty < 0.0) max_penalty = 0.0;
-    if (max_penalty > 0.9) max_penalty = 0.9;
-    if (span_pct <= 0.0) span_pct = 40.0;
-    if (min_scale < 0.0) min_scale = 0.0;
-    if (min_scale > 1.0) min_scale = 1.0;
-
-    if (sample_ratio_pct <= target_ratio_pct) return 1.0;
-
-    over = sample_ratio_pct - target_ratio_pct;
-    norm = over / span_pct;
-    if (norm < 0.0) norm = 0.0;
-    if (norm > 1.0) norm = 1.0;
-
-    scale = 1.0 - max_penalty * norm;
-    if (scale < min_scale) scale = min_scale;
-    if (scale > 1.0) scale = 1.0;
-    return scale;
 }
 
 static void lz4_adaptive_choose_objective_weights(size_t input_size,
@@ -1564,19 +1493,6 @@ static void lz4_adaptive_choose_objective_weights(size_t input_size,
     if (ratio_weight_pct) *ratio_weight_pct = ratio;
     if (target_ratio_pct) *target_ratio_pct = target_ratio;
     if (dec_host_penalty_pct) *dec_host_penalty_pct = dec_penalty;
-}
-
-static int lz4_should_use_device_compaction(size_t packed_bytes, size_t sparse_bytes, size_t num_blocks, cl_kernel pack_kernel) {
-    const unsigned min_blocks = 8U;
-    const unsigned min_gain_pct = 5U;
-    if (!pack_kernel) return 0;
-    if (packed_bytes == 0 || sparse_bytes == 0 || packed_bytes >= sparse_bytes) return 0;
-    {
-        size_t saved_bytes;
-        if (num_blocks < (size_t)min_blocks) return 0;
-        saved_bytes = sparse_bytes - packed_bytes;
-        return saved_bytes * 100U >= sparse_bytes * (size_t)min_gain_pct;
-    }
 }
 
 static size_t choose_comp_worker_count(cl_command_queue queue, size_t num_blocks, size_t local_size) {
@@ -1994,6 +1910,8 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
                                unsigned char** out_slots,
                                size_t* out_slot_size,
                                uint64_t* kernel_us,
+                               uint64_t* upload_us,
+                               uint64_t* download_us,
                                int skip_input_upload) {
     const int hash_log = 14;
     cl_int err = CL_SUCCESS;
@@ -2016,13 +1934,14 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
     size_t prev_dict_capacity;
     size_t packed_total = 0;
     size_t sparse_total = 0;
-    int use_device_compaction = 0;
     int use_standard_copy;
     int use_mapped_indices;
     const int map_cache_enabled = 1;
     uint64_t mapped_hash = 0;
     int mapped_upload_needed = 1;
     cl_mem prev_block_info_buf = NULL;
+    uint64_t upload_acc = 0;
+    uint64_t download_acc = 0;
 
     if (!ocl || !src || src_size == 0 || block_size == 0 || !out_sizes || !out_offsets || !out_slots || !out_slot_size || !kernel_us) return -1;
 
@@ -2033,6 +1952,8 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
     *out_slots = NULL;
     *out_slot_size = 0;
     *kernel_us = 0;
+    if (upload_us) *upload_us = 0;
+    if (download_us) *download_us = 0;
     use_standard_copy = hybrid_prefers_standard_copy(ocl->queue);
 
     if (use_mapped_indices) {
@@ -2109,11 +2030,14 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
     ocl->ws.comp_epoch_base += (uint32_t)(((size_t)num_blocks + gsz - 1) / gsz) + 2U;
 
     if (!skip_input_upload) {
+        const uint64_t t_up0 = get_us();
         if (hybrid_write_buffer_auto(ocl->queue, ocl->ws.comp_in_buf, src, src_size, use_standard_copy) != 0) {
             goto fail;
         }
+        upload_acc += (get_us() - t_up0);
     }
     if (use_mapped_indices && mapped_upload_needed) {
+        const uint64_t t_up0 = get_us();
         if (hybrid_write_buffer_auto(ocl->queue,
                                      ocl->ws.block_info_buf,
                                      mapped_block_indices,
@@ -2121,6 +2045,7 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
                                      use_standard_copy) != 0) {
             goto fail;
         }
+        upload_acc += (get_us() - t_up0);
         if (map_cache_enabled) {
             ocl->cached_block_map_hash = mapped_hash;
             ocl->cached_block_map_count = num_blocks;
@@ -2187,7 +2112,9 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
     }
 
     {
+        const uint64_t t_down0 = get_us();
         if (hybrid_read_buffer_auto(ocl->queue, ocl->ws.output_size_buf, h_sizes, num_blocks * sizeof(uint32_t), use_standard_copy) != 0) goto fail;
+        download_acc += (get_us() - t_down0);
     }
 
     for (size_t i = 0; i < num_blocks; ++i) {
@@ -2196,73 +2123,31 @@ static int gpu_compress_blocks(ocl_env_t* ocl,
         packed_total += (size_t)h_sizes[i];
     }
 
-    use_device_compaction = lz4_should_use_device_compaction(packed_total, sparse_total, num_blocks, ocl->kpack);
 
     if (packed_total > 0) {
         packed_out = (unsigned char*)malloc(packed_total);
         if (!packed_out) goto fail;
     }
 
-    if (use_device_compaction) {
-        size_t pack_global;
-        uint32_t totalBlocks32 = (uint32_t)num_blocks;
-        ocl->ws.packed_offsets_buf = ensure_buffer(ocl->ctx,
-                                                   ocl->ws.packed_offsets_buf,
-                                                   num_blocks * sizeof(uint32_t),
-                                                   &ocl->ws.current_packed_offsets_capacity,
-                                                   &err);
-        if (err != CL_SUCCESS || !ocl->ws.packed_offsets_buf) goto fail;
-        ocl->ws.packed_out_buf = ensure_buffer(ocl->ctx,
-                                               ocl->ws.packed_out_buf,
-                                               packed_total,
-                                               &ocl->ws.current_packed_out_capacity,
-                                               &err);
-        if (packed_total > 0 && (err != CL_SUCCESS || !ocl->ws.packed_out_buf)) goto fail;
-        if (hybrid_write_buffer_auto(ocl->queue,
-                                     ocl->ws.packed_offsets_buf,
-                                     h_packed_offsets,
-                                     num_blocks * sizeof(uint32_t),
-                                     use_standard_copy) != 0) {
-            goto fail;
-        }
-
-        err = CL_SUCCESS;
-        err |= set_kernel_mem_arg_if_changed(ocl->kpack, 0, &ocl->cached_kpack_arg0, ocl->ws.out_buf);
-        err |= set_kernel_mem_arg_if_changed(ocl->kpack, 1, &ocl->cached_kpack_arg1, ocl->ws.packed_out_buf);
-        err |= set_kernel_mem_arg_if_changed(ocl->kpack, 2, &ocl->cached_kpack_arg2, ocl->ws.packed_offsets_buf);
-        err |= set_kernel_mem_arg_if_changed(ocl->kpack, 3, &ocl->cached_kpack_arg3, ocl->ws.output_size_buf);
-        err |= clSetKernelArg(ocl->kpack, 4, sizeof(uint32_t), &single_block_max_out_u32);
-        err |= clSetKernelArg(ocl->kpack, 5, sizeof(uint32_t), &totalBlocks32);
-        if (err != CL_SUCCESS) goto fail;
-
-        pack_global = round_up_size(num_blocks, lsz);
-        if (pack_global == 0) pack_global = lsz;
+    if (sparse_total > 0) {
+        h_out = (unsigned char*)malloc(sparse_total);
+        if (!h_out) goto fail;
         {
-            const uint64_t t0 = get_us();
-            err = clEnqueueNDRangeKernel(ocl->queue, ocl->kpack, 1, NULL, &pack_global, &lsz, 0, NULL, NULL);
-            if (err != CL_SUCCESS) goto fail;
-            clFinish(ocl->queue);
-            *kernel_us += get_us() - t0;
+            const uint64_t t_down0 = get_us();
+        if (hybrid_read_buffer_auto(ocl->queue, ocl->ws.out_buf, h_out, sparse_total, use_standard_copy) != 0) goto fail;
+            download_acc += (get_us() - t_down0);
         }
-
-        if (packed_total > 0) {
-            if (hybrid_read_buffer_auto(ocl->queue, ocl->ws.packed_out_buf, packed_out, packed_total, use_standard_copy) != 0) goto fail;
-        }
-    } else {
-        if (sparse_total > 0) {
-            h_out = (unsigned char*)malloc(sparse_total);
-            if (!h_out) goto fail;
-            if (hybrid_read_buffer_auto(ocl->queue, ocl->ws.out_buf, h_out, sparse_total, use_standard_copy) != 0) goto fail;
-        }
-        for (size_t i = 0; i < num_blocks; ++i) {
-            memcpy(packed_out + h_packed_offsets[i], h_out + i * single_block_max_out, (size_t)h_sizes[i]);
-        }
+    }
+    for (size_t i = 0; i < num_blocks; ++i) {
+        memcpy(packed_out + h_packed_offsets[i], h_out + i * single_block_max_out, (size_t)h_sizes[i]);
     }
 
     *out_sizes = h_sizes;
     *out_offsets = h_packed_offsets;
     *out_slots = packed_out;
     *out_slot_size = packed_total;
+    if (upload_us) *upload_us = upload_acc;
+    if (download_us) *download_us = download_acc;
 
     h_sizes = NULL;
     h_packed_offsets = NULL;
@@ -2290,7 +2175,9 @@ static int gpu_decompress_blocks(ocl_env_t* ocl,
                                  int local_size,
                                  unsigned char* out_full,
                                  uint32_t* out_sizes,
-                                 uint64_t* kernel_us) {
+                                 uint64_t* kernel_us,
+                                 uint64_t* upload_us,
+                                 uint64_t* download_us) {
     cl_int err = CL_SUCCESS;
     uint32_t* h_comp_off = NULL;
     size_t comp_total = 0;
@@ -2301,16 +2188,22 @@ static int gpu_decompress_blocks(ocl_env_t* ocl,
     uint64_t decomp_meta_hash;
     int need_upload_meta = 1;
     int use_standard_copy;
+    uint64_t upload_acc = 0;
+    uint64_t download_acc = 0;
 
     if (!ocl || !comp_data || !comp_sizes || !out_full || !out_sizes || !kernel_us) return -1;
     if (num_blocks == 0) {
         *kernel_us = 0;
+        if (upload_us) *upload_us = 0;
+        if (download_us) *download_us = 0;
         return 0;
     }
     if (num_blocks > (size_t)UINT32_MAX) return -1;
     if (block_size > (size_t)UINT32_MAX) return -1;
     block_size_u32 = (uint32_t)block_size;
     use_standard_copy = hybrid_prefers_standard_copy(ocl->queue);
+    if (upload_us) *upload_us = 0;
+    if (download_us) *download_us = 0;
 
     h_comp_off = (uint32_t*)malloc(num_blocks * sizeof(uint32_t));
     if (!h_comp_off) goto fail;
@@ -2348,13 +2241,20 @@ static int gpu_decompress_blocks(ocl_env_t* ocl,
         need_upload_meta = 0;
     }
 
-    if (hybrid_write_buffer_auto(ocl->queue, ocl->ws.in_buf, comp_data, comp_total, use_standard_copy) != 0) {
-        goto fail;
+    {
+        const uint64_t t_up0 = get_us();
+        if (hybrid_write_buffer_auto(ocl->queue, ocl->ws.in_buf, comp_data, comp_total, use_standard_copy) != 0) {
+            goto fail;
+        }
+        upload_acc += (get_us() - t_up0);
     }
-    if (need_upload_meta &&
-        (hybrid_write_buffer_auto(ocl->queue, ocl->ws.decomp_comp_off_buf, h_comp_off, num_blocks * sizeof(uint32_t), use_standard_copy) != 0 ||
-         hybrid_write_buffer_auto(ocl->queue, ocl->ws.decomp_comp_size_buf, comp_sizes, num_blocks * sizeof(uint32_t), use_standard_copy) != 0)) {
-        goto fail;
+    if (need_upload_meta) {
+        const uint64_t t_up0 = get_us();
+        if (hybrid_write_buffer_auto(ocl->queue, ocl->ws.decomp_comp_off_buf, h_comp_off, num_blocks * sizeof(uint32_t), use_standard_copy) != 0 ||
+            hybrid_write_buffer_auto(ocl->queue, ocl->ws.decomp_comp_size_buf, comp_sizes, num_blocks * sizeof(uint32_t), use_standard_copy) != 0) {
+            goto fail;
+        }
+        upload_acc += (get_us() - t_up0);
     }
     if (need_upload_meta) {
         ocl->cached_decomp_meta_hash = decomp_meta_hash;
@@ -2386,7 +2286,9 @@ static int gpu_decompress_blocks(ocl_env_t* ocl,
     }
 
     {
+        const uint64_t t_down0 = get_us();
         if (hybrid_read_buffer_auto(ocl->queue, ocl->ws.decomp_sizes_out_buf, out_sizes, num_blocks * sizeof(uint32_t), use_standard_copy) != 0) goto fail;
+        download_acc += (get_us() - t_down0);
     }
 
     for (size_t i = 0; i < num_blocks; ++i) {
@@ -2394,166 +2296,17 @@ static int gpu_decompress_blocks(ocl_env_t* ocl,
     }
 
     {
+        const uint64_t t_down0 = get_us();
         if (hybrid_read_buffer_auto(ocl->queue, ocl->ws.out_buf, out_full, num_blocks * block_size, use_standard_copy) != 0) goto fail;
+        download_acc += (get_us() - t_down0);
     }
+    if (upload_us) *upload_us = upload_acc;
+    if (download_us) *download_us = download_acc;
     free(h_comp_off);
     return 0;
 
 fail:
     free(h_comp_off);
-    return -1;
-}
-
-static int gpu_decompress_blocks_mapped(ocl_env_t* ocl,
-                                        const unsigned char* comp_data,
-                                        size_t comp_data_size,
-                                        const uint32_t* comp_offsets_all,
-                                        const uint32_t* comp_sizes_all,
-                                        size_t total_blocks_all,
-                                        const uint32_t* mapped_block_indices,
-                                        size_t mapped_blocks,
-                                        size_t block_size,
-                                        int local_size,
-                                        unsigned char* out_dense,
-                                        uint32_t* out_sizes,
-                                        uint64_t* kernel_us) {
-    cl_int err = CL_SUCCESS;
-    size_t lsz;
-    size_t gsz;
-    uint32_t block_size_u32;
-    uint32_t total_mapped_u32;
-    int use_standard_copy;
-    const int map_cache_enabled = 1;
-    uint64_t mapped_hash = 0;
-    int mapped_upload_needed = 1;
-    cl_mem prev_block_info_buf = NULL;
-    size_t dense_sz;
-
-    if (!ocl || !comp_data || !comp_offsets_all || !comp_sizes_all || !mapped_block_indices || !out_dense || !out_sizes || !kernel_us) return -1;
-    if (mapped_blocks == 0 || total_blocks_all == 0) {
-        *kernel_us = 0;
-        return 0;
-    }
-    if (mapped_blocks > (size_t)UINT32_MAX) return -1;
-    if (total_blocks_all > (size_t)UINT32_MAX) return -1;
-    if (block_size > (size_t)UINT32_MAX) return -1;
-
-    block_size_u32 = (uint32_t)block_size;
-    total_mapped_u32 = (uint32_t)mapped_blocks;
-    dense_sz = mapped_blocks * block_size;
-    use_standard_copy = hybrid_prefers_standard_copy(ocl->queue);
-
-    ocl->ws.in_buf = ensure_buffer(ocl->ctx, ocl->ws.in_buf, comp_data_size, &ocl->ws.current_in_capacity, &err);
-    if (err != CL_SUCCESS || !ocl->ws.in_buf) goto fail;
-    ocl->ws.out_buf = ensure_buffer(ocl->ctx, ocl->ws.out_buf, mapped_blocks * block_size, &ocl->ws.current_out_capacity, &err);
-    if (err != CL_SUCCESS || !ocl->ws.out_buf) goto fail;
-    ocl->ws.decomp_comp_off_buf = ensure_buffer(ocl->ctx, ocl->ws.decomp_comp_off_buf, total_blocks_all * sizeof(uint32_t), &ocl->ws.current_decomp_comp_off_capacity, &err);
-    if (err != CL_SUCCESS || !ocl->ws.decomp_comp_off_buf) goto fail;
-    ocl->ws.decomp_comp_size_buf = ensure_buffer(ocl->ctx, ocl->ws.decomp_comp_size_buf, total_blocks_all * sizeof(uint32_t), &ocl->ws.current_decomp_comp_size_capacity, &err);
-    if (err != CL_SUCCESS || !ocl->ws.decomp_comp_size_buf) goto fail;
-    prev_block_info_buf = ocl->ws.block_info_buf;
-    ocl->ws.block_info_buf = ensure_buffer(ocl->ctx, ocl->ws.block_info_buf, mapped_blocks * sizeof(uint32_t), &ocl->ws.current_blocks_capacity, &err);
-    if (err != CL_SUCCESS || !ocl->ws.block_info_buf) goto fail;
-    if (ocl->ws.block_info_buf != prev_block_info_buf) {
-        ocl->cached_block_map_valid = 0;
-    }
-    ocl->ws.decomp_sizes_out_buf = ensure_buffer(ocl->ctx, ocl->ws.decomp_sizes_out_buf, mapped_blocks * sizeof(uint32_t), &ocl->ws.current_decomp_sizes_out_capacity, &err);
-    if (err != CL_SUCCESS || !ocl->ws.decomp_sizes_out_buf) goto fail;
-
-    mapped_hash = lz4_hash_u32_array(mapped_block_indices, mapped_blocks);
-    if (map_cache_enabled && ocl->cached_block_map_valid &&
-        ocl->cached_block_map_count == mapped_blocks &&
-        ocl->cached_block_map_hash == mapped_hash) {
-        mapped_upload_needed = 0;
-    }
-
-    if (hybrid_write_buffer_auto(ocl->queue, ocl->ws.in_buf, comp_data, comp_data_size, use_standard_copy) != 0 ||
-        hybrid_write_buffer_auto(ocl->queue, ocl->ws.decomp_comp_off_buf, comp_offsets_all, total_blocks_all * sizeof(uint32_t), use_standard_copy) != 0 ||
-        hybrid_write_buffer_auto(ocl->queue, ocl->ws.decomp_comp_size_buf, comp_sizes_all, total_blocks_all * sizeof(uint32_t), use_standard_copy) != 0) {
-        goto fail;
-    }
-    if (mapped_upload_needed) {
-        if (hybrid_write_buffer_auto(ocl->queue, ocl->ws.block_info_buf, mapped_block_indices, mapped_blocks * sizeof(uint32_t), use_standard_copy) != 0) {
-            goto fail;
-        }
-        if (map_cache_enabled) {
-            ocl->cached_block_map_hash = mapped_hash;
-            ocl->cached_block_map_count = mapped_blocks;
-            ocl->cached_block_map_valid = 1;
-        }
-    }
-
-    err = CL_SUCCESS;
-    err |= clSetKernelArg(ocl->kdec_mapped, 0, sizeof(cl_mem), &ocl->ws.in_buf);
-    err |= clSetKernelArg(ocl->kdec_mapped, 1, sizeof(cl_mem), &ocl->ws.out_buf);
-    err |= clSetKernelArg(ocl->kdec_mapped, 2, sizeof(cl_mem), &ocl->ws.decomp_comp_off_buf);
-    err |= clSetKernelArg(ocl->kdec_mapped, 3, sizeof(cl_mem), &ocl->ws.decomp_comp_size_buf);
-    err |= clSetKernelArg(ocl->kdec_mapped, 4, sizeof(cl_mem), &ocl->ws.block_info_buf);
-    err |= clSetKernelArg(ocl->kdec_mapped, 5, sizeof(cl_mem), &ocl->ws.decomp_sizes_out_buf);
-    err |= clSetKernelArg(ocl->kdec_mapped, 6, sizeof(uint32_t), &block_size_u32);
-    err |= clSetKernelArg(ocl->kdec_mapped, 7, sizeof(uint32_t), &total_mapped_u32);
-    if (err != CL_SUCCESS) goto fail;
-
-    lsz = sanitize_local_size(ocl->queue, (size_t)((local_size > 0) ? local_size : 1), mapped_blocks);
-    gsz = round_up_size(choose_decomp_worker_count(ocl->queue, mapped_blocks, lsz), lsz);
-    if (gsz == 0) gsz = 1;
-
-    {
-        const uint64_t t0 = get_us();
-        err = clEnqueueNDRangeKernel(ocl->queue, ocl->kdec_mapped, 1, NULL, &gsz, &lsz, 0, NULL, NULL);
-        if (err != CL_SUCCESS) goto fail;
-        clFinish(ocl->queue);
-        *kernel_us = get_us() - t0;
-    }
-
-    if (hybrid_read_buffer_auto(ocl->queue, ocl->ws.decomp_sizes_out_buf, out_sizes, mapped_blocks * sizeof(uint32_t), use_standard_copy) != 0) goto fail;
-    for (size_t i = 0; i < mapped_blocks; ++i) {
-        if (out_sizes[i] == 0xFFFFFFFFU) goto fail;
-    }
-
-    if (dense_sz > 0) {
-        cl_int map_err = CL_SUCCESS;
-        void* mapped_out = clEnqueueMapBuffer(ocl->queue,
-                                              ocl->ws.out_buf,
-                                              CL_TRUE,
-                                              CL_MAP_READ,
-                                              0,
-                                              dense_sz,
-                                              0,
-                                              NULL,
-                                              NULL,
-                                              &map_err);
-        if (map_err == CL_SUCCESS && mapped_out) {
-            const unsigned char* dense = (const unsigned char*)mapped_out;
-            for (size_t i = 0; i < mapped_blocks; ++i) {
-                size_t blk = (size_t)mapped_block_indices[i];
-                memcpy(out_dense + blk * block_size,
-                       dense + i * block_size,
-                       (size_t)out_sizes[i]);
-            }
-            map_err = clEnqueueUnmapMemObject(ocl->queue, ocl->ws.out_buf, mapped_out, 0, NULL, NULL);
-            if (map_err != CL_SUCCESS) goto fail;
-            clFinish(ocl->queue);
-        } else {
-            unsigned char* dense_tmp = (unsigned char*)malloc(dense_sz);
-            if (!dense_tmp) goto fail;
-            if (hybrid_read_buffer_auto(ocl->queue, ocl->ws.out_buf, dense_tmp, dense_sz, use_standard_copy) != 0) {
-                free(dense_tmp);
-                goto fail;
-            }
-            for (size_t i = 0; i < mapped_blocks; ++i) {
-                size_t blk = (size_t)mapped_block_indices[i];
-                memcpy(out_dense + blk * block_size,
-                       dense_tmp + i * block_size,
-                       (size_t)out_sizes[i]);
-            }
-            free(dense_tmp);
-        }
-    }
-
-    return 0;
-
-fail:
     return -1;
 }
 
@@ -2660,6 +2413,8 @@ static int hybrid_compress_memory(ocl_env_t* ocl,
         }
 
         if (gpu_blocks > 0) {
+            uint64_t gpu_upload_us = 0;
+            uint64_t gpu_download_us = 0;
             if (cpu_blocks == 0) {
                 gpu_input = (unsigned char*)(uintptr_t)input;
                 gpu_input_size = input_size;
@@ -2680,8 +2435,14 @@ static int hybrid_compress_memory(ocl_env_t* ocl,
                                     &gpu_slots,
                                     &gpu_slot_size,
                                     m ? &m->gpu_kernel_us : &(uint64_t){0},
+                                    &gpu_upload_us,
+                                    &gpu_download_us,
                                     skip_input_upload) != 0) {
                 goto fail;
+            }
+            if (m) {
+                m->data_upload_us += gpu_upload_us;
+                m->data_download_us += gpu_download_us;
             }
         }
 
@@ -2851,6 +2612,8 @@ static int hybrid_decompress_memory(ocl_env_t* ocl,
         }
 
         if (gpu_blocks > 0) {
+            uint64_t gpu_upload_us = 0;
+            uint64_t gpu_download_us = 0;
             if (gpu_decompress_blocks(ocl,
                                       gpu_comp_data,
                                       sizes,
@@ -2859,8 +2622,14 @@ static int hybrid_decompress_memory(ocl_env_t* ocl,
                                       cfg->local_size,
                                       out_full,
                                       gpu_out_sizes,
-                                      m ? &m->gpu_kernel_us : &(uint64_t){0}) != 0) {
+                                      m ? &m->gpu_kernel_us : &(uint64_t){0},
+                                      &gpu_upload_us,
+                                      &gpu_download_us) != 0) {
                 goto fail;
+            }
+            if (m) {
+                m->data_upload_us += gpu_upload_us;
+                m->data_download_us += gpu_download_us;
             }
         }
 
@@ -2913,7 +2682,6 @@ static void show_help(const char* prog) {
     fprintf(stderr, "  --adaptive               Enable adaptive per-file CPU/GPU split\n");
     fprintf(stderr, "  --sample-blocks N        Adaptive sample block count (default: 8)\n");
     fprintf(stderr, "  --gpu-ratio F            Fraction of blocks assigned to GPU (default: 0.5)\n");
-    fprintf(stderr, "  --split-prefix           Use contiguous prefix split (default, low host overhead)\n");
     fprintf(stderr, "  --bench [N]              Benchmark mode with optional N seconds (default: 3)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Streaming:\n");
@@ -2923,8 +2691,43 @@ static void show_help(const char* prog) {
     fprintf(stderr, "Environment knobs:\n");
     fprintf(stderr, "  FORCE_OPENCL_DEVICE=GPU|CPU|DEFAULT|ALL   OpenCL device selection\n");
     fprintf(stderr, "  LZ4_STANDARD_COPY=0|1                      Host-memory copy mode (0=map/zero-copy, 1=standard copy)\n");
-    fprintf(stderr, "  Prefix split index-less fast path and mapped index cache are deterministic-on\n");
     fprintf(stderr, "  -v, --verbose            Verbose output\n");
+}
+
+static void print_hybrid_time_row(FILE* msg, const char* label, uint64_t us, uint64_t total_us) {
+    double ms;
+    double pct;
+    if (!msg || !label) return;
+    ms = (double)us / 1000.0;
+    pct = (total_us > 0) ? (100.0 * (double)us / (double)total_us) : 0.0;
+    fprintf(msg, "  %-18s : %10.3f ms (%6.2f%%)\n", label, ms, pct);
+}
+
+static void print_hybrid_verbose_timing(FILE* msg, const hybrid_metrics_t* met) {
+    uint64_t total_us;
+    uint64_t parallel_us;
+    uint64_t host_overhead_us;
+
+    if (!msg || !met) return;
+
+    parallel_us = met->parallel_us;
+    if (parallel_us < met->cpu_kernel_us) parallel_us = met->cpu_kernel_us;
+    if (parallel_us < met->gpu_kernel_us) parallel_us = met->gpu_kernel_us;
+
+    total_us = met->total_us;
+    if (total_us < parallel_us) total_us = parallel_us;
+    host_overhead_us = (total_us > parallel_us) ? (total_us - parallel_us) : 0;
+
+    print_hybrid_time_row(msg, "File Read", met->file_read_us, total_us);
+    print_hybrid_time_row(msg, "OCI Setup", met->ocl_setup_us, total_us);
+    print_hybrid_time_row(msg, "Data Upload", met->data_upload_us, total_us);
+    print_hybrid_time_row(msg, "GPU Kernel", met->gpu_kernel_us, total_us);
+    print_hybrid_time_row(msg, "CPU Kernel", met->cpu_kernel_us, total_us);
+    print_hybrid_time_row(msg, "Parallel Span", parallel_us, total_us);
+    print_hybrid_time_row(msg, "Data Download", met->data_download_us, total_us);
+    print_hybrid_time_row(msg, "File Write", met->file_write_us, total_us);
+    print_hybrid_time_row(msg, "Host Overhead", host_overhead_us, total_us);
+    fprintf(msg, "  %-18s : %10.3f ms\n", "TOTAL INCLUSIVE", (double)total_us / 1000.0);
 }
 
 static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_seconds) {
@@ -2938,18 +2741,16 @@ static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_sec
     int skip_ocl_adaptive = 0;
 
     struct timespec ts0, ts1;
+    const size_t bench_drop_iterations = 1;
+    size_t total_successful_iterations = 0;
     size_t cap = 16, n = 0;
     double* comp_k = NULL;
-    double* comp_t = NULL;
     double* dec_k = NULL;
-    double* dec_t = NULL;
     double* ratio = NULL;
     double* comp_cpu_us_arr = NULL;
     double* comp_gpu_us_arr = NULL;
     double* dec_cpu_us_arr = NULL;
     double* dec_gpu_us_arr = NULL;
-    double* comp_parallel_us_arr = NULL;
-    double* dec_parallel_us_arr = NULL;
     int verify_ok = 1;
     size_t dec_repeat = 1;
     double adaptive_ratio_sum = 0.0;
@@ -2990,17 +2791,13 @@ static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_sec
     }
 
     comp_k = (double*)malloc(cap * sizeof(double));
-    comp_t = (double*)malloc(cap * sizeof(double));
     dec_k = (double*)malloc(cap * sizeof(double));
-    dec_t = (double*)malloc(cap * sizeof(double));
     ratio = (double*)malloc(cap * sizeof(double));
     comp_cpu_us_arr = (double*)malloc(cap * sizeof(double));
     comp_gpu_us_arr = (double*)malloc(cap * sizeof(double));
     dec_cpu_us_arr = (double*)malloc(cap * sizeof(double));
     dec_gpu_us_arr = (double*)malloc(cap * sizeof(double));
-    comp_parallel_us_arr = (double*)malloc(cap * sizeof(double));
-    dec_parallel_us_arr = (double*)malloc(cap * sizeof(double));
-    if (!comp_k || !comp_t || !dec_k || !dec_t || !ratio || !comp_cpu_us_arr || !comp_gpu_us_arr || !dec_cpu_us_arr || !dec_gpu_us_arr || !comp_parallel_us_arr || !dec_parallel_us_arr) verify_ok = 0;
+    if (!comp_k || !dec_k || !ratio || !comp_cpu_us_arr || !comp_gpu_us_arr || !dec_cpu_us_arr || !dec_gpu_us_arr) verify_ok = 0;
 
     clock_gettime(CLOCK_MONOTONIC, &ts0);
 
@@ -3010,17 +2807,16 @@ static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_sec
         hybrid_metrics_t cm, dm;
         double in_mb;
         uint64_t best_dec_kernel_us = 0;
-        uint64_t best_dec_total_us = 0;
         uint64_t best_dec_cpu_us = 0;
         uint64_t best_dec_gpu_us = 0;
-        uint64_t best_dec_parallel_us = 0;
         int have_dec_sample = 0;
-        const uint64_t ctot0 = get_us();
-        if (hybrid_compress_memory(ocl_ready ? &ocl : NULL, input, input_size, active_cfg, &comp_buf, &comp_size, &cm, 0) != 0) {
-            verify_ok = 0;
-            break;
+        {
+            int skip_upload = (active_cfg->gpu_ratio >= 1.0 && total_successful_iterations > 0) ? 1 : 0;
+            if (hybrid_compress_memory(ocl_ready ? &ocl : NULL, input, input_size, active_cfg, &comp_buf, &comp_size, &cm, skip_upload) != 0) {
+                verify_ok = 0;
+                break;
+            }
         }
-        cm.total_us = get_us() - ctot0;
 
         if (active_cfg->adaptive_split && comp_buf && comp_size >= 16U) {
             uint32_t magic = 0;
@@ -3042,14 +2838,12 @@ static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_sec
             unsigned char* dec_buf = NULL;
             size_t dec_size = 0;
             uint64_t dec_kernel_us;
-            const uint64_t dtot0 = get_us();
 
             if (hybrid_decompress_memory(ocl_ready ? &ocl : NULL, comp_buf, comp_size, active_cfg, &dec_buf, &dec_size, &dm) != 0) {
                 free(dec_buf);
                 verify_ok = 0;
                 break;
             }
-            dm.total_us = get_us() - dtot0;
 
             if (rep == 0 && (dec_size != input_size || memcmp(dec_buf, input, input_size) != 0)) {
                 free(dec_buf);
@@ -3063,9 +2857,7 @@ static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_sec
                 best_dec_kernel_us = dec_kernel_us;
                 best_dec_cpu_us = dm.cpu_kernel_us;
                 best_dec_gpu_us = dm.gpu_kernel_us;
-                best_dec_parallel_us = dm.parallel_us;
             }
-            if (!have_dec_sample || dm.total_us < best_dec_total_us) best_dec_total_us = dm.total_us;
             have_dec_sample = 1;
 
             free(dec_buf);
@@ -3077,20 +2869,23 @@ static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_sec
             break;
         }
 
+        total_successful_iterations += 1;
+        if (total_successful_iterations <= bench_drop_iterations) {
+            free(comp_buf);
+            clock_gettime(CLOCK_MONOTONIC, &ts1);
+            continue;
+        }
+
         if (n == cap) {
             size_t ncap = cap * 2;
             double* p;
             p = (double*)realloc(comp_k, ncap * sizeof(double)); if (!p) { verify_ok = 0; free(comp_buf); break; } comp_k = p;
-            p = (double*)realloc(comp_t, ncap * sizeof(double)); if (!p) { verify_ok = 0; free(comp_buf); break; } comp_t = p;
             p = (double*)realloc(dec_k, ncap * sizeof(double)); if (!p) { verify_ok = 0; free(comp_buf); break; } dec_k = p;
-            p = (double*)realloc(dec_t, ncap * sizeof(double)); if (!p) { verify_ok = 0; free(comp_buf); break; } dec_t = p;
             p = (double*)realloc(ratio, ncap * sizeof(double)); if (!p) { verify_ok = 0; free(comp_buf); break; } ratio = p;
             p = (double*)realloc(comp_cpu_us_arr, ncap * sizeof(double)); if (!p) { verify_ok = 0; free(comp_buf); break; } comp_cpu_us_arr = p;
             p = (double*)realloc(comp_gpu_us_arr, ncap * sizeof(double)); if (!p) { verify_ok = 0; free(comp_buf); break; } comp_gpu_us_arr = p;
             p = (double*)realloc(dec_cpu_us_arr, ncap * sizeof(double)); if (!p) { verify_ok = 0; free(comp_buf); break; } dec_cpu_us_arr = p;
             p = (double*)realloc(dec_gpu_us_arr, ncap * sizeof(double)); if (!p) { verify_ok = 0; free(comp_buf); break; } dec_gpu_us_arr = p;
-            p = (double*)realloc(comp_parallel_us_arr, ncap * sizeof(double)); if (!p) { verify_ok = 0; free(comp_buf); break; } comp_parallel_us_arr = p;
-            p = (double*)realloc(dec_parallel_us_arr, ncap * sizeof(double)); if (!p) { verify_ok = 0; free(comp_buf); break; } dec_parallel_us_arr = p;
             cap = ncap;
         }
 
@@ -3100,16 +2895,12 @@ static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_sec
             if (cm.cpu_kernel_us > comp_kernel_us) comp_kernel_us = cm.cpu_kernel_us;
             comp_k[n] = (comp_kernel_us > 0) ? (in_mb * 1000000.0 / (double)comp_kernel_us) : 0.0;
         }
-        comp_t[n] = (cm.total_us > 0) ? (in_mb * 1000000.0 / (double)cm.total_us) : 0.0;
         dec_k[n] = (best_dec_kernel_us > 0) ? (in_mb * 1000000.0 / (double)best_dec_kernel_us) : 0.0;
-        dec_t[n] = (best_dec_total_us > 0) ? (in_mb * 1000000.0 / (double)best_dec_total_us) : 0.0;
         ratio[n] = (input_size > 0) ? (100.0 * (double)comp_size / (double)input_size) : 0.0;
         comp_cpu_us_arr[n] = (double)cm.cpu_kernel_us;
         comp_gpu_us_arr[n] = (double)cm.gpu_kernel_us;
         dec_cpu_us_arr[n] = (double)best_dec_cpu_us;
         dec_gpu_us_arr[n] = (double)best_dec_gpu_us;
-        comp_parallel_us_arr[n] = (double)cm.parallel_us;
-        dec_parallel_us_arr[n] = (double)best_dec_parallel_us;
         ++n;
 
         free(comp_buf);
@@ -3120,22 +2911,15 @@ static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_sec
 
     clock_gettime(CLOCK_MONOTONIC, &ts1);
     if (n > 0) {
-        printf("Bench Compress : kernel_tp=%.2f MB/s total_tp=%.2f MB/s ratio=%.2f%%\n",
-             max_double(comp_k, n), median_double(comp_t, n), median_double(ratio, n));
-        printf("Bench Decompress : kernel_tp=%.2f MB/s total_tp=%.2f MB/s verify=%s\n",
-             max_double(dec_k, n), median_double(dec_t, n), verify_ok ? "OK" : "FAIL");
+           printf("Bench Compress : kernel_tp=%.2f MB/s ratio=%.2f%%\n",
+               median_double(comp_k, n), median_double(ratio, n));
+           printf("Bench Decompress : kernel_tp=%.2f MB/s verify=%s\n",
+               median_double(dec_k, n), verify_ok ? "OK" : "FAIL");
            printf("Bench Detail : comp_cpu_us=%.0f comp_gpu_us=%.0f dec_cpu_us=%.0f dec_gpu_us=%.0f\n",
                median_double(comp_cpu_us_arr, n),
                median_double(comp_gpu_us_arr, n),
                median_double(dec_cpu_us_arr, n),
                median_double(dec_gpu_us_arr, n));
-          printf("Bench Parallel : comp_tp=%.2f MB/s dec_tp=%.2f MB/s\n",
-                 (median_double(comp_parallel_us_arr, n) > 0.0)
-                     ? (((double)input_size / (1024.0 * 1024.0)) * 1000000.0 / median_double(comp_parallel_us_arr, n))
-                     : 0.0,
-                 (median_double(dec_parallel_us_arr, n) > 0.0)
-                     ? (((double)input_size / (1024.0 * 1024.0)) * 1000000.0 / median_double(dec_parallel_us_arr, n))
-                     : 0.0);
         if (active_cfg->adaptive_split && adaptive_ratio_count > 0) {
             double adaptive_ratio_mean = adaptive_ratio_sum / (double)adaptive_ratio_count;
             printf("Bench Adaptive : gpu_ratio_mean=%.4f min=%.4f max=%.4f samples=%zu\n",
@@ -3149,23 +2933,18 @@ static int run_bench(const char* input_path, hybrid_cfg_t* cfg, double bench_sec
                    adaptive_ratio_max,
                    adaptive_ratio_count);
         }
-        printf("Bench Summary : iterations=%zu seconds=%.2f\n", n, elapsed_sec(&ts0, &ts1));
     } else {
         fprintf(stderr, "bench error: no successful iteration\n");
         verify_ok = 0;
     }
 
     free(comp_k);
-    free(comp_t);
     free(dec_k);
-    free(dec_t);
     free(ratio);
     free(comp_cpu_us_arr);
     free(comp_gpu_us_arr);
     free(dec_cpu_us_arr);
     free(dec_gpu_us_arr);
-    free(comp_parallel_us_arr);
-    free(dec_parallel_us_arr);
     free(input);
     if (ocl_ready) ocl_free(&ocl);
     return verify_ok ? 0 : 1;
@@ -3236,7 +3015,7 @@ int main(int argc, char** argv) {
         } else if (strncmp(argv[i], "--gpu-ratio=", 12) == 0) {
             cfg.gpu_ratio = atof(argv[i] + 12);
         } else if (strcmp(argv[i], "--split-prefix") == 0) {
-            /* Prefix split is the only supported policy. */
+            /* Deprecated: accepted for backward compatibility. */
         } else if (strcmp(argv[i], "--bench") == 0) {
             bench_mode = 1;
             if (i + 1 < argc && argv[i + 1][0] != '-' && is_number_string(argv[i + 1])) {
@@ -3315,12 +3094,23 @@ int main(int argc, char** argv) {
         unsigned char* out_buf = NULL;
         size_t out_sz = 0;
         hybrid_metrics_t met;
-        uint64_t total0 = get_us();
+        uint64_t total_start_us = 0;
+        uint64_t file_read_us = 0;
+        uint64_t ocl_setup_us = 0;
+        uint64_t file_write_us = 0;
+        uint64_t total_end_us = 0;
+        uint64_t total0 = 0;
 
-        if (read_entire_file(input_path, &in_buf, &in_sz) != 0) {
-            fprintf(stderr, "Error: failed to read input file %s (%s)\n", input_path, strerror(errno));
-            return 1;
+        {
+            uint64_t t_read0 = get_us();
+            if (read_entire_file(input_path, &in_buf, &in_sz) != 0) {
+                fprintf(stderr, "Error: failed to read input file %s (%s)\n", input_path, strerror(errno));
+                return 1;
+            }
+            file_read_us = get_us() - t_read0;
+            total_start_us = t_read0;
         }
+        total0 = total_start_us;
 
         run_cfg = cfg;
         skip_ocl_adaptive = (!mode_decompress && adaptive_should_skip_ocl(&cfg, in_sz));
@@ -3348,11 +3138,13 @@ int main(int argc, char** argv) {
         }
 
         if (!(skip_ocl_for_compress || skip_ocl_for_decompress)) {
+            const uint64_t t_ocl0 = get_us();
             if (ocl_init(&ocl) != 0) {
                 fprintf(stderr, "Error: OpenCL init failed\n");
                 free(in_buf);
                 return 1;
             }
+            ocl_setup_us = get_us() - t_ocl0;
             ocl_ready = 1;
         }
 
@@ -3363,20 +3155,30 @@ int main(int argc, char** argv) {
                 goto done;
             }
             met.total_us = get_us() - t0;
+            {
+                const uint64_t t_w0 = get_us();
             if (write_entire_file(output_path, out_buf, out_sz) != 0) {
                 fprintf(stderr, "Error: failed writing output file %s\n", output_path);
                 goto done;
+            }
+                file_write_us = get_us() - t_w0;
+            }
+            met.file_read_us = file_read_us;
+            met.ocl_setup_us = ocl_setup_us;
+            met.file_write_us = file_write_us;
+            total_end_us = get_us();
+            if (total_end_us > total_start_us) {
+                met.total_us = total_end_us - total_start_us;
             }
             if (cfg.verbose) {
                 FILE* msg = output_to_stdout ? stderr : stdout;
                 double in_mb = (double)in_sz / (1024.0 * 1024.0);
                 double k_tp = (met.parallel_us > 0) ? (in_mb * 1000000.0 / (double)met.parallel_us) : 0.0;
-                double t_tp = (met.total_us > 0) ? (in_mb * 1000000.0 / (double)met.total_us) : 0.0;
                 fprintf(msg,
-                        "Hybrid Compress : kernel_tp=%.2f MB/s total_tp=%.2f MB/s ratio=%.2f%%\n",
+                        "Hybrid Compress : kernel_tp=%.2f MB/s ratio=%.2f%%\n",
                         k_tp,
-                        t_tp,
                         (in_sz > 0) ? (100.0 * (double)out_sz / (double)in_sz) : 0.0);
+                print_hybrid_verbose_timing(msg, &met);
             } else {
                 FILE* msg = output_to_stdout ? stderr : stdout;
                 fprintf(msg, "%s : %zu -> %zu in %.2f ms\n", input_path, in_sz, out_sz, (get_us() - total0) / 1000.0);
@@ -3388,16 +3190,27 @@ int main(int argc, char** argv) {
                 goto done;
             }
             met.total_us = get_us() - t0;
+            {
+                const uint64_t t_w0 = get_us();
             if (write_entire_file(output_path, out_buf, out_sz) != 0) {
                 fprintf(stderr, "Error: failed writing output file %s\n", output_path);
                 goto done;
+            }
+                file_write_us = get_us() - t_w0;
+            }
+            met.file_read_us = file_read_us;
+            met.ocl_setup_us = ocl_setup_us;
+            met.file_write_us = file_write_us;
+            total_end_us = get_us();
+            if (total_end_us > total_start_us) {
+                met.total_us = total_end_us - total_start_us;
             }
             if (cfg.verbose) {
                 FILE* msg = output_to_stdout ? stderr : stdout;
                 double out_mb = (double)out_sz / (1024.0 * 1024.0);
                 double k_tp = (met.parallel_us > 0) ? (out_mb * 1000000.0 / (double)met.parallel_us) : 0.0;
-                double t_tp = (met.total_us > 0) ? (out_mb * 1000000.0 / (double)met.total_us) : 0.0;
-                fprintf(msg, "Hybrid Decompress : kernel_tp=%.2f MB/s total_tp=%.2f MB/s\n", k_tp, t_tp);
+                fprintf(msg, "Hybrid Decompress : kernel_tp=%.2f MB/s\n", k_tp);
+                print_hybrid_verbose_timing(msg, &met);
             } else {
                 FILE* msg = output_to_stdout ? stderr : stdout;
                 fprintf(msg, "%s : %zu -> %zu in %.2f ms\n", input_path, in_sz, out_sz, (get_us() - total0) / 1000.0);

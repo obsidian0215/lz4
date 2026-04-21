@@ -1,4 +1,4 @@
-# LZ4 Hybrid 性能总结（Intel + Nvidia）
+﻿# LZ4 Hybrid 性能总结（Intel + Nvidia）
 
 > 代码路径：`/root/lz4/lz4_hybrid`
 > 当前二进制：`/root/lz4/lz4_hybrid/lz4_hybrid`
@@ -27,8 +27,7 @@
 
 - 分区只走 `partition_blocks_prefix()`；
 - 容器头字段 `gblk` 仅表达“GPU 前缀块数”；
-- 解压端按同一前缀边界复原；
-- CLI 仅保留 `--split-prefix` 语义。
+- 解压端按同一前缀边界复原
 
 这意味着文档不再描述其它分区口径，避免“文档多口径、代码单口径”的偏差。
 
@@ -432,33 +431,9 @@ $$
 \frac{sparse\_bytes - packed\_bytes}{sparse\_bytes} \ge 5\%
 $$
 
-##### 3.9.4 pack Host 端缓冲准备
+##### 3.9.4 输出组装与回写
 
-若开启 pack，Host 分配并更新：
-
-1. `packed_offsets_buf`：偏移表；
-2. `packed_out_buf`：紧凑输出区。
-
-偏移通过 `hybrid_write_buffer_auto()` 上传；数据通道可依据设备特性选择 map/unmap 或标准 copy。
-
-##### 3.9.5 pack kernel 参数绑定顺序
-
-`lz4_pack_blocks` 参数按下列顺序绑定：
-
-1. `out_buf`（稀疏输入）
-2. `packed_out_buf`
-3. `packed_offsets_buf`
-4. `output_size_buf`（每块长度）
-5. `singleBlockMaxOut`
-6. `totalBlocks`
-
-参数顺序与 kernel 声明严格一致，避免错位导致的数据破坏。
-
-##### 3.9.6 pack 启动几何
-
-`pack_global = round_up_size(num_blocks, lsz)`，`local_size` 复用主压缩路径的 `lsz`（已过 `sanitize_local_size`）。
-
-语义上是“每个 work-group 处理一个块”，因为 kernel 用 `get_group_id(0)` 作为块索引。
+当前实现由 Host 端按块长度表组装连续 payload，并通过统一读写路径完成输出回写。
 
 ##### 3.9.7 kernel 内部小块路径
 
@@ -622,16 +597,12 @@ pack kernel 时间会累加到 `gpu_kernel_us`；
 | 块数修正 | `lz4_adaptive_adjust_gpu_blocks` |
 | 分区落地 | `partition_blocks_prefix` |
 
-##### 3.13.2 pack 相关
+##### 3.13.2 输出回写相关
 
 | 概念 | 代码符号 |
 | --- | --- |
-| 启停判定 | `lz4_should_use_device_compaction` |
-| 稀疏输出缓冲 | `ocl->ws.out_buf` |
+| 输出缓冲 | `ocl->ws.out_buf` |
 | 长度缓冲 | `ocl->ws.output_size_buf` |
-| 偏移缓冲 | `ocl->ws.packed_offsets_buf` |
-| 紧凑输出缓冲 | `ocl->ws.packed_out_buf` |
-| pack kernel | `lz4_pack_blocks` |
 | 回读策略 | `hybrid_read_buffer_auto` |
 
 ##### 3.13.3 常量与门限
@@ -640,8 +611,6 @@ pack kernel 时间会累加到 `gpu_kernel_us`；
 | --- | ---: | --- |
 | `min_mixed` | 8 | 混合分配最小块数 |
 | `quantum` | 4 | 块数量化步长 |
-| `min_blocks` | 8 | pack 最小块门限 |
-| `min_gain_pct` | 5 | pack 最小节省比例 |
 | `perf_weight_pct` | 70 | adaptive 性能权重 |
 | `energy_weight_pct` | 30 | adaptive 能效权重 |
 | `dec_host_penalty_pct` | 15 | 保守修正项 |
@@ -650,8 +619,7 @@ pack kernel 时间会累加到 `gpu_kernel_us`；
 
 1. `choose_adaptive_gpu_ratio`：确认公式与权重是否被改；
 2. `lz4_adaptive_adjust_gpu_blocks`：确认门限与量化是否被改；
-3. `gpu_compress_blocks` 中 pack 判定分支：确认阈值是否被改；
-4. `lz4_gpu.cl` 的 `lz4_pack_blocks`：确认小块路径和向量路径是否被改。
+3. `gpu_compress_blocks` 的输出回写分支：确认缓冲与偏移计算是否被改。
 
 #### 3.14 常见误解与校正
 
@@ -814,26 +782,9 @@ pack kernel 时间会累加到 `gpu_kernel_us`；
 
 因此上层容器组装完全不关心“是否走过 pack”。
 
-#### 3.18 `lz4_pack_blocks` 内核级拆解
+#### 3.18 输出路径说明
 
-##### 3.18.1 块映射方式
-
-kernel 使用 `blk = get_group_id(0)`，即每个 work-group 负责一个压缩块。
-
-组内线程（lane）共同搬运该块，避免跨块同步。
-
-##### 3.18.2 地址计算
-
-每块地址由两条公式给出：
-
-1. 稀疏源地址：`src = sparse_output + blk * singleBlockMaxOut`；
-2. 紧凑目标地址：`dst = packed_output + packed_offsets[blk]`。
-
-只要偏移表合法，就可保证块间目标区间不重叠。
-
-##### 3.18.3 小块优化路径
-
-`sz <= 32` 时只让 `lane==0` 执行。
+当前输出路径由主机端按 `blockSizes` 顺序组装，重点审查偏移计算、边界检查与写回一致性。
 
 执行序：
 
@@ -945,9 +896,8 @@ kernel 内部并不检查 `sz > singleBlockMaxOut`。因此必须依赖 Host 端
 
 1. 先看 `choose_adaptive_gpu_ratio` 是否改了权重或惩罚；
 2. 再看 `lz4_adaptive_adjust_gpu_blocks` 是否改了 `min_mixed/quantum`；
-3. 再看 `lz4_should_use_device_compaction` 的 `min_blocks/min_gain_pct`；
-4. 再看 `lz4_pack_blocks` 小块与向量路径是否被改；
-5. 最后看容器写入与读取顺序是否保持对偶。
+3. 再看输出回写中的偏移/长度处理；
+4. 最后看容器写入与读取顺序是否保持对偶。
 
 按这个顺序审，可以最快定位“策略漂移”和“语义漂移”。
 
@@ -1107,11 +1057,11 @@ HYBRID（按 `CF/GF` 频点对聚合）结果：
 
 #### 4.7 Hybrid 内部：adaptive vs fixed(R=0.5)
 
-按文件/频点/线程配对，共 `600` 对：
+按 `T=1` 口径配对：
 
-1. 总体：`dComp mean=-0.54%`，`median=+0.59%`；`dDec mean=+0.88%`，`median=-0.05%`；`dRatio mean=+0.0400 pctpt`
-2. 胜场：`Comp 348/600`，`Dec 296/600`
-3. 分线程：`T1(dComp=-2.58%，dDec=+0.72%)`，`T2(dComp=+1.49%，dDec=+1.04%)`
+1. 压缩：`dComp=-2.58%`
+2. 解压：`dDec=+0.72%`
+3. 压缩率：维持稳定，无异常偏移
 
 结论：adaptive 已接近可用，但方差与长尾回退仍需约束，不宜直接全局默认。
 

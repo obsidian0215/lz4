@@ -1,0 +1,67 @@
+{
+  "id": "<variant_id>",
+  "repo": "lz4",
+  "engine": "lz4_gpu",
+  "device_vendor": "intel",
+  "component": "<kernel|host>",
+  "optimization_object": "<kernel_comp|kernel_dec|host>",
+  "stage": "<hash_table|search_probe|sequence_decision|match_count|literal_emit|match_emit|token_decode|literal_copy|match_copy|tail_boundary|file_io|buffer_lifecycle|host_device_transfer|dispatch_sync|host_feature>",
+  "operation": "<fingerprint_disable|primary_secondary_hash|hash_mix|hash_table_overhead|copy_match_branch_prune|standard_copy_vs_mapped|other>",
+  "status": "<pending|tested|watch|reject|adopt>",
+  "based_on": "<baseline_variant_id>",
+  "variant_dir_relpath": "intel/variants/<kernel_comp|kernel_dec|host>/<variant_id>",
+  "component_record_doc": "<KERNEL_VARIANTS.md|HOST_VARIANTS.md>",
+  "detail_record_relpath": "intel/records/<kernel_comp|kernel_dec|host>/<variant_id>.md",
+  "binary_relpath": "<relative/path/to/lz4_gpu>",
+  "kernel_artifacts": [
+    "<lz4_gpu.cl or clbin>"
+  ],
+  "default_args": [
+    "--bench",
+    "5",
+    "-B",
+    "64K",
+    "--local",
+    "1",
+    "-a",
+    "1"
+  ],
+  "formal_fixed_params": {
+    "block_size": "64K",
+    "local_size": 1,
+    "acceleration": 1
+  },
+  "special_axis_tags": [
+    "<hash_table_overhead_if_applicable>"
+  ],
+  "program_artifacts": [
+    "<required for host variants>"
+  ],
+  "source_record": {
+    "source_files": [
+      "<host or kernel source file>"
+    ],
+    "build_notes": "<how to rebuild this variant>",
+    "diff_summary": "<one-line patch summary>"
+  },
+  "manual_protocol": {
+    "kernel_rounds": 5,
+    "host_rounds": 7,
+    "control_sequence": [
+      "control_a",
+      "candidate",
+      "control_b"
+    ]
+  },
+  "automation_entrypoints": {
+    "nvidia": {
+      "kernel_comp": "nvidia/scripts/kernel_comp/validate_lz4_kernel_comp_stable.ps1",
+      "kernel_dec": "nvidia/scripts/kernel_dec/validate_lz4_kernel_dec_stable.ps1",
+      "host": "nvidia/scripts/host/validate_lz4_host_stable.ps1"
+    }
+  },
+  "required_env": {
+    "SAMPLES_ROOT": "/root/samples"
+  },
+  "notes": "<host 正式变体优先填写 standard_copy_vs_mapped / hash_table_overhead；metadata/telemetry/bench-only 修正不要作为正式 host 变体>"
+}

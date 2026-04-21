@@ -1,0 +1,60 @@
+{
+  "id": "<variant_id>",
+  "repo": "lz4",
+  "engine": "lz4_hybrid",
+  "device_vendor": "intel",
+  "component": "<host|scheduler>",
+  "optimization_object": "<host|scheduler>",
+  "stage": "<file_io|buffer_lifecycle|host_device_transfer|dispatch_sync|host_feature|work_partition|execution_model|fallback_policy>",
+  "operation": "<standard_copy_vs_mapped|hash_table_overhead|ratio_policy|fallback_threshold|other>",
+  "status": "<pending|tested|watch|reject|adopt>",
+  "based_on": "<baseline_variant_id>",
+  "variant_dir_relpath": "intel/variants/<host|scheduler>/<variant_id>",
+  "component_record_doc": "<HOST_VARIANTS.md|SCHEDULER_VARIANTS.md>",
+  "detail_record_relpath": "intel/records/<host|scheduler>/<variant_id>.md",
+  "binary_relpath": "<relative/path/to/lz4_hybrid executable>",
+  "default_args": [
+    "-b",
+    "64K",
+    "-l",
+    "1",
+    "-a",
+    "1"
+  ],
+  "formal_fixed_params": {
+    "block_size": "64K",
+    "local_size": 1,
+    "acceleration": 1
+  },
+  "special_axis_tags": [
+    "<hash_table_overhead_if_applicable>"
+  ],
+  "program_artifacts": [
+    "<required for host/scheduler variants>"
+  ],
+  "source_record": {
+    "source_files": [
+      "<host or scheduler source file>"
+    ],
+    "build_notes": "<how to rebuild this variant>",
+    "diff_summary": "<one-line patch summary>"
+  },
+  "manual_protocol": {
+    "rounds": 7,
+    "measurements": [
+      "segment_times",
+      "total_time",
+      "ratio"
+    ]
+  },
+  "automation_entrypoints": {
+    "nvidia": {
+      "host": "nvidia/scripts/host/validate_lz4_hybrid_host_stable.ps1",
+      "scheduler": "nvidia/scripts/scheduler/validate_lz4_hybrid_scheduler_stable.ps1"
+    }
+  },
+  "required_env": {
+    "SAMPLES_ROOT": "/root/samples"
+  },
+  "notes": "<host 正式变体优先填写 standard_copy_vs_mapped / hash_table_overhead；metadata/telemetry/bench-only 修正不要作为正式 host 变体>"
+}

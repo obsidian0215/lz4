@@ -10,30 +10,47 @@
 #include <windows.h>
 #endif
 #include "lz4_gpu_core.h"
+#include "lz4_gpu_debug.h"
 #include "lz4_gpu_utils.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
 
-enum {
-    LZ4_DBG_COMP_SEARCH_ITERS = 0,
-    LZ4_DBG_COMP_FP_CHECKS,
-    LZ4_DBG_COMP_MATCH_FOUND,
-    LZ4_DBG_COMP_LITERAL_BYTES,
-    LZ4_DBG_COMP_MATCH_BYTES,
-    LZ4_DBG_COMP_LASTLIT_BYTES,
-    LZ4_DBG_COMP_N
-};
+static int lz4_write_blocks_packed(FILE* fout,
+                                   const uint8_t* base,
+                                   const uint32_t* offsets,
+                                   const uint32_t* sizes,
+                                   size_t count);
+static int lz4_env_flag_value(const char* name, int* is_set);
 
-enum {
-    LZ4_DBG_DEC_TOKENS = 0,
-    LZ4_DBG_DEC_LITERAL_BYTES,
-    LZ4_DBG_DEC_MATCH_BYTES,
-    LZ4_DBG_DEC_SMALL_OFFSETS,
-    LZ4_DBG_DEC_OUTPUT_ERROR,
-    LZ4_DBG_DEC_N
-};
+lz4_gpu_debug_config_t lz4_gpu_get_debug_config(void) {
+    lz4_gpu_debug_config_t cfg;
+    int debug_is_set = 0;
+    int limit_is_set = 0;
+    cfg.enabled = 0;
+    cfg.block_limit = 0;
+
+    cfg.enabled = lz4_env_flag_value("LZ4_GPU_DEBUG", &debug_is_set);
+    if (!debug_is_set) cfg.enabled = 0;
+
+    {
+        const char* env = getenv("LZ4_GPU_DEBUG_BLOCK_LIMIT");
+        if (env && *env) {
+            char* end = NULL;
+            unsigned long parsed = strtoul(env, &end, 10);
+            if (end != env && *end == '\0') {
+                cfg.block_limit = (int)parsed;
+                limit_is_set = 1;
+            }
+        }
+    }
+
+    if (cfg.block_limit > 0 && limit_is_set && !debug_is_set) {
+        cfg.enabled = 1;
+    }
+    return cfg;
+}
 
 void lz4_gpu_workspace_init(lz4_gpu_workspace_t* ws) {
     memset(ws, 0, sizeof(*ws));
@@ -44,10 +61,8 @@ void lz4_gpu_workspace_free(lz4_gpu_workspace_t* ws) {
     if (ws->in_buf) clReleaseMemObject(ws->in_buf);
     if (ws->comp_in_buf) clReleaseMemObject(ws->comp_in_buf);
     if (ws->out_buf) clReleaseMemObject(ws->out_buf);
-    if (ws->packed_out_buf) clReleaseMemObject(ws->packed_out_buf);
     if (ws->block_info_buf) clReleaseMemObject(ws->block_info_buf);
     if (ws->out_offsets_buf) clReleaseMemObject(ws->out_offsets_buf);
-    if (ws->packed_offsets_buf) clReleaseMemObject(ws->packed_offsets_buf);
     if (ws->output_size_buf) clReleaseMemObject(ws->output_size_buf);
     if (ws->dict_buf) clReleaseMemObject(ws->dict_buf);
     if (ws->decomp_comp_off_buf) clReleaseMemObject(ws->decomp_comp_off_buf);
@@ -87,155 +102,6 @@ static int lz4_env_flag_value(const char* name, int* is_set) {
     if (strcmp(env, "1") == 0 || strcasecmp(env, "true") == 0 || strcasecmp(env, "yes") == 0 || strcasecmp(env, "on") == 0) return 1;
     if (strcmp(env, "0") == 0 || strcasecmp(env, "false") == 0 || strcasecmp(env, "no") == 0 || strcasecmp(env, "off") == 0) return 0;
     return atoi(env) != 0;
-}
-
-static unsigned lz4_env_unsigned_value(const char* name, unsigned defv) {
-    const char* env = getenv(name);
-    char* end = NULL;
-    unsigned long parsed;
-    if (!env || !*env) return defv;
-    parsed = strtoul(env, &end, 10);
-    if (end == env || *end != '\0' || parsed > UINT_MAX) return defv;
-    return (unsigned)parsed;
-}
-
-typedef struct {
-    double mean_bytes;
-    double mad_ratio;
-    double fill_ratio;
-    double active_ratio;
-} lz4_compaction_stats_t;
-
-static lz4_compaction_stats_t lz4_collect_compaction_stats(const uint32_t* block_sizes,
-                                                           size_t num_blocks,
-                                                           size_t packed_bytes,
-                                                           size_t sparse_bytes) {
-    lz4_compaction_stats_t s;
-    unsigned long long sum_abs = 0;
-    unsigned long long mean_int = 0;
-    size_t active_blocks = 0;
-
-    s.mean_bytes = 0.0;
-    s.mad_ratio = 0.0;
-    s.fill_ratio = 0.0;
-    s.active_ratio = 0.0;
-
-    if (!block_sizes || num_blocks == 0 || sparse_bytes == 0) {
-        return s;
-    }
-
-    mean_int = (unsigned long long)(packed_bytes / num_blocks);
-    s.mean_bytes = (double)packed_bytes / (double)num_blocks;
-    s.fill_ratio = (double)packed_bytes / (double)sparse_bytes;
-
-    for (size_t i = 0; i < num_blocks; ++i) {
-        unsigned long long v = (unsigned long long)block_sizes[i];
-        if (v > 0) active_blocks++;
-        if (v >= mean_int) {
-            sum_abs += (v - mean_int);
-        } else {
-            sum_abs += (mean_int - v);
-        }
-    }
-
-    s.active_ratio = (double)active_blocks / (double)num_blocks;
-    if (mean_int > 0) {
-        s.mad_ratio = ((double)sum_abs / (double)num_blocks) / (double)mean_int;
-    }
-
-    return s;
-}
-
-static unsigned lz4_compaction_adaptive_gain_pct(unsigned base_gain_pct,
-                                                 int use_standard_copy,
-                                                 const lz4_compaction_stats_t* stats) {
-    int gain = (int)base_gain_pct;
-
-    if (use_standard_copy) {
-        gain -= 2;
-    } else {
-        gain += 1;
-    }
-
-    if (stats) {
-        if (stats->fill_ratio <= 0.60) gain -= 3;
-        else if (stats->fill_ratio <= 0.72) gain -= 2;
-        else if (stats->fill_ratio >= 0.90) gain += 2;
-
-        if (stats->active_ratio <= 0.65) gain -= 2;
-        else if (stats->active_ratio <= 0.85) gain -= 1;
-
-        if (stats->mad_ratio >= 0.65) gain -= 1;
-        else if (stats->mad_ratio <= 0.18) gain += 1;
-    }
-
-    if (gain < 2) gain = 2;
-    if (gain > 35) gain = 35;
-    return (unsigned)gain;
-}
-
-static int lz4_compaction_trace_enabled(void) {
-    int is_set = 0;
-    int v = lz4_env_flag_value("LZ4_GPU_TRACE_COMPACTION", &is_set);
-    return is_set ? v : 0;
-}
-
-static int lz4_should_use_device_compaction(size_t packed_bytes,
-                                            size_t sparse_bytes,
-                                            size_t num_blocks,
-                                            cl_kernel pack_kernel,
-                                            int use_standard_copy,
-                                            const lz4_compaction_stats_t* stats,
-                                            unsigned* out_gain_pct) {
-    int force_set = 0;
-    int force_value = lz4_env_flag_value("LZ4_GPU_FORCE_COMPACTION", &force_set);
-    int enable_set = 0;
-    int enable_value = lz4_env_flag_value("LZ4_GPU_ENABLE_COMPACTION", &enable_set);
-    int enable_compaction = enable_set ? enable_value : 1;
-    unsigned adaptive_gain_pct = 0;
-    size_t saved_bytes;
-
-    if (!pack_kernel) return 0;
-    if (force_set) {
-        if (out_gain_pct) *out_gain_pct = 0;
-        return force_value;
-    }
-    if (!enable_compaction) return 0;
-    if (packed_bytes == 0 || sparse_bytes == 0 || packed_bytes >= sparse_bytes) return 0;
-
-    {
-        unsigned min_blocks = lz4_env_unsigned_value("LZ4_GPU_COMPACTION_MIN_BLOCKS", 8U);
-        unsigned min_gain_pct = lz4_env_unsigned_value("LZ4_GPU_COMPACTION_MIN_GAIN_PCT", 8U);
-        unsigned min_sparse_kb = lz4_env_unsigned_value("LZ4_GPU_COMPACTION_MIN_SPARSE_KB", 1024U);
-        unsigned min_saved_kb = lz4_env_unsigned_value("LZ4_GPU_COMPACTION_MIN_SAVED_KB", 512U);
-
-        if (num_blocks < (size_t)min_blocks) return 0;
-        if (sparse_bytes < (size_t)min_sparse_kb * 1024ULL) return 0;
-
-        saved_bytes = sparse_bytes - packed_bytes;
-        if (saved_bytes < (size_t)min_saved_kb * 1024ULL) return 0;
-
-        adaptive_gain_pct = lz4_compaction_adaptive_gain_pct(min_gain_pct, use_standard_copy, stats);
-        if (out_gain_pct) *out_gain_pct = adaptive_gain_pct;
-
-        if (saved_bytes * 100U < sparse_bytes * (size_t)adaptive_gain_pct) {
-            return 0;
-        }
-
-        /*
-         * 统一且致密的块分布下，pack 内核额外调度可能覆盖掉微小节省收益；
-         * 对这种模式增加一个收益下限，避免在“几乎无洞”的布局上误触发 compaction。
-         */
-        if (stats &&
-            stats->fill_ratio >= 0.93 &&
-            stats->active_ratio >= 0.95 &&
-            stats->mad_ratio <= 0.10 &&
-            saved_bytes < num_blocks * 96ULL) {
-            return 0;
-        }
-
-        return 1;
-    }
 }
 
 cl_mem ensure_buffer_ex(cl_context context, cl_mem buf, size_t size, size_t* current_capacity, cl_mem_flags flags, int alloc_host_ptr, cl_int* err) {
@@ -358,20 +224,6 @@ static size_t sanitize_local_size(cl_command_queue queue, size_t requested, size
     return p2;
 }
 
-static size_t parse_wi_per_cu_env(const char* primary_env, const char* fallback_env, size_t defv) {
-    const char* env = NULL;
-    char* end = NULL;
-    unsigned long parsed;
-
-    if (primary_env && *primary_env) env = getenv(primary_env);
-    if ((!env || !*env) && fallback_env && *fallback_env) env = getenv(fallback_env);
-    if (!env || !*env) return defv;
-
-    parsed = strtoul(env, &end, 10);
-    if (end != env && parsed > 0) return (size_t)parsed;
-    return defv;
-}
-
 static size_t choose_comp_worker_count(cl_command_queue queue, size_t num_blocks, size_t local_size) {
     if (num_blocks == 0) return 1;
 
@@ -382,15 +234,116 @@ static size_t choose_comp_worker_count(cl_command_queue queue, size_t num_blocks
     }
     if (cu == 0) cu = 1;
 
-    /* Compression default tuned by fixed-baseline 50x5: wi_per_cu=24 gives better comp/dec balance on current target. */
-    size_t default_wi_per_cu = 24;
-    size_t wi_per_cu = parse_wi_per_cu_env("LZ4_GPU_COMP_WI_PER_CU", "LZ4_GPU_WI_PER_CU", default_wi_per_cu);
-
-    size_t target = (size_t)cu * wi_per_cu;
+    /* Fixed compression launch ceiling kept from the current baseline: 24 lanes per CU. */
+    size_t target = (size_t)cu * 24U;
     if (target < local_size) target = local_size;
     if (target > num_blocks) target = num_blocks;
     if (target == 0) target = 1;
     return target;
+}
+
+static size_t choose_comp_dict_pool_budget_bytes(cl_command_queue queue) {
+    int env_set = 0;
+    size_t env_mb = 0;
+    const size_t MB = (size_t)1024U * 1024U;
+    const size_t min_budget = 16U * MB;
+    const size_t max_budget = 512U * MB;
+
+    {
+        const char* env = getenv("LZ4_GPU_COMP_DICT_POOL_MB");
+        if (env && *env) {
+            char* end = NULL;
+            unsigned long parsed = strtoul(env, &end, 10);
+            if (end != env && *end == '\0') {
+                env_set = 1;
+                env_mb = (size_t)parsed;
+            }
+        }
+    }
+
+    if (env_set && env_mb > 0) {
+        size_t b = env_mb * MB;
+        if (b < min_budget) b = min_budget;
+        if (b > max_budget) b = max_budget;
+        return b;
+    }
+
+    {
+        cl_device_id qdev = NULL;
+        cl_ulong global_mem = 0;
+        if (clGetCommandQueueInfo(queue, CL_QUEUE_DEVICE, sizeof(qdev), &qdev, NULL) == CL_SUCCESS && qdev &&
+            clGetDeviceInfo(qdev, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(global_mem), &global_mem, NULL) == CL_SUCCESS &&
+            global_mem > 0) {
+            size_t b = (size_t)(global_mem / 32U);
+            if (b < min_budget) b = min_budget;
+            if (b > max_budget) b = max_budget;
+            return b;
+        }
+    }
+
+    return 64U * MB;
+}
+
+typedef struct {
+    size_t raw_worker_count;
+    size_t active_lane_count;
+    size_t launched_wi_count;
+    size_t dict_owner_count;
+    size_t dict_entries_per_owner;
+    size_t dict_bytes_per_owner;
+    size_t dict_total_bytes;
+    size_t dict_budget_bytes;
+    size_t padding_wi_count;
+    uint32_t blocks_per_owner;
+} lz4_comp_plan_t;
+
+static size_t choose_comp_dict_owner_count(size_t raw_worker_count,
+                                           size_t dict_pool_budget_bytes,
+                                           size_t dict_bytes_per_owner) {
+    size_t budget_owners;
+
+    if (raw_worker_count == 0) return 1;
+    if (dict_bytes_per_owner == 0) return raw_worker_count;
+
+    budget_owners = dict_pool_budget_bytes / dict_bytes_per_owner;
+    if (budget_owners == 0) budget_owners = 1;
+    if (budget_owners > raw_worker_count) budget_owners = raw_worker_count;
+    return budget_owners;
+}
+
+static lz4_comp_plan_t lz4_build_comp_plan(cl_command_queue queue,
+                                           size_t file_size,
+                                           size_t block_size,
+                                           size_t num_blocks,
+                                           size_t local_size) {
+    const int hash_log = 14;
+    lz4_comp_plan_t plan;
+    int table_type = (block_size <= 65536) ? 0 : 1;
+    size_t dict_pool_budget_bytes;
+
+    memset(&plan, 0, sizeof(plan));
+    dict_pool_budget_bytes = choose_comp_dict_pool_budget_bytes(queue);
+    plan.dict_entries_per_owner = (size_t)1U << (table_type == 0 ? (hash_log + 1) : hash_log);
+    plan.dict_bytes_per_owner = plan.dict_entries_per_owner * sizeof(cl_uint);
+    plan.raw_worker_count = choose_comp_worker_count(queue, num_blocks, local_size);
+    plan.dict_owner_count = choose_comp_dict_owner_count(plan.raw_worker_count,
+                                                         dict_pool_budget_bytes,
+                                                         plan.dict_bytes_per_owner);
+    plan.active_lane_count = plan.dict_owner_count;
+    if (plan.active_lane_count == 0) plan.active_lane_count = 1;
+    plan.launched_wi_count = round_up_size(plan.active_lane_count, local_size);
+    if (plan.launched_wi_count == 0) plan.launched_wi_count = local_size ? local_size : 1;
+    if (plan.launched_wi_count < plan.active_lane_count) {
+        plan.launched_wi_count = plan.active_lane_count;
+    }
+    plan.padding_wi_count = (plan.launched_wi_count > plan.active_lane_count)
+        ? (plan.launched_wi_count - plan.active_lane_count)
+        : 0;
+    plan.dict_total_bytes = plan.dict_owner_count * plan.dict_bytes_per_owner;
+    plan.dict_budget_bytes = dict_pool_budget_bytes;
+    plan.blocks_per_owner = (uint32_t)((num_blocks + plan.active_lane_count - 1) / plan.active_lane_count);
+    if (plan.blocks_per_owner == 0) plan.blocks_per_owner = 1;
+    return plan;
 }
 
 static size_t choose_decomp_worker_count(cl_command_queue queue, size_t num_blocks, size_t local_size) {
@@ -403,10 +356,9 @@ static size_t choose_decomp_worker_count(cl_command_queue queue, size_t num_bloc
     }
     if (cu == 0) cu = 1;
 
-    size_t default_wi_per_cu = (num_blocks >= 4096) ? 48 : 96;
-    size_t wi_per_cu = parse_wi_per_cu_env("LZ4_GPU_DECOMP_WI_PER_CU", "LZ4_GPU_WI_PER_CU", default_wi_per_cu);
-
-    size_t target = (size_t)cu * wi_per_cu;
+    /* Fixed decompression launch ceiling kept from the current baseline: 96 lanes per CU for smaller workloads,
+     * 48 lanes per CU for very large workloads. */
+    size_t target = (size_t)cu * ((num_blocks >= 4096) ? 48U : 96U);
     if (target < local_size) target = local_size;
     if (target > num_blocks) target = num_blocks;
     if (target == 0) target = 1;
@@ -414,13 +366,33 @@ static size_t choose_decomp_worker_count(cl_command_queue queue, size_t num_bloc
 }
 
 static int lz4_debug_counters_enabled(void) {
-    return 0;
+    return lz4_gpu_get_debug_config().enabled;
 }
 
-static void lz4_print_comp_debug_stats(const uint32_t* stats, int num_blocks) {
+static void lz4_print_comp_debug_blocks(const uint32_t* stats, int num_blocks, int block_limit) {
+    int shown = (block_limit < num_blocks) ? block_limit : num_blocks;
+    for (int i = 0; i < shown; ++i) {
+        const size_t base = (size_t)i * LZ4_DBG_COMP_N;
+        fprintf(stderr,
+                "[LZ4-DBG][COMP][BLOCK %d] search_iters=%u hash_tag_hits=%u distance_rejects=%u match_found=%u hash_inserts=%u literal_bytes=%u match_bytes=%u last_literals=%u\n",
+                i,
+                stats[base + LZ4_DBG_COMP_SEARCH_ITERS],
+                stats[base + LZ4_DBG_COMP_HASH_TAG_HITS],
+                stats[base + LZ4_DBG_COMP_HASH_DISTANCE_REJECTS],
+                stats[base + LZ4_DBG_COMP_MATCH_FOUND],
+                stats[base + LZ4_DBG_COMP_HASH_INSERTS],
+                stats[base + LZ4_DBG_COMP_LITERAL_BYTES],
+                stats[base + LZ4_DBG_COMP_MATCH_BYTES],
+                stats[base + LZ4_DBG_COMP_LASTLIT_BYTES]);
+    }
+}
+
+static void lz4_print_comp_debug_stats(const uint32_t* stats, int num_blocks, int block_limit) {
     unsigned long long search_iters = 0;
-    unsigned long long fp_checks = 0;
+    unsigned long long hash_tag_hits = 0;
+    unsigned long long distance_rejects = 0;
     unsigned long long match_found = 0;
+    unsigned long long hash_inserts = 0;
     unsigned long long literal_bytes = 0;
     unsigned long long match_bytes = 0;
     unsigned long long lastlit_bytes = 0;
@@ -428,33 +400,60 @@ static void lz4_print_comp_debug_stats(const uint32_t* stats, int num_blocks) {
     for (int i = 0; i < num_blocks; ++i) {
         const size_t base = (size_t)i * LZ4_DBG_COMP_N;
         search_iters += stats[base + LZ4_DBG_COMP_SEARCH_ITERS];
-        fp_checks += stats[base + LZ4_DBG_COMP_FP_CHECKS];
+        hash_tag_hits += stats[base + LZ4_DBG_COMP_HASH_TAG_HITS];
+        distance_rejects += stats[base + LZ4_DBG_COMP_HASH_DISTANCE_REJECTS];
         match_found += stats[base + LZ4_DBG_COMP_MATCH_FOUND];
+        hash_inserts += stats[base + LZ4_DBG_COMP_HASH_INSERTS];
         literal_bytes += stats[base + LZ4_DBG_COMP_LITERAL_BYTES];
         match_bytes += stats[base + LZ4_DBG_COMP_MATCH_BYTES];
         lastlit_bytes += stats[base + LZ4_DBG_COMP_LASTLIT_BYTES];
     }
 
     double avg_search = (num_blocks > 0) ? ((double)search_iters / (double)num_blocks) : 0.0;
-    double hit_rate = (fp_checks > 0) ? ((double)match_found / (double)fp_checks) : 0.0;
+    double tag_hit_rate = (search_iters > 0) ? ((double)hash_tag_hits / (double)search_iters) : 0.0;
+    double match_rate = (search_iters > 0) ? ((double)match_found / (double)search_iters) : 0.0;
     fprintf(stderr,
-            "[LZ4-DBG][COMP] blocks=%d search_iters=%llu fp_checks=%llu match_found=%llu hit_rate=%.4f literals=%llu matches=%llu last_literals=%llu avg_search/block=%.2f\n",
+            "[LZ4-DBG][COMP] blocks=%d search_iters=%llu hash_tag_hits=%llu distance_rejects=%llu match_found=%llu hash_inserts=%llu tag_hit/search=%.4f match/search=%.4f literals=%llu matches=%llu last_literals=%llu avg_search/block=%.2f\n",
             num_blocks,
             search_iters,
-            fp_checks,
+            hash_tag_hits,
+            distance_rejects,
             match_found,
-            hit_rate,
+            hash_inserts,
+            tag_hit_rate,
+            match_rate,
             literal_bytes,
             match_bytes,
             lastlit_bytes,
             avg_search);
+
+    if (block_limit > 0) lz4_print_comp_debug_blocks(stats, num_blocks, block_limit);
 }
 
-static void lz4_print_dec_debug_stats(const uint32_t* stats, int num_blocks) {
+static void lz4_print_dec_debug_blocks(const uint32_t* stats, int num_blocks, int block_limit) {
+    int shown = (block_limit < num_blocks) ? block_limit : num_blocks;
+    for (int i = 0; i < shown; ++i) {
+        const size_t base = (size_t)i * LZ4_DBG_DEC_N;
+        fprintf(stderr,
+                "[LZ4-DBG][DECOMP][BLOCK %d] tokens=%u literal_bytes=%u match_bytes=%u small_offsets=%u fast_literals=%u fast_matches=%u output_errors=%u\n",
+                i,
+                stats[base + LZ4_DBG_DEC_TOKENS],
+                stats[base + LZ4_DBG_DEC_LITERAL_BYTES],
+                stats[base + LZ4_DBG_DEC_MATCH_BYTES],
+                stats[base + LZ4_DBG_DEC_SMALL_OFFSETS],
+                stats[base + LZ4_DBG_DEC_FAST_LITERAL_PATHS],
+                stats[base + LZ4_DBG_DEC_FAST_MATCH_PATHS],
+                stats[base + LZ4_DBG_DEC_OUTPUT_ERROR]);
+    }
+}
+
+static void lz4_print_dec_debug_stats(const uint32_t* stats, int num_blocks, int block_limit) {
     unsigned long long tokens = 0;
     unsigned long long literal_bytes = 0;
     unsigned long long match_bytes = 0;
     unsigned long long small_offsets = 0;
+    unsigned long long fast_literals = 0;
+    unsigned long long fast_matches = 0;
     unsigned long long output_errors = 0;
 
     for (int i = 0; i < num_blocks; ++i) {
@@ -463,21 +462,88 @@ static void lz4_print_dec_debug_stats(const uint32_t* stats, int num_blocks) {
         literal_bytes += stats[base + LZ4_DBG_DEC_LITERAL_BYTES];
         match_bytes += stats[base + LZ4_DBG_DEC_MATCH_BYTES];
         small_offsets += stats[base + LZ4_DBG_DEC_SMALL_OFFSETS];
+        fast_literals += stats[base + LZ4_DBG_DEC_FAST_LITERAL_PATHS];
+        fast_matches += stats[base + LZ4_DBG_DEC_FAST_MATCH_PATHS];
         output_errors += stats[base + LZ4_DBG_DEC_OUTPUT_ERROR];
     }
 
     double avg_tokens = (num_blocks > 0) ? ((double)tokens / (double)num_blocks) : 0.0;
     double small_offset_ratio = (tokens > 0) ? ((double)small_offsets / (double)tokens) : 0.0;
     fprintf(stderr,
-            "[LZ4-DBG][DECOMP] blocks=%d tokens=%llu literals=%llu matches=%llu small_offsets=%llu small_offset/token=%.4f output_errors=%llu avg_tokens/block=%.2f\n",
+            "[LZ4-DBG][DECOMP] blocks=%d tokens=%llu literals=%llu matches=%llu small_offsets=%llu fast_literals=%llu fast_matches=%llu small_offset/token=%.4f output_errors=%llu avg_tokens/block=%.2f\n",
             num_blocks,
             tokens,
             literal_bytes,
             match_bytes,
             small_offsets,
+            fast_literals,
+            fast_matches,
             small_offset_ratio,
             output_errors,
             avg_tokens);
+
+    if (block_limit > 0) lz4_print_dec_debug_blocks(stats, num_blocks, block_limit);
+}
+
+static void lz4_print_comp_host_debug(const char* input_path,
+                                      size_t file_size,
+                                      int num_blocks,
+                                      size_t block_size,
+                                      size_t l_ws,
+                      const lz4_comp_plan_t* plan,
+                                      int tableType,
+                                      uint32_t epoch_base,
+                                      int use_standard_copy,
+                                      int kernel_has_dbg,
+                                      int dbg_enabled) {
+    double dict_per_input = (file_size > 0 && plan) ? ((double)plan->dict_total_bytes / (double)file_size) : 0.0;
+    fprintf(stderr,
+        "[LZ4-DBG][HOST][COMP] input=%s file_size=%zu blocks=%d block_size=%zu local=%zu raw_workers=%zu active_lanes=%zu launched=%zu pad=%zu tableType=%d dict_owners=%zu dict_entries/owner=%zu dict_bytes/owner=%zu dict_total=%zu dict_budget=%zu dict/input=%.3fx blocks/owner<=%u epoch_base=%u copy=%s kernel_debug_args=%s debug_enabled=%s\n",
+            input_path ? input_path : "<null>",
+            file_size,
+            num_blocks,
+            block_size,
+            l_ws,
+        plan ? plan->raw_worker_count : 0,
+        plan ? plan->active_lane_count : 0,
+        plan ? plan->launched_wi_count : 0,
+        plan ? plan->padding_wi_count : 0,
+            tableType,
+        plan ? plan->dict_owner_count : 0,
+        plan ? plan->dict_entries_per_owner : 0,
+        plan ? plan->dict_bytes_per_owner : 0,
+        plan ? plan->dict_total_bytes : 0,
+        plan ? plan->dict_budget_bytes : 0,
+            dict_per_input,
+        plan ? plan->blocks_per_owner : 0,
+            epoch_base,
+            use_standard_copy ? "standard" : "mapped",
+            kernel_has_dbg ? "yes" : "no",
+            dbg_enabled ? "yes" : "no");
+}
+
+static void lz4_print_dec_host_debug(const char* input_path,
+                                     uint32_t num_blocks,
+                                     uint32_t block_size,
+                                     size_t l_ws,
+                                     size_t worker_count,
+                                     size_t g_ws,
+                                     size_t data_size,
+                                     int use_standard_copy,
+                                     int kernel_has_dbg,
+                                     int dbg_enabled) {
+    fprintf(stderr,
+            "[LZ4-DBG][HOST][DECOMP] input=%s comp_bytes=%zu blocks=%u block_size=%u local=%zu workers=%zu global=%zu copy=%s kernel_debug_args=%s debug_enabled=%s\n",
+            input_path ? input_path : "<null>",
+            data_size,
+            num_blocks,
+            block_size,
+            l_ws,
+            worker_count,
+            g_ws,
+            use_standard_copy ? "standard" : "mapped",
+            kernel_has_dbg ? "yes" : "no",
+            dbg_enabled ? "yes" : "no");
 }
 
 static int lz4_write_blocks_packed(FILE* fout,
@@ -550,20 +616,6 @@ static int lz4_write_blocks_packed(FILE* fout,
     return 0;
 }
 
-static int lz4_write_blocks_direct(FILE* fout,
-                                   const uint8_t* base,
-                                   const uint32_t* offsets,
-                                   const uint32_t* sizes,
-                                   size_t count) {
-    if (!fout || !base || !offsets || !sizes) return -1;
-    for (size_t i = 0; i < count; ++i) {
-        size_t len = (size_t)sizes[i];
-        if (len == 0) continue;
-        if (fwrite(base + offsets[i], 1, len, fout) != len) return -1;
-    }
-    return 0;
-}
-
 static int lz4_write_blocks_from_mapped_buffer(cl_command_queue queue,
                                                 cl_mem src_buf,
                                                 size_t mapped_bytes,
@@ -605,42 +657,6 @@ static void lz4_set_stream_buffer(FILE* f) {
     }
 }
 
-static int lz4_readback_to_file_chunked(cl_command_queue queue,
-                                        cl_mem src_buf,
-                                        size_t total_bytes,
-                                        FILE* fout,
-                                        size_t chunk_bytes) {
-    cl_int err;
-    uint8_t* staging;
-    size_t off = 0;
-
-    if (!src_buf || !fout) return -1;
-    if (total_bytes == 0) return 0;
-    if (chunk_bytes < 256U * 1024U) chunk_bytes = 256U * 1024U;
-
-    staging = (uint8_t*)malloc(chunk_bytes);
-    if (!staging) return -1;
-
-    while (off < total_bytes) {
-        size_t step = total_bytes - off;
-        if (step > chunk_bytes) step = chunk_bytes;
-
-        err = clEnqueueReadBuffer(queue, src_buf, CL_TRUE, off, step, staging, 0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            free(staging);
-            return -1;
-        }
-        if (fwrite(staging, 1, step, fout) != step) {
-            free(staging);
-            return -1;
-        }
-        off += step;
-    }
-
-    free(staging);
-    return 0;
-}
-
 static int lz4_write_contiguous_from_mapped_buffer(cl_command_queue queue,
                                                    cl_mem src_buf,
                                                    size_t mapped_bytes,
@@ -667,68 +683,11 @@ static int lz4_write_contiguous_from_mapped_buffer(cl_command_queue queue,
     if (err != CL_SUCCESS) return -1;
     return 0;
 }
-
-static int lz4_write_compacted_payload_auto(cl_command_queue queue,
-                                            cl_mem src_buf,
-                                            size_t total_bytes,
-                                            FILE* fout,
-                                            int use_standard_copy,
-                                            const lz4_compaction_stats_t* stats,
-                                            unsigned long* download_us) {
-    uint64_t t0;
-    size_t read_chunk_kb;
-
-    if (!queue || !src_buf || !fout) return -1;
-    if (total_bytes == 0) {
-        if (download_us) *download_us = 0;
-        return 0;
-    }
-
-    if (!use_standard_copy) {
-        size_t mapped_max_mb = (size_t)lz4_env_unsigned_value("LZ4_GPU_PACK_MAPPED_MAX_MB", 256U);
-        size_t mapped_soft_limit = mapped_max_mb * 1024ULL * 1024ULL;
-        int prefer_mapped = (total_bytes <= mapped_soft_limit);
-
-        if (stats) {
-            if (stats->fill_ratio <= 0.80 || stats->mad_ratio >= 0.35) {
-                prefer_mapped = 1;
-            }
-        }
-
-        if (prefer_mapped) {
-            if (lz4_write_contiguous_from_mapped_buffer(queue,
-                                                        src_buf,
-                                                        total_bytes,
-                                                        fout,
-                                                        download_us) == 0) {
-                return 0;
-            }
-        }
-    }
-
-    read_chunk_kb = (size_t)lz4_env_unsigned_value("LZ4_GPU_PACK_READBACK_KB", 8192U);
-    if (stats && stats->fill_ratio <= 0.55 && read_chunk_kb > 4096U) {
-        read_chunk_kb = 4096U;
-    }
-
-    t0 = get_us();
-    if (lz4_readback_to_file_chunked(queue,
-                                     src_buf,
-                                     total_bytes,
-                                     fout,
-                                     read_chunk_kb * 1024ULL) != 0) {
-        return -1;
-    }
-    if (download_us) *download_us = (unsigned long)(get_us() - t0);
-    return 0;
-}
-
-int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kernel, cl_kernel pack_kernel,
+int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kernel,
                     const char* input_path, const char* output_path,
                     size_t block_size, int acceleration, lz4_gpu_workspace_t* ws,
                     timing_t* t, int local_size,
                     int skip_input_upload) {
-    const int hash_log = 14;
     cl_int err;
     uint64_t t1, t2;
 
@@ -740,19 +699,25 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
     t1 = get_us();
     int num_blocks = (file_size + block_size - 1) / block_size;
     int use_standard_copy = lz4_prefers_standard_copy(queue);
+    lz4_gpu_debug_config_t dbg_cfg = lz4_gpu_get_debug_config();
+
     size_t l_ws = sanitize_local_size(queue, (local_size > 0) ? (size_t)local_size : 1, (size_t)num_blocks);
-    size_t worker_count = choose_comp_worker_count(queue, (size_t)num_blocks, l_ws);
-    size_t g_ws = round_up_size(worker_count, l_ws);
+    lz4_comp_plan_t comp_plan = lz4_build_comp_plan(queue,
+                                                    file_size,
+                                                    block_size,
+                                                    (size_t)num_blocks,
+                                                    l_ws);
+    size_t g_ws = comp_plan.launched_wi_count;
     cl_uint kernel_num_args = 0;
     int kernel_has_dbg = 0;
     if (clGetKernelInfo(kernel, CL_KERNEL_NUM_ARGS, sizeof(kernel_num_args), &kernel_num_args, NULL) == CL_SUCCESS) {
-        kernel_has_dbg = (kernel_num_args >= 14U);
+        kernel_has_dbg = (kernel_num_args >= 15U);
     }
 
     uint32_t* h_block_info = malloc(num_blocks * 2 * sizeof(uint32_t));
     uint32_t* h_out_offsets = malloc(num_blocks * sizeof(uint32_t));
     cl_mem dbg_comp_buf = NULL;
-    int dbg_comp_requested = lz4_debug_counters_enabled();
+    int dbg_comp_requested = dbg_cfg.enabled;
     int dbg_comp_enabled = dbg_comp_requested && kernel_has_dbg;
     if (dbg_comp_requested && !kernel_has_dbg) {
         fprintf(stderr, "[LZ4-DBG][COMP] warning: kernel has no debug args, debug counters disabled\n");
@@ -843,34 +808,51 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
             fprintf(stderr, "[LZ4-DBG][COMP] warning: failed to enable debug counters, continuing without them\n");
         }
     }
-    size_t dict_entries_per_worker = (size_t)1U << (tableType == 0 ? (hash_log + 1) : hash_log);
-    size_t dict_size_per_worker = dict_entries_per_worker * sizeof(cl_uint);  /* 32-bit compact entries */
     size_t prev_dict_capacity = ws->current_dict_capacity;
-    ws->dict_buf = ensure_buffer_ex(context, ws->dict_buf, g_ws * dict_size_per_worker, &ws->current_dict_capacity, CL_MEM_READ_WRITE, !use_standard_copy, &err);
+    ws->dict_buf = ensure_buffer_ex(context,
+                                    ws->dict_buf,
+                                    comp_plan.dict_total_bytes,
+                                    &ws->current_dict_capacity,
+                                    CL_MEM_READ_WRITE,
+                                    !use_standard_copy,
+                                    &err);
     if (ws->current_dict_capacity != prev_dict_capacity) {
         (void)zero_buffer(queue, ws->dict_buf, ws->current_dict_capacity);
     }
     if (ws->comp_epoch_base == 0) ws->comp_epoch_base = 1;
     {
-        uint32_t blocks_per_worker = (uint32_t)(((size_t)num_blocks + g_ws - 1) / g_ws);
-        uint32_t epochs_needed = blocks_per_worker + 2U;
+        uint32_t epochs_needed = comp_plan.blocks_per_owner + 2U;
         if (epochs_needed >= UINT32_MAX - 1024U) epochs_needed = 1024U;
-        /* 8-bit epoch in kernel: clear dict when low byte would wrap to avoid stale collisions */
-        uint32_t cur_low = ws->comp_epoch_base & 0xFF;
-        uint32_t end_low = (ws->comp_epoch_base + epochs_needed) & 0xFF;
-        int wraps_8bit = (end_low <= cur_low) || (ws->comp_epoch_base > (uint32_t)(UINT32_MAX - epochs_needed));
-        if (wraps_8bit) {
+        /* 12-bit epoch in kernel: clear dict when low 12 bits would wrap to avoid stale collisions */
+        uint32_t cur_low = ws->comp_epoch_base & 0xFFF;
+        uint32_t end_low = (ws->comp_epoch_base + epochs_needed) & 0xFFF;
+        int wraps_12bit = (end_low <= cur_low) || (ws->comp_epoch_base > (uint32_t)(UINT32_MAX - epochs_needed));
+        if (wraps_12bit) {
             (void)zero_buffer(queue, ws->dict_buf, ws->current_dict_capacity);
             ws->comp_epoch_base = 1;
         }
     }
     uint32_t epoch_base = ws->comp_epoch_base;
-    ws->comp_epoch_base += (uint32_t)(((size_t)num_blocks + g_ws - 1) / g_ws) + 2U;
+    ws->comp_epoch_base += comp_plan.blocks_per_owner + 2U;
+    if (dbg_comp_requested) {
+        lz4_print_comp_host_debug(input_path,
+                                  file_size,
+                                  num_blocks,
+                                  block_size,
+                                  l_ws,
+                                  &comp_plan,
+                                  tableType,
+                                  epoch_base,
+                                  use_standard_copy,
+                                  kernel_has_dbg,
+                                  dbg_comp_enabled);
+    }
     t->buffer_alloc_us = (unsigned long)(get_us() - t1);
 
     t1 = get_us();
     int globalIndexBase = 0;
     int inputSize = (int)file_size;
+    uint32_t active_lane_count = (uint32_t)comp_plan.active_lane_count;
     cl_mem dbg_comp_arg = dbg_comp_enabled ? dbg_comp_buf : ws->output_size_buf;
     uint32_t dbg_comp_flag = dbg_comp_enabled ? 1U : 0U;
 
@@ -886,9 +868,10 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
         err |= clSetKernelArg(kernel, 8, sizeof(int), &acceleration);
         err |= clSetKernelArg(kernel, 9, sizeof(int), &globalIndexBase);
         err |= clSetKernelArg(kernel, 10, sizeof(cl_mem), &ws->dict_buf);
+        err |= clSetKernelArg(kernel, 11, sizeof(uint32_t), &active_lane_count);
         if (kernel_has_dbg) {
-            err |= clSetKernelArg(kernel, 12, sizeof(cl_mem), &dbg_comp_arg);
-            err |= clSetKernelArg(kernel, 13, sizeof(uint32_t), &dbg_comp_flag);
+            err |= clSetKernelArg(kernel, 13, sizeof(cl_mem), &dbg_comp_arg);
+            err |= clSetKernelArg(kernel, 14, sizeof(uint32_t), &dbg_comp_flag);
         }
         if (err != CL_SUCCESS) {
             fprintf(stderr, "[LZ4] set compress kernel args failed: %d\n", err);
@@ -898,7 +881,7 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
             return -1;
         }
     }
-    err = clSetKernelArg(kernel, 11, sizeof(uint32_t), &epoch_base);
+    err = clSetKernelArg(kernel, 12, sizeof(uint32_t), &epoch_base);
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[LZ4] set epoch_base kernel arg failed: %d\n", err);
         if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
@@ -914,7 +897,7 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
     err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &g_ws, &l_ws, 0, NULL, &ev);
     clWaitForEvents(1, &ev);
     t->kernel_exec_us = (unsigned long)(get_us() - t1);
-    t->algo_config = hash_log;
+    t->algo_config = 14;
 
     t1 = get_us();
     uint32_t* h_osizes = (uint32_t*)malloc(num_blocks * sizeof(uint32_t));
@@ -931,15 +914,6 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
     t->out_size = total_compressed_size;
 
     size_t total_out_read = (size_t)num_blocks * single_block_max_out;
-    lz4_compaction_stats_t compaction_stats = lz4_collect_compaction_stats(
-        h_osizes,
-        (size_t)num_blocks,
-        total_compressed_size,
-        total_out_read
-    );
-    unsigned compaction_gain_pct = 0;
-    int compaction_trace = lz4_compaction_trace_enabled();
-
     t->download_total_us = (unsigned long)(get_us() - t1);
 
     if (dbg_comp_enabled && dbg_comp_buf) {
@@ -947,14 +921,17 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
         uint32_t* dbg_comp_stats = (uint32_t*)malloc(dbg_comp_bytes);
         if (dbg_comp_stats) {
             if (clEnqueueReadBuffer(queue, dbg_comp_buf, CL_TRUE, 0, dbg_comp_bytes, dbg_comp_stats, 0, NULL, NULL) == CL_SUCCESS) {
-                lz4_print_comp_debug_stats(dbg_comp_stats, num_blocks);
+                lz4_print_comp_debug_stats(dbg_comp_stats, num_blocks, dbg_cfg.block_limit);
             }
             free(dbg_comp_stats);
         }
     }
 
     t1 = get_us();
-    FILE* fout = fopen(output_path, "wb");
+    FILE* fout = NULL;
+    if (output_path && output_path[0] != '\0') {
+        fout = fopen(output_path, "wb");
+    }
     if (fout) {
         lz4_set_stream_buffer(fout);
         uint32_t magic = 0x184D2204;
@@ -963,162 +940,49 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
         uint32_t bsize_u32 = (uint32_t)block_size;
         fwrite(&bsize_u32, 1, 4, fout);
         fwrite(h_osizes, 1, num_blocks * 4, fout);
-
-        int use_compaction = lz4_should_use_device_compaction(total_compressed_size,
-                                                              total_out_read,
-                                                              (size_t)num_blocks,
-                                                              pack_kernel,
-                                                              use_standard_copy,
-                                                              &compaction_stats,
-                                                              &compaction_gain_pct);
-
-        if (compaction_trace) {
-            size_t saved_bytes = (total_out_read > total_compressed_size) ? (total_out_read - total_compressed_size) : 0;
-            double saved_pct = (total_out_read > 0) ? ((double)saved_bytes * 100.0 / (double)total_out_read) : 0.0;
-            fprintf(stderr,
-                    "[LZ4][compaction] blocks=%d packed=%zu sparse=%zu saved=%zu saved_pct=%.2f gain_gate=%u fill=%.3f active=%.3f mad=%.3f stdcopy=%d decision=%d\n",
-                    num_blocks,
-                    total_compressed_size,
-                    total_out_read,
-                    saved_bytes,
-                    saved_pct,
-                    compaction_gain_pct,
-                    compaction_stats.fill_ratio,
-                    compaction_stats.active_ratio,
-                    compaction_stats.mad_ratio,
-                    use_standard_copy,
-                    use_compaction);
-        }
-
-        if (use_compaction) {
-            uint32_t* h_packed_offsets = (uint32_t*)malloc((size_t)num_blocks * sizeof(uint32_t));
-            if (!h_packed_offsets) {
+        if (!use_standard_copy) {
+            if (lz4_write_blocks_from_mapped_buffer(queue,
+                                                    ws->out_buf,
+                                                    total_out_read,
+                                                    fout,
+                                                    h_out_offsets,
+                                                    h_osizes,
+                                                    (size_t)num_blocks,
+                                                    &t->download_total_us) != 0) {
+                fprintf(stderr, "[LZ4] mapped write for sparse payload failed\n");
                 fclose(fout);
                 if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
                 free(h_block_info); free(h_osizes); free(h_out_offsets);
                 return -1;
             }
-
-            {
-                size_t packed_off = 0;
-                for (int i = 0; i < num_blocks; ++i) {
-                    h_packed_offsets[i] = (uint32_t)packed_off;
-                    packed_off += (size_t)h_osizes[i];
-                }
-            }
-
-            ws->packed_offsets_buf = ensure_buffer_ex(context, ws->packed_offsets_buf,
-                                                      (size_t)num_blocks * sizeof(uint32_t),
-                                                      &ws->current_packed_offsets_capacity,
-                                                      CL_MEM_READ_ONLY, !use_standard_copy, &err);
-            ws->packed_out_buf = ensure_buffer_ex(context, ws->packed_out_buf,
-                                                  total_compressed_size ? total_compressed_size : 1,
-                                                  &ws->current_packed_out_capacity,
-                                                  CL_MEM_READ_WRITE, !use_standard_copy, &err);
-            if (err != CL_SUCCESS || !ws->packed_offsets_buf || !ws->packed_out_buf ||
-                write_buffer_auto(queue, ws->packed_offsets_buf, h_packed_offsets,
-                                  (size_t)num_blocks * sizeof(uint32_t), use_standard_copy) != 0) {
-                free(h_packed_offsets);
-                fclose(fout);
-                if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
-                free(h_block_info); free(h_osizes); free(h_out_offsets);
-                return -1;
-            }
-
-            {
-                size_t pack_lws = sanitize_local_size(queue, 64, 256);
-                size_t pack_gws = ((size_t)num_blocks > 0) ? ((size_t)num_blocks * pack_lws) : pack_lws;
-                cl_event pack_ev = NULL;
-                uint32_t total_blocks_u32 = (uint32_t)num_blocks;
-
-                err  = clSetKernelArg(pack_kernel, 0, sizeof(cl_mem), &ws->out_buf);
-                err |= clSetKernelArg(pack_kernel, 1, sizeof(cl_mem), &ws->packed_out_buf);
-                err |= clSetKernelArg(pack_kernel, 2, sizeof(cl_mem), &ws->packed_offsets_buf);
-                err |= clSetKernelArg(pack_kernel, 3, sizeof(cl_mem), &ws->output_size_buf);
-                err |= clSetKernelArg(pack_kernel, 4, sizeof(uint32_t), &single_block_max_out);
-                err |= clSetKernelArg(pack_kernel, 5, sizeof(uint32_t), &total_blocks_u32);
-                if (err != CL_SUCCESS) {
-                    free(h_packed_offsets);
-                    fclose(fout);
-                    if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
-                    free(h_block_info); free(h_osizes); free(h_out_offsets);
-                    return -1;
-                }
-
-                t1 = get_us();
-                err = clEnqueueNDRangeKernel(queue, pack_kernel, 1, NULL, &pack_gws, &pack_lws, 0, NULL, &pack_ev);
-                if (err != CL_SUCCESS || !pack_ev) {
-                    free(h_packed_offsets);
-                    fclose(fout);
-                    if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
-                    free(h_block_info); free(h_osizes); free(h_out_offsets);
-                    return -1;
-                }
-                clWaitForEvents(1, &pack_ev);
-                clReleaseEvent(pack_ev);
-                t->kernel_exec_us += (unsigned long)(get_us() - t1);
-            }
-
-            if (total_compressed_size > 0) {
-                if (lz4_write_compacted_payload_auto(queue,
-                                                     ws->packed_out_buf,
-                                                     total_compressed_size,
-                                                     fout,
-                                                     use_standard_copy,
-                                                     &compaction_stats,
-                                                     &t->download_total_us) != 0) {
-                    fprintf(stderr, "[LZ4] compacted payload writeback failed\n");
-                    free(h_packed_offsets);
-                    fclose(fout);
-                    if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
-                    free(h_block_info); free(h_osizes); free(h_out_offsets);
-                    return -1;
-                }
-            }
-            free(h_packed_offsets);
         } else {
-            if (!use_standard_copy) {
-                if (lz4_write_blocks_from_mapped_buffer(queue,
-                                                        ws->out_buf,
-                                                        total_out_read,
-                                                        fout,
-                                                        h_out_offsets,
-                                                        h_osizes,
-                                                        (size_t)num_blocks,
-                                                        &t->download_total_us) != 0) {
-                    fprintf(stderr, "[LZ4] mapped write for sparse payload failed\n");
+            uint8_t* h_out = (uint8_t*)malloc(total_out_read);
+            if (h_out) {
+                uint64_t t_down0 = get_us();
+                if (read_buffer_auto(queue, ws->out_buf, h_out, total_out_read, use_standard_copy) != 0) {
+                    fprintf(stderr, "[LZ4] read compressed payload buffer failed\n");
+                    free(h_out);
                     fclose(fout);
                     if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
                     free(h_block_info); free(h_osizes); free(h_out_offsets);
                     return -1;
                 }
-            } else {
-                uint8_t* h_out = (uint8_t*)malloc(total_out_read);
-                if (h_out) {
-                    uint64_t t_down0 = get_us();
-                    if (read_buffer_auto(queue, ws->out_buf, h_out, total_out_read, use_standard_copy) != 0) {
-                        fprintf(stderr, "[LZ4] read compressed payload buffer failed\n");
-                        free(h_out);
-                        fclose(fout);
-                        if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
-                        free(h_block_info); free(h_osizes); free(h_out_offsets);
-                        return -1;
-                    }
-                    t->download_total_us = (unsigned long)(get_us() - t_down0);
-                    if (lz4_write_blocks_packed(fout, h_out, h_out_offsets, h_osizes, (size_t)num_blocks) != 0) {
-                        free(h_out);
-                        fclose(fout);
-                        if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
-                        free(h_block_info); free(h_osizes); free(h_out_offsets);
-                        return -1;
-                    }
+                t->download_total_us = (unsigned long)(get_us() - t_down0);
+                if (lz4_write_blocks_packed(fout, h_out, h_out_offsets, h_osizes, (size_t)num_blocks) != 0) {
                     free(h_out);
+                    fclose(fout);
+                    if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
+                    free(h_block_info); free(h_osizes); free(h_out_offsets);
+                    return -1;
                 }
+                free(h_out);
             }
         }
         fclose(fout);
     }
-    t->file_write_us = (unsigned long)(get_us() - t1);
+    t->file_write_us = (output_path && output_path[0] != '\0')
+        ? (unsigned long)(get_us() - t1)
+        : 0;
 
     if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
     free(h_block_info); free(h_osizes); free(h_out_offsets);
@@ -1133,6 +997,7 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
 
     t1 = get_us();
     int use_standard_copy = lz4_prefers_standard_copy(queue);
+    lz4_gpu_debug_config_t dbg_cfg = lz4_gpu_get_debug_config();
     FILE* fin = fopen(input_path, "rb"); if (!fin) return -1;
     lz4_set_stream_buffer(fin);
     uint32_t magic, num_blocks, block_size_val;
@@ -1148,7 +1013,9 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
     size_t file_size = ftell(fin);
     size_t data_size = file_size - header_size;
     fseek(fin, header_size, SEEK_SET);
+    t->in_size = (unsigned long)file_size;
     t->file_read_us = 0;
+    t->data_upload_us = 0;
 
     t1 = get_us();
     uint32_t* h_comp_offsets = malloc(num_blocks * sizeof(uint32_t));
@@ -1206,39 +1073,13 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
     }
 
     {
-        uint64_t file_read_t0 = get_us();
-    if (use_standard_copy) {
-        uint8_t* h_in = (uint8_t*)malloc(data_size);
-        if (!h_in) {
-            fclose(fin);
-            free(h_comp_sizes);
-            free(h_comp_offsets);
-            free(h_comp_sizes_32);
-            free(h_out_offsets);
-            free(h_max_out_sizes);
-            return -1;
-        }
-        if (fread(h_in, 1, data_size, fin) != data_size ||
-            write_buffer_auto(queue, ws->in_buf, h_in, data_size, 1) != 0) {
-            fprintf(stderr, "[LZ4] read/upload compressed input failed for standard-copy decompress path\n");
-            free(h_in);
-            fclose(fin);
-            free(h_comp_sizes);
-            free(h_comp_offsets);
-            free(h_comp_sizes_32);
-            free(h_out_offsets);
-            free(h_max_out_sizes);
-            return -1;
-        }
-        free(h_in);
-    } else {
-        void* mapped_in = clEnqueueMapBuffer(queue, ws->in_buf, CL_TRUE, CL_MAP_WRITE, 0, data_size, 0, NULL, NULL, &err);
-        if (err == CL_SUCCESS && mapped_in) {
-            size_t nr = fread(mapped_in, 1, data_size, fin);
-            if (nr != data_size) {
-                fprintf(stderr, "[LZ4] fread compressed input failed for mapped decompress path\n");
+        unsigned long file_read_us_acc = 0;
+        unsigned long upload_us_acc = 0;
+
+        if (use_standard_copy) {
+            uint8_t* h_in = (uint8_t*)malloc(data_size);
+            if (!h_in) {
                 fclose(fin);
-                clEnqueueUnmapMemObject(queue, ws->in_buf, mapped_in, 0, NULL, NULL);
                 free(h_comp_sizes);
                 free(h_comp_offsets);
                 free(h_comp_sizes_32);
@@ -1246,20 +1087,71 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
                 free(h_max_out_sizes);
                 return -1;
             }
-            clEnqueueUnmapMemObject(queue, ws->in_buf, mapped_in, 0, NULL, NULL);
+            {
+                uint64_t t_read0 = get_us();
+                size_t nr = fread(h_in, 1, data_size, fin);
+                file_read_us_acc += (unsigned long)(get_us() - t_read0);
+                if (nr != data_size) {
+                    fprintf(stderr, "[LZ4] read compressed input failed for standard-copy decompress path\n");
+                    free(h_in);
+                    fclose(fin);
+                    free(h_comp_sizes);
+                    free(h_comp_offsets);
+                    free(h_comp_sizes_32);
+                    free(h_out_offsets);
+                    free(h_max_out_sizes);
+                    return -1;
+                }
+            }
+            {
+                uint64_t t_up0 = get_us();
+                if (write_buffer_auto(queue, ws->in_buf, h_in, data_size, 1) != 0) {
+                    fprintf(stderr, "[LZ4] upload compressed input failed for standard-copy decompress path\n");
+                    free(h_in);
+                    fclose(fin);
+                    free(h_comp_sizes);
+                    free(h_comp_offsets);
+                    free(h_comp_sizes_32);
+                    free(h_out_offsets);
+                    free(h_max_out_sizes);
+                    return -1;
+                }
+                upload_us_acc += (unsigned long)(get_us() - t_up0);
+            }
+            free(h_in);
         } else {
-            fprintf(stderr, "[LZ4] map compressed input buffer failed: %d\n", err);
-            fclose(fin);
-            free(h_comp_sizes);
-            free(h_comp_offsets);
-            free(h_comp_sizes_32);
-            free(h_out_offsets);
-            free(h_max_out_sizes);
-            return -1;
+            void* mapped_in = clEnqueueMapBuffer(queue, ws->in_buf, CL_TRUE, CL_MAP_WRITE, 0, data_size, 0, NULL, NULL, &err);
+            if (err == CL_SUCCESS && mapped_in) {
+                uint64_t t_read0 = get_us();
+                size_t nr = fread(mapped_in, 1, data_size, fin);
+                file_read_us_acc += (unsigned long)(get_us() - t_read0);
+                if (nr != data_size) {
+                    fprintf(stderr, "[LZ4] fread compressed input failed for mapped decompress path\n");
+                    fclose(fin);
+                    clEnqueueUnmapMemObject(queue, ws->in_buf, mapped_in, 0, NULL, NULL);
+                    free(h_comp_sizes);
+                    free(h_comp_offsets);
+                    free(h_comp_sizes_32);
+                    free(h_out_offsets);
+                    free(h_max_out_sizes);
+                    return -1;
+                }
+                clEnqueueUnmapMemObject(queue, ws->in_buf, mapped_in, 0, NULL, NULL);
+            } else {
+                fprintf(stderr, "[LZ4] map compressed input buffer failed: %d\n", err);
+                fclose(fin);
+                free(h_comp_sizes);
+                free(h_comp_offsets);
+                free(h_comp_sizes_32);
+                free(h_out_offsets);
+                free(h_max_out_sizes);
+                return -1;
+            }
         }
-    }
-    fclose(fin);
-    t->file_read_us = (unsigned long)(get_us() - file_read_t0);
+
+        fclose(fin);
+        t->file_read_us = file_read_us_acc;
+        t->data_upload_us += upload_us_acc;
     }
 
     ws->decomp_comp_off_buf = ensure_buffer_ex(context, ws->decomp_comp_off_buf, num_blocks * 4,
@@ -1294,6 +1186,7 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
     }
 
     if (use_standard_copy) {
+        uint64_t t_meta_up0 = get_us();
         cl_event meta_ev[2] = {0};
         int ev_count = 0;
         err  = clEnqueueWriteBuffer(queue, ws->decomp_comp_off_buf, CL_FALSE, 0, num_blocks * 4, h_comp_offsets, 0, NULL, &meta_ev[ev_count]);
@@ -1313,8 +1206,10 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
             free(h_max_out_sizes);
             return -1;
         }
+        t->data_upload_us += (unsigned long)(get_us() - t_meta_up0);
         for (int ei = 0; ei < ev_count; ++ei) if (meta_ev[ei]) clReleaseEvent(meta_ev[ei]);
     } else {
+        uint64_t t_meta_up0 = get_us();
         if (write_buffer_auto(queue, ws->decomp_comp_off_buf, h_comp_offsets, num_blocks * 4, 0) != 0 ||
             write_buffer_auto(queue, ws->decomp_comp_size_buf, h_comp_sizes_32, num_blocks * 4, 0) != 0) {
             fprintf(stderr, "[LZ4] upload decompress metadata buffers failed\n");
@@ -1325,10 +1220,9 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
             free(h_max_out_sizes);
             return -1;
         }
+        t->data_upload_us += (unsigned long)(get_us() - t_meta_up0);
     }
     t->buffer_alloc_us = (unsigned long)(get_us() - t1);
-
-    t->data_upload_us = use_standard_copy ? t->data_upload_us : 0;
 
     t1 = get_us();
     cl_mem dbg_dec_buf = NULL;
@@ -1337,7 +1231,7 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
     if (clGetKernelInfo(kernel, CL_KERNEL_NUM_ARGS, sizeof(kernel_num_args), &kernel_num_args, NULL) == CL_SUCCESS) {
         kernel_has_dbg = (kernel_num_args >= 9U);
     }
-    int dbg_dec_requested = lz4_debug_counters_enabled();
+    int dbg_dec_requested = dbg_cfg.enabled;
     int dbg_dec_enabled = dbg_dec_requested && kernel_has_dbg;
     if (dbg_dec_requested && !kernel_has_dbg) {
         fprintf(stderr, "[LZ4-DBG][DECOMP] warning: kernel has no debug args, debug counters disabled\n");
@@ -1374,6 +1268,18 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
     }
     size_t worker_count = choose_decomp_worker_count(queue, (size_t)num_blocks, l_ws);
     size_t g_ws = round_up_size(worker_count, l_ws);
+    if (dbg_dec_requested) {
+        lz4_print_dec_host_debug(input_path,
+                                 num_blocks,
+                                 block_size_val,
+                                 l_ws,
+                                 worker_count,
+                                 g_ws,
+                                 data_size,
+                                 use_standard_copy,
+                                 kernel_has_dbg,
+                                 dbg_dec_enabled);
+    }
     t->global_size = (unsigned long)g_ws;
     t->local_size = (unsigned long)l_ws;
     cl_event ev;
@@ -1404,7 +1310,7 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
         uint32_t* dbg_dec_stats = (uint32_t*)malloc(dbg_dec_bytes);
         if (dbg_dec_stats) {
             if (clEnqueueReadBuffer(queue, dbg_dec_buf, CL_TRUE, 0, dbg_dec_bytes, dbg_dec_stats, 0, NULL, NULL) == CL_SUCCESS) {
-                lz4_print_dec_debug_stats(dbg_dec_stats, (int)num_blocks);
+                lz4_print_dec_debug_stats(dbg_dec_stats, (int)num_blocks, dbg_cfg.block_limit);
             }
             free(dbg_dec_stats);
         }
@@ -1413,8 +1319,9 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
     t1 = get_us();
     FILE* fout = fopen(output_path, "wb");
     if (fout) {
+        int disable_mapped_write = lz4_env_flag_value("LZ4_GPU_DISABLE_DECOMP_MAPPED_WRITE", NULL);
         lz4_set_stream_buffer(fout);
-        if (!use_standard_copy && !lz4_env_flag_value("LZ4_GPU_DISABLE_DECOMP_MAPPED_WRITE", NULL)) {
+        if (!use_standard_copy && !disable_mapped_write) {
             if (lz4_write_contiguous_from_mapped_buffer(queue,
                                                         ws->out_buf,
                                                         total_decomp_sz,
@@ -1491,6 +1398,38 @@ static int lz4_get_executable_path(char* out, size_t outlen) {
 #endif
 }
 
+static int lz4_join_path2(char* out, size_t outlen, const char* a, const char* b) {
+    size_t la;
+    size_t lb;
+    if (!out || outlen == 0 || !a || !b) return -1;
+    la = strlen(a);
+    lb = strlen(b);
+    if (la + 1 + lb + 1 > outlen) return -1;
+    memcpy(out, a, la);
+    out[la] = '/';
+    memcpy(out + la + 1, b, lb);
+    out[la + 1 + lb] = '\0';
+    return 0;
+}
+
+static int lz4_join_path3(char* out, size_t outlen, const char* a, const char* b, const char* c) {
+    size_t la;
+    size_t lb;
+    size_t lc;
+    if (!out || outlen == 0 || !a || !b || !c) return -1;
+    la = strlen(a);
+    lb = strlen(b);
+    lc = strlen(c);
+    if (la + 1 + lb + 1 + lc + 1 > outlen) return -1;
+    memcpy(out, a, la);
+    out[la] = '/';
+    memcpy(out + la + 1, b, lb);
+    out[la + 1 + lb] = '/';
+    memcpy(out + la + 1 + lb + 1, c, lc);
+    out[la + 1 + lb + 1 + lc] = '\0';
+    return 0;
+}
+
 static int lz4_find_file_path(const char* name, char* out, size_t outlen) {
     char path[PATH_MAX];
     char base[PATH_MAX];
@@ -1510,14 +1449,14 @@ static int lz4_find_file_path(const char* name, char* out, size_t outlen) {
             if (!slash) slash = strrchr(exe_path, '/');
             if (slash) {
                 *slash = '\0';
-                snprintf(path, sizeof(path), "%s/../lz4_gpu/%s", exe_path, name);
-                if (access(path, R_OK) == 0) {
+                if (lz4_join_path3(path, sizeof(path), exe_path, "../lz4_gpu", name) == 0 &&
+                    access(path, R_OK) == 0) {
                     strncpy(out, path, outlen - 1);
                     out[outlen - 1] = '\0';
                     return 0;
                 }
-                snprintf(path, sizeof(path), "%s/%s", exe_path, name);
-                if (access(path, R_OK) == 0) {
+                if (lz4_join_path2(path, sizeof(path), exe_path, name) == 0 &&
+                    access(path, R_OK) == 0) {
                     strncpy(out, path, outlen - 1);
                     out[outlen - 1] = '\0';
                     return 0;
@@ -1527,8 +1466,8 @@ static int lz4_find_file_path(const char* name, char* out, size_t outlen) {
     }
 
     if (getcwd(base, sizeof(base)) != NULL) {
-        snprintf(path, sizeof(path), "%s/%s", base, name);
-        if (access(path, R_OK) == 0) {
+        if (lz4_join_path2(path, sizeof(path), base, name) == 0 &&
+            access(path, R_OK) == 0) {
             strncpy(out, path, outlen - 1);
             out[outlen - 1] = '\0';
             return 0;
@@ -1564,17 +1503,12 @@ cl_program lz4_load_program(cl_context context, cl_device_id device) {
                         cl_int kernel_err = CL_SUCCESS;
                         cl_kernel kcomp = clCreateKernel(prog, "lz4_compress_block", &kernel_err);
                         cl_kernel kdec = NULL;
-                        cl_kernel kpack = NULL;
                         if (kernel_err == CL_SUCCESS && kcomp) {
                             kdec = clCreateKernel(prog, "lz4_decompress_blocks", &kernel_err);
                         }
-                        if (kernel_err == CL_SUCCESS && kdec) {
-                            kpack = clCreateKernel(prog, "lz4_pack_blocks", &kernel_err);
-                        }
                         if (kcomp) clReleaseKernel(kcomp);
                         if (kdec) clReleaseKernel(kdec);
-                        if (kpack) clReleaseKernel(kpack);
-                        if (kernel_err == CL_SUCCESS && kpack) {
+                        if (kernel_err == CL_SUCCESS && kdec) {
                             return prog;
                         }
                     }
@@ -1587,7 +1521,7 @@ cl_program lz4_load_program(cl_context context, cl_device_id device) {
     // Fallback: load from source
     {
         char resolved_src[PATH_MAX];
-        const char* source_name = dbg_enabled ? "lz4_gpu_debug.cl" : "lz4_gpu.cl";
+        const char* source_name = "lz4_gpu.cl";
         if (lz4_find_file_path(source_name, resolved_src, sizeof(resolved_src)) != 0) {
             fprintf(stderr, "failed to locate OpenCL source: %s\n", source_name);
             return NULL;
@@ -1603,8 +1537,12 @@ cl_program lz4_load_program(cl_context context, cl_device_id device) {
             fprintf(stderr, "clCreateProgramWithSource failed: err=%d\n", err);
             return NULL;
         }
-        char flags[192];
-        snprintf(flags, sizeof(flags), "-I. -I./lz4_gpu -I../lz4_gpu -I.. -DLZ4_HASHLOG=%d -DLZ4_GPU_DEBUG_COUNTERS_RUNTIME=%d", hash_log, dbg_enabled ? 1 : 0);
+        char flags[224];
+        if (dbg_enabled) {
+            snprintf(flags, sizeof(flags), "-I. -I./lz4_gpu -I../lz4_gpu -I.. -DLZ4_HASHLOG=%d -DLZ4_GPU_DEBUG_COUNTERS_RUNTIME=1", hash_log);
+        } else {
+            snprintf(flags, sizeof(flags), "-I. -I./lz4_gpu -I../lz4_gpu -I.. -DLZ4_HASHLOG=%d", hash_log);
+        }
         err = clBuildProgram(prog, 1, &device, flags, NULL, NULL);
         if (err != CL_SUCCESS) {
             size_t log_sz = 0;

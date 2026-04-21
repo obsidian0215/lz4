@@ -75,8 +75,8 @@ make OS=Windows_NT CC=gcc \
 ### 3.3 基准示例
 
 ```bash
-./lz4_hybrid --bench 3 -b 64K -T 2 -a 3 --gpu-ratio 0.7 /path/to/file
-./lz4_hybrid --bench 3 -b 64K -T 2 -a 3 --adaptive --sample-blocks 8 /path/to/file
+./lz4_hybrid --bench 3 -b 64K -T 1 -a 3 --gpu-ratio 0.7 /path/to/file
+./lz4_hybrid --bench 3 -b 64K -T 1 -a 3 --adaptive --sample-blocks 8 /path/to/file
 ```
 
 ## 4. 容器格式与数据路径
@@ -138,7 +138,16 @@ Total 吞吐采用进程内预热后的整体 wall-time，覆盖运行时与协�
 
 所有性能结论默认建立在 roundtrip 验证通过的前提下；若正确性失败，性能数据视为无效。
 
-## 8. 验证与回归规范
+## 8. 环境变量（GPU 后端相关）
+
+`lz4_hybrid` 的 GPU 子路径复用 `lz4_gpu` 后端，因此以下变量会影响 hybrid 内的 GPU 段行为：
+
+| 变量 | 取值 / 默认 | 作用范围 |
+| --- | --- | --- |
+| `FORCE_OPENCL_DEVICE` | `GPU`(默认) / `CPU` / `DEFAULT` / `ALL` | OpenCL 设备选择 |
+| `LZ4_STANDARD_COPY` | `auto` / `0` / `1` | host-device 传输路径 |
+
+## 9. 验证与回归规范
 
 推荐最小闭环：
 
@@ -148,14 +157,14 @@ Total 吞吐采用进程内预热后的整体 wall-time，覆盖运行时与协�
 4. 对比 ratio 变化；
 5. 保存 artifact 路径与二进制哈希。
 
-## 9. 常见问题与排查
+## 10. 常见问题与排查
 
 1. **OpenCL 初始化失败**：确认驱动、平台与设备可见；
 2. **吞吐波动过大**：检查是否混入冷启动与后台负载；
 3. **多线程收益异常**：核对 `-T` 与系统 CPU 绑定策略；
 4. **结果不可复现**：固定输入集、二进制哈希和运行顺序。
 
-## 10. 当前版本结论
+## 11. 当前版本结论
 
 - `lz4_hybrid` 已具备完整 CPU/GPU 协同能力；
 - 固定比例与自适应比例均可用于正式验证；

@@ -52,7 +52,7 @@ int write_buffer_auto(cl_command_queue queue, cl_mem buf, const void* src, size_
 int write_buffer_mapped(cl_command_queue queue, cl_mem buf, const void* src, size_t bytes);
 int read_buffer_auto(cl_command_queue queue, cl_mem buf, void* dst, size_t bytes, int standard_copy);
 
-int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kernel, cl_kernel pack_kernel,
+int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kernel,
                     const char* input_path, const char* output_path,
                     size_t block_size, int acceleration, lz4_gpu_workspace_t* ws,
                     timing_t* t, int local_size,

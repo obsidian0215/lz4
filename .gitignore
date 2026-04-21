@@ -74,6 +74,10 @@ lz4_gpu/*.csv
 lz4_gpu/*.txt
 lz4_gpu/*.log
 lz4_gpu/*.lz4
+lz4_gpu/variant_validation/nvidia/
+lz4_gpu/variant_validation/intel/
+lz4_hybrid/variant_validation/nvidia/
+lz4_hybrid/variant_validation/intel/
 lz4_gpu/output
 lz4_gpu/lz4_gpu
 lz4_gpu/lz4_gpu_debug

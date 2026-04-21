@@ -1,40 +1,5 @@
 # LZ4 Hybrid 优化路线（可读版）
 
-## Wave-0 噪声阈值（G1 门禁，2026-04-06）
-
-测量口径
-
-- 样本目录：`/root/samples_subset`
-- 重复次数：`3`
-- 单轮时长：`bench_seconds=3.5`
-- 代表配置：`HYBRID-only, split_layout=prefix, cpu_threads=2, block=64K, local=1, no-freq-scan`
-- 阈值公式：`|Δ| > max(1.5×MAD, P95(|noise_delta|))`
-- 判定方向：`CompTotalMBs`、`DecTotalMBs`、`Ratio%` 均按“越大越好”；`Δ <= -threshold_abs` 记为明显回退，`Δ >= threshold_abs` 记为明显提升。
-- 阈值工件：`/root/lz4/exp_results/noise_profiles/g1/thresholds/lz4_hybrid_fixed.json`、`/root/lz4/exp_results/noise_profiles/g1/thresholds/lz4_hybrid_adaptive.json`
-
-当前门禁阈值（LZ4 Hybrid fixed）
-
-- `CompTotalMBs(mean)`：`threshold_abs=13.0994 MB/s`
-- `CompTotalMBs(median)`：`threshold_abs=46.8400 MB/s`
-- `DecTotalMBs(mean)`：`threshold_abs=64.4981 MB/s`
-- `DecTotalMBs(median)`：`threshold_abs=38.7880 MB/s`
-- `Ratio%(mean)`：`threshold_abs=0.0000 pctpt`
-- `Ratio%(median)`：`threshold_abs=0.0000 pctpt`
-
-当前门禁阈值（LZ4 Hybrid adaptive）
-
-- `CompTotalMBs(mean)`：`threshold_abs=25.3601 MB/s`
-- `CompTotalMBs(median)`：`threshold_abs=30.4050 MB/s`
-- `DecTotalMBs(mean)`：`threshold_abs=25.2616 MB/s`
-- `DecTotalMBs(median)`：`threshold_abs=206.0550 MB/s`
-- `Ratio%(mean)`：`threshold_abs=0.0000 pctpt`
-- `Ratio%(median)`：`threshold_abs=0.0000 pctpt`
-
-说明
-
-- 以上阈值用于当前 Wave-0 的 subset/fullset 采纳门禁；若后续切换配置空间或计时口径，需要重新测量并覆盖本节。
-- `Ratio%` 阈值为 `0` 表示噪声测量中几乎无抖动，后续仍按“均值+中位数双判 + 全样本10轮”执行。
-
 ## 全集基线结果（当前保留）
 
 - 基线全集目录：`/root/lz4/exp_results/runs/fullset_allcfg_current_lz4/runs/20260403_151152`
@@ -59,7 +24,6 @@
 实现
 
 - 文件：`/root/lz4/lz4_hybrid/lz4_hybrid.c`
-- 证据：`host_round_20260401_113006_L4H_HOST_R5B_FULLSET_PREADOPT_ab.json`
 
 测试结果
 
@@ -177,12 +141,10 @@
 
 | 修改名（实际语义） | 动机 | 设计与实现 | 测试结果 | 拒绝原因 |
 | --- | --- | --- | --- | --- |
-| 解压 worker 批量 claim | 降低原子调度开销 | 解压路径引入批量 claim（`host_round_...R5A...`） | `Comp -0.5499%/-0.6663%`，`Dec -0.6722%/-0.4466%` | Comp/Dec 双负向 |
-| 最小化解压 offsets 构建 | 降低准备开销 | 仅必要分段构建 offsets（`host_round_...R5C...`） | `Comp +0.6209%/+0.1290%`，`Dec -2.3916%/-2.6439%` | Dec 双负向 |
+| CPU 压缩批量领取（两轮方案） | 降低压缩侧领取竞争 | 压缩 worker 批量领取候选实现（two-pass） | 收益不稳定，未形成一致正向 | 不满足默认并线门槛 |
+| adaptive 默认 `sample-blocks 8->16` | 期望提升 adaptive 采样稳定性 | 调整 adaptive 默认采样块数 | A/B 与 R3 不稳（R3 dec `-0.27%`） | 回滚默认到 `8` |
 | 压缩 worker 批量 claim | 减少调度热点 | 压缩线程批量领取任务（`host_round_...R6...`） | `Comp +1.7383%/+0.6109%`，`Dec -2.7797%/-2.5088%` | Dec 门禁失败 |
 | 解压调度强化（大块场景） | 缩减预处理与调度开销 | 大块场景增强解压路径（`host_round_...R7...`） | `Comp +0.5267%/-1.0244%`，`Dec +0.3901%/-0.2558%` | 中位数未过门禁 |
-| 线程感知 ratio guard | 稳定 `T=1/2/4` 自适应分布 | adaptive 中加入线程感知约束（`lz4_threadaware_ratio_guard_20260402_025558`） | `T1: Comp -0.0339%/+0.9857%, Dec +0.6083%/+1.4529%`；`T2: Comp +0.0414%/-0.2809%`；`T4: Comp -0.1432%/+0.1623%, Dec +0.2717%/-0.1711%` | 指标混合，无稳定净收益 |
-| 频率模式 + 线程功耗感知模型 | 引入 perf/energy/ratio 联合决策 | 频率感知多目标模型（`freqaware_model_20260402_034500`） | `T1/T2` 有收益，但 `T4` 中位数明显回退（`Comp -2.9969%`, `Dec -3.7062%`） | 高线程档不稳定，被主线替代 |
 
 ## 当前代码一致性检查结论
 

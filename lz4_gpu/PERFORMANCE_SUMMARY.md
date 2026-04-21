@@ -1,6 +1,6 @@
-# LZ4 GPU 性能总结（Intel + Nvidia）
+﻿# LZ4 GPU 性能总结（Intel + Nvidia）
 
-> 更新时间：2026-04-04
+> 更新时间：2026-04-20
 > 代码路径：`/root/lz4/lz4_gpu`
 > 当前二进制：`/root/lz4/lz4_gpu/lz4_gpu`
 > 当前哈希：`sha256=730253128ef8c18c166544eeb29cd45385377ffef090f8eb7fde333c91dd3074`
@@ -49,7 +49,7 @@
 
 #### 1.5 2026-03-24 主线收敛状态（GPU）
 
-- **保留项（有明确收益）**：pack kernel 分层向量化、解压 local-size 自动化、OpenCL queue 新 API 与路径安全修复。
+- **保留项（有明确收益）**：mapped host path 收敛、解压 local-size 自动化、OpenCL queue 新 API 与路径安全修复。
 - **回退项（无稳定收益）**：压缩路径上过于激进的 local-size 自动化默认化（已回退到更稳策略）。
 本轮证据工件：
 
@@ -68,7 +68,7 @@
 | 组件 | 文件 | 角色 | 关键实现点 |
 | --- | --- | --- | --- |
 | CLI 与运行模式 | `lz4_gpu.c` | standalone / daemon / client / bench 入口 | `run_lz4_standalone`, `run_lz4_bench`, `FORCE_OPENCL_DEVICE` |
-| OpenCL 内核 | `lz4_gpu.cl` | 压缩/解压/pack kernel | `lz4_compress_block`, `lz4_decompress_blocks`, `lz4_pack_blocks` |
+| OpenCL 内核 | `lz4_gpu.cl` | 压缩/解压 kernel | `lz4_compress_block`, `lz4_decompress_blocks` |
 | 核心运行时 | `lz4_gpu_core.c` | buffer 生命周期、调度、写回、计时 | `ensure_buffer_ex`, `choose_comp_worker_count`, `lz4_compress_core` |
 | 共享状态 | `lz4_gpu_core.h` | workspace + 缓冲复用状态 | `lz4_gpu_workspace_t` |
 | 协议/守护进程 | `lz4_gpu_protocol.h` + daemon/client | 进程间复用 OpenCL 上下文 | socket 协议 |
@@ -78,7 +78,7 @@
 ```mermaid
 flowchart LR
     A[lz4_gpu.c<br/>CLI/bench/daemon] --> B[lz4_gpu_core.c<br/>runtime & scheduling]
-    B --> C[lz4_gpu.cl<br/>compress/decompress/pack kernels]
+   B --> C[lz4_gpu.cl<br/>compress/decompress kernels]
     B --> D[lz4_gpu_core.h<br/>workspace cache]
     A --> E[lz4_gpu_protocol.h + daemon/client]
     C --> F[OpenCL Device<br/>Intel Iris Xe]
@@ -101,17 +101,15 @@ sequenceDiagram
     R->>R: ensure/reuse buffers
     R->>K: lz4_compress_block (NDRange)
     K-->>R: block sizes + sparse payload
-    R->>K: lz4_pack_blocks (optional)
-    K-->>R: packed payload + offsets
-    R->>O: write header + block lens + payload
+   R->>O: write header + block lens + assembled payload
 ```
 
 压缩阶段关键点：
 
 1. `lz4_compress_core` 负责 block 切分和参数下发。
 2. `choose_comp_worker_count` 根据 `CU * wi_per_cu` 动态确定并发。
-3. 输出先是稀疏槽位，再按阈值判定是否执行 pack。
-4. 写回路径可走 mapped/chunked/readbuffer 多分支。
+3. 输出保留固定槽位布局，主机端依据 `blockSizes` 把有效块顺序组装并写回。
+4. host 侧只保留 `mapped / standard-copy` 双路径，不再维持 `pipeline / overlap / compaction` 分支状态机。
 
 #### 2.4 解压流程图（过程详解）
 
@@ -144,11 +142,11 @@ sequenceDiagram
 [Input File]
    | read/mmap
    v
-[d_in] --kernel--> [d_out sparse slots] --(optional pack kernel)--> [d_packed_out]
-   |                                                |
-   |                                            [d_sizes]
-   v                                                v
-host/runtime ------------------------------> container assembly -> output
+[d_in] --kernel--> [d_out sparse slots]
+   |                     |
+   |                  [d_sizes]
+   v                     v
+host/runtime ------> container assembly -> output
 ```
 
 - iGPU 默认倾向 map/unmap（零拷贝风格）。
@@ -165,17 +163,17 @@ host/runtime ------------------------------> container assembly -> output
 
 ##### 3.1.1 32-bit 紧凑哈希条目
 
-- **动机**：64-bit 条目在共享内存平台造成高带宽开销。
-- **设计**：条目编码为 `[8-bit epoch | 8-bit fp | 16-bit index]`。
+- **动机**：共享内存平台上，hash 表条目越小，字典带宽与容量压力越容易控制。
+- **设计**：默认条目编码为 `[8-bit epoch | reserved | 16-bit low position]`，保持 32-bit 紧凑布局。
 - **实现**：`lz4_gpu.cl` 中 `LZ4_putIndexOnHash` / `LZ4_getIndexOnHash`。
-- **效果**：降低字典带宽与容量压力；配合 HL=14 成为当前主线。
+- **效果**：降低字典访问成本，并把更复杂的 fingerprint/hash 实验留在默认基线之外。
 
-##### 3.1.2 指纹过滤与重建索引
+##### 3.1.2 低 16 位位置重建索引
 
-- **动机**：减少无效 full compare。
-- **设计**：先做 fp 过滤，再根据低 16 位重建 matchIndex。
-- **实现**：`LZ4_fp8` + `LZ4_getIndexOnHash`。
-- **效果**：降低冲突路径开销，稳定压缩吞吐。
+- **动机**：在不扩大 hash 表条目的前提下，仍需要从当前窗口恢复可用的 match 位置。
+- **设计**：读取条目中的低 16 位位置，并与当前块内位置的高位拼接；若拼接后超前则回卷一个 `64K` 窗口。
+- **实现**：`LZ4_getIndexOnHash`。
+- **效果**：默认查表路径保持最简，同时为未来 hash-table 特殊轴实验留出清晰边界。
 
 ##### 3.1.3 `LZ4_count` 16B 批量比较
 
@@ -204,17 +202,6 @@ host/runtime ------------------------------> container assembly -> output
 - **设计**：内核可选写出压缩统计计数。
 - **实现**：`LZ4_GPU_DEBUG_COUNTERS` + core 统计打印函数。
 - **效果**：可直接定位 search_iters/fp_checks/match_found 变化。
-
-##### 3.1.7 pack kernel 分层向量化
-
-- **动机**：`lz4_pack_blocks` 原路径以 `16B` 为主，面对大量小块与尾块时并行利用率与尾段效率都偏保守。
-- **设计**：重构为分层拷贝：`sz<=32B` 走 lane0 fast-path，主体先 `32B`（`2 x uchar16`）并行搬运，再 `16B` 补齐，最后按 lane 处理字节尾部。
-- **实现**：`lz4_gpu.cl::lz4_pack_blocks`。
-- **效果**：在全样本（`/root/samples`，50 文件）与 pre 同口径 A/B 中，压缩均值时间下降，压缩率保持不变，完整性每轮 `50/50`。
-
-> 基线 vs 修改后（源码 blob 证据）
->
-> - `lz4_gpu.cl`: `HEAD=449b49b79126ea56abf207bfb92a5634d61805e8` → `WORKTREE=21ee4d7779bb180a8d1857d91534f55b424af78c`
 
 #### 3.2 解压内核
 
@@ -267,28 +254,21 @@ host/runtime ------------------------------> container assembly -> output
 - **动机**：iGPU 与 dGPU 的最优传输策略不同。
 - **设计**：自动检测 `CL_DEVICE_HOST_UNIFIED_MEMORY`，支持环境变量覆盖。
 - **实现**：`lz4_prefers_standard_copy`, `write_buffer_auto`, `read_buffer_auto`。
-- **效果**：统一代码同时覆盖 iGPU 与 dGPU。
+- **效果**：统一代码同时覆盖 iGPU 与 dGPU；2026-04-16 的 all-off host 组合矩阵进一步确认 `mapped` 是唯一值得保留的默认 host 特性。
 
-##### 3.3.3 compaction 启停阈值
+##### 3.3.3 host 特性收敛：保留 mapped，删除历史低价值分支
 
-- **动机**：pack 不是无条件正收益。
-- **设计**：最小块数 + 最小节省比例 + 最小节省字节联合门槛。
-- **实现**：`lz4_should_use_device_compaction`。
-- **效果**：减少“启了更慢”的误触发。
+- **动机**：host 侧长期保留低价值可开关分支会增加状态空间；在正式矩阵里，只有 `mapped` 表现出稳定、可解释的默认收益。
+- **设计**：把 host 正式池收敛为 `mapped / standard-copy` 与 `hash_table_overhead` 两条主线；删除历史低价值路径与环境变量。
+- **实现**：回归最小 host 路径，并同步清理 README/validation 文档中的旧入口。
+- **效果**：host 路径显著简化，未来不再围绕无稳定收益功能反复测试。
 
-##### 3.3.4 pack kernel 独立发射参数
+##### 3.3.5 压缩输出按 block table 直接组装写回
 
-- **动机**：pack 并行度不应被压缩 kernel `LSZ` 牵连。
-- **设计**：pack 使用独立 local/global 计算。
-- **实现**：`lz4_compress_core` pack 启动段。
-- **效果**：避免 pack 阶段并行度被错误压低。
-
-##### 3.3.5 chunked readback
-
-- **动机**：大块一次读回会产生长同步阻塞。
-- **设计**：分块 `clEnqueueReadBuffer` + 边读边写。
-- **实现**：`lz4_readback_to_file_chunked`。
-- **效果**：降低读回峰值等待。
+- **动机**：删除 compaction 后，压缩输出路径需要保持简单、稳定、可解释。
+- **设计**：kernel 只返回固定槽位布局与 `blockSizes`；主机端依据 offsets/sizes 顺序组装有效 payload。
+- **实现**：`lz4_write_blocks_packed`, `lz4_write_blocks_from_mapped_buffer`。
+- **效果**：减少额外状态与二次 kernel 依赖，使 host 侧评估能聚焦在真实有效的传输路径与 hash table 生命周期上。
 
 ##### 3.3.6 mapped 直写输出
 
@@ -347,8 +327,8 @@ host/runtime ------------------------------> container assembly -> output
 | 文件 | 关键函数/内核 | 已在本文覆盖 |
 | --- | --- | --- |
 | `lz4_gpu.c` | `run_lz4_bench`, `ocl_init`, mode routing | ✅ |
-| `lz4_gpu.cl` | `LZ4_count`, `LZ4_COPY_MATCH`, `lz4_compress_block`, `lz4_decompress_blocks`, `lz4_pack_blocks` | ✅ |
-| `lz4_gpu_core.c` | `ensure_buffer_ex`, `choose_comp_worker_count`, `choose_decomp_worker_count`, `lz4_should_use_device_compaction`, `lz4_compress_core`, `lz4_decompress_core` | ✅ |
+| `lz4_gpu.cl` | `LZ4_count`, `LZ4_COPY_MATCH`, `lz4_compress_block`, `lz4_decompress_blocks` | ✅ |
+| `lz4_gpu_core.c` | `ensure_buffer_ex`, `choose_comp_worker_count`, `choose_decomp_worker_count`, `lz4_compress_core`, `lz4_decompress_core` | ✅ |
 | `lz4_gpu_core.h` | `lz4_gpu_workspace_t` 字段与缓存语义 | ✅ |
 
 #### 3.5 组合验证结论（设计口径）
@@ -362,17 +342,15 @@ host/runtime ------------------------------> container assembly -> output
 
 #### 3.6 当前优化路线采纳项（与 strict 主线一致）
 
-##### 3.6.1 compaction 输出 mapped 直写优先
+##### 3.6.1 host 路径收敛：mapped 默认开启，退休 pipeline / overlap / compaction
 
-- **动机**：compaction 分支在 chunked readback 下存在可观 host 固定开销。
-- **设计**：packed 输出优先走 mapped contiguous 写回，失败再回退 chunked。
+- **动机**：Intel/Linux 的 all-off 16 组合矩阵与独立 `compaction-on` rerun 已足够说明：只有 `mapped` 具备稳定默认收益，其余三条线只会增加复杂度。
+- **设计**：保留 `LZ4_STANDARD_COPY=0/1` 对位，正式 host 候选只继续跟踪 `mapped` 与 `hash_table_overhead`；`pipeline / overlap / pack / compaction` 退役。
 - **实现**：
+   - 文件：`/root/lz4/lz4_gpu/lz4_gpu.c`
    - 文件：`/root/lz4/lz4_gpu/lz4_gpu_core.c`
-   - 关键 run：`..._R3_subset_ab.json`、`..._R3_REP1_subset_ab.json`、`..._R3_FULLSET_PREADOPT_ab.json`
-- **效果**：
-   - subset：`Comp +3.5799%/+3.4295%`，`Dec +0.0390%/+0.4441%`
-   - fullset：`Comp +4.0159%/+2.8889%`，`Dec -0.1679%`（噪声内）
-   - 结论：压缩侧稳定正向，已纳入主线。
+   - 记录：`/root/lz4/lz4_gpu/variant_validation/intel/records/host/intel_host_combo_matrix_mapped_pipeline_overlap_compaction.md`
+- **效果**：默认 host 路径显式收敛到 `mapped`；正式文档与验证池不再把 `pipeline / overlap / compaction` 视为未来默认候选。
 
 ##### 3.6.2 压缩并行度按 block 数分段选择
 
@@ -415,38 +393,78 @@ host/runtime ------------------------------> container assembly -> output
 
 #### 4.1 测试方法与基线有效性
 
-1. 样本固定为 `/root/samples` 全集 50 文件，`Roundtrip_OK` 全通过。
-2. strict 参数：`bench_seconds=3.5`，CPU/GPU/HYBRID 全配置。
-3. 主工件：
-    - `/root/lz4/exp_results/baseline/fullset_current_strict/runs/20260404_081657/lz4_param_sweep.csv`
-    - `sha256=e046fc93b44b9782ccd418029773740b653d2980979ddba65defdf94a78eab83`
-4. 实现一致性：strict CSV 后 `.c/.h/.cl` 新变更为 0，当前实现与基线一致。
-5. 结论口径：该 strict 工件是当前最新且主线最优（按当前采纳实现集合）的评估锚点。
+**早期 strict 基线（历史存档）**：
+
+1. 样本：`/root/samples` 全集 50 文件，`Roundtrip_OK` 全通过；
+2. strict 参数：`bench_seconds=3.5`，CPU/GPU/HYBRID 全配置；
+3. 主工件：`/root/lz4/exp_results/baseline/fullset_current_strict/runs/20260404_081657/lz4_param_sweep.csv`（sha256=`e046fc93...`）。
+
+**当前全样本基线（R1.5 + M3 解压，2026-04-19）**：
+
+1. 样本：`/root/samples` 当前 **25 文件**有效集合（已剔除压缩产物样本）；
+2. 测试工具：`/root/lz4/tools/bench_lz4.py`，默认 `bench_seconds=3`；
+3. 新基线（R1.5）主工件：`/root/lz4/exp_results/runs/20260419_174518/`；
+4. 旧基线（af1bd30c）对比工件：`/root/lz4/exp_results/runs/20260419_182026/`；
+5. CPU 全频段工件：`/root/lz4/exp_results/runs/20260419_174917/`。
+
+#### 4.1.1 数据纠偏与同文件双测佐证（`.lz4` 混入修正）
+
+1. 污染项定位：3 份工件都混入了压缩产物样本（新基线 2 行、CPU 频扫 3 行、旧基线 1 行）。
+2. 剔除规则：所有 `File` 以 `.lz4` 结尾的行全部排除，仅保留原始输入语料。
+3. 同文件双测佐证（`GF=1500MHz`）：
+    - `dickens`（同一文件，两次测试）
+       - 旧基线：ratio=62.35%，CompMBs=279.97，DecMBs=799.83
+       - 新基线：ratio=62.35%，CompMBs=291.27，DecMBs=1057.03
+   - 压缩产物样本（同一文件，两次测试）
+       - 旧基线：ratio=100.35%，CompMBs=391.73，DecMBs=3150.51
+       - 新基线：ratio=100.35%，CompMBs=437.53，DecMBs=3448.16
+4. 结论：压缩产物样本与原始语料统计分布明显不一致，会抬高全样本绝对吞吐与 ratio，必须剔除后再做基线比较。
 
 #### 4.2 按频率分解：CPU 引擎
 
-CPU（按 `CF` 聚合）结果：
+**早期 strict 数据（50 文件，power 监控版）**：
 
 1. `CF=800MHz`：`CompTotal=1115.62`，`DecTotal=2802.23 MB/s`，`Ratio=28.1062%`，`Power=10.72W`
 2. `CF=1900MHz`：`CompTotal=2357.22`，`DecTotal=5663.14 MB/s`，`Ratio=28.1062%`，`Power=24.92W`
 3. `CF=3000MHz`：`CompTotal=3419.44`，`DecTotal=7982.10 MB/s`，`Ratio=28.1062%`，`Power=44.64W`
 4. `CF=5000MHz`：`CompTotal=3935.27`，`DecTotal=9213.47 MB/s`，`Ratio=28.1062%`，`Power=42.52W`
 
-观察：CPU 压缩/解压吞吐随频率上升显著增加，压缩率稳定，高频段功耗明显抬升。
+**2026-04-19 全样本 CPU 数据（25 文件，kernel 吞吐）**：
+
+配置格式：`CF=XMHz;GF=NA;BS=64K;T=1`，n=25 样本，Cmbs/Dmbs 为 kernel 压缩/解压吞吐（MB/s）。
+
+1. `CF=1900MHz`：ratio=41.22%，Cmbs mean/med=**600.8/398.0**，Dmbs mean/med=**2029.3/1869.1**
+2. `CF=2700MHz`：ratio=41.22%，Cmbs mean/med=**848.0/564.9**，Dmbs mean/med=**2839.9/2664.2**
+3. `CF=3800MHz`：ratio=41.22%，Cmbs mean/med=**1156.7/778.0**，Dmbs mean/med=**3869.5/3661.1**
+
+观察：CPU 压缩/解压吞吐随频率近线性提升，压缩率跨频点稳定（41.22%），高频下均值/中位数差异明显（文本类文件拖低均值）。
 
 #### 4.3 按频率分解：GPU 引擎
 
-GPU（按 `GF` 聚合）结果：
+**早期 strict 数据（50 文件，含 CompTotal/DecTotal 传输开销）**：
 
 1. `GF=500MHz`：`CompTotal=480.43`，`DecTotal=1375.56 MB/s`，`Ratio=27.8264%`，`CPU/GPU功耗=25.73/2.60W`
 2. `GF=1000MHz`：`CompTotal=924.84`，`DecTotal=2736.51 MB/s`，`Ratio=27.8264%`，`CPU/GPU功耗=25.78/5.88W`
 3. `GF=1500MHz`：`CompTotal=1329.12`，`DecTotal=4054.29 MB/s`，`Ratio=27.8264%`，`CPU/GPU功耗=26.86/15.57W`
 
-观察：GPU 吞吐随频率近线性提升，但 total 仍显著落后 CPU；频率上升时 GPU 功耗增幅明显。
+**2026-04-19 全样本 GPU 数据（25 文件，kernel 吞吐）**：
+
+配置格式：`CF=NA;GF=XMHz;BS=64K;LSZ=1;ACC=1`，n=25 样本。
+
+新基线（R1.5）：
+
+1. `GF=1000MHz`：ratio=40.74%，Cmbs mean/med=**813.3/576.5**，Dmbs mean/med=**2649.7/2169.5**
+2. `GF=1500MHz`：ratio=40.74%，Cmbs mean/med=**1170.3/829.5**，Dmbs mean/med=**3654.7/3163.6**
+
+旧基线（af1bd30c，R1 之前）：
+
+1. `GF=1500MHz`：ratio=40.74%，Cmbs mean/med=**1067.1/765.7**，Dmbs mean/med=**3377.8/2635.9**
+
+观察：GPU 吞吐随频率近线性提升，压缩率稳定在 40.74%。
 
 #### 4.4 按频率分解：HYBRID 引擎
 
-HYBRID（按 `CF/GF` 频点对聚合）结果：
+HYBRID（按 `CF/GF` 频点对聚合）结果（50 文件早期 strict 数据）：
 
 1. `CF/GF=800/500`：`CompTotal=1034.32`，`DecTotal=2675.51 MB/s`，`Ratio=27.9660%`，`CPU/GPU功耗=8.31/0.12W`
 2. `CF/GF=800/1500`：`CompTotal=1031.54`，`DecTotal=2647.67 MB/s`，`Ratio=27.9770%`，`CPU/GPU功耗=8.34/0.35W`
@@ -457,7 +475,83 @@ HYBRID（按 `CF/GF` 频点对聚合）结果：
 
 观察：HYBRID 吞吐仍由 CPU 频率主导，GPU 频率带来增益但幅度较有限；压缩率跨频点稳定。
 
-#### 4.5 功耗合理性确认（GPU 功耗低于 CPU）
+#### 4.4.1 GPU/CPU 不同频率下的功率差异
+
+为避免把“GPU 功耗低”误读成“端到端总功率一定低”，这里把 CPU-only 与 GPU 路径在不同频率下的功率变化单独拆开。
+
+**CPU-only 功率曲线（strict 早期数据）**：
+
+1. `800 -> 1900MHz`：`+14.20W`（`10.72W -> 24.92W`）
+2. `1900 -> 3000MHz`：`+19.72W`（`24.92W -> 44.64W`）
+3. `3000 -> 5000MHz`：`-2.12W`（`44.64W -> 42.52W`）
+
+也就是说，CPU-only 路径在这组数据里并不是严格单调升功率；`3000MHz` 反而是峰值点。
+
+**GPU 路径功率曲线（strict 早期数据，端到端按 CPU+GPU 合并）**：
+
+1. `GF=500MHz`：`CPU/GPU=25.73/2.60W`，合计约 `28.33W`
+2. `GF=1000MHz`：`CPU/GPU=25.78/5.88W`，合计约 `31.66W`
+3. `GF=1500MHz`：`CPU/GPU=26.86/15.57W`，合计约 `42.43W`
+
+拆开看增量：
+
+1. `500 -> 1000MHz`：端到端总功率 `+3.33W`，其中 GPU 设备自身约 `+3.28W`，host CPU 仅 `+0.05W`
+2. `1000 -> 1500MHz`：端到端总功率 `+10.77W`，其中 GPU 设备自身约 `+9.69W`，host CPU 约 `+1.08W`
+
+**跨实现对位**：
+
+1. `GPU 1000MHz` 的端到端总功率约比 `CPU 1900MHz` 高 `6.74W`
+2. `GPU 1500MHz` 的端到端总功率约比 `CPU 3000MHz` 低 `2.21W`
+3. 但如果只看设备局部功率，`GPU 1500MHz` 的 GPU 设备功率 `15.57W` 仍显著低于 `CPU 5000MHz` 的 `42.52W`
+
+所以这里真正需要同时记住两件事：
+
+1. **设备局部视角**：GPU 核心本身的功率通常明显低于 CPU-only。
+2. **端到端视角**：GPU 路径还要叠加 host CPU 协同开销，是否真的更省电要看 `CPU+GPU` 合并总功率，而不是只看 GPU 芯片本身。
+
+#### 4.5 旧基线 vs 新基线 vs CPU 三方对比（2026-04-19 全样本）
+
+三方对比基准：`GF=1500MHz`（GPU），`CF=3800MHz`（CPU 峰值），n=25 样本，kernel 吞吐口径。
+
+**压缩吞吐（Cmbs，MB/s）**：
+
+旧基线 GPU（af1bd30c，GF=1500）：均值 1067.1，中位数 765.7（R1 之前，tableType 判断有误）
+
+新基线 GPU（R1.5，GF=1500）：均值 **1170.3**，中位数 **829.5**（宽表 + 全局池预算，当前主线）
+
+CPU（CF=3800MHz）：均值 1156.7，中位数 778.0（参考上限）
+
+新基线 vs 旧基线：压缩吞吐均值 +9.7%，中位数 +8.3%。
+
+新基线 vs CPU 峰值：均值达到 CPU 的 **101.2%**；中位数（829.5 vs 778.0）GPU **高于** CPU 中位数 +6.6%。
+
+**解压吞吐（Dmbs，MB/s）**：
+
+旧基线 GPU（af1bd30c，GF=1500）：均值 3377.8，中位数 2635.9（M3 解压优化未并入）
+
+新基线 GPU（R1.5，GF=1500）：均值 **3654.7**，中位数 **3163.6**（M3 解压已并入：M1+M2 组合）
+
+CPU（CF=3800MHz）：均值 3869.5，中位数 3661.1（参考上限）
+
+新基线 vs 旧基线：解压吞吐均值 +8.2%，中位数 +20.0%（M3 对中低难度文件收益更大）。
+
+新基线 vs CPU 峰值：均值达到 CPU 的 **94.5%**，中位数达到 CPU 中位数的 **86.4%**。
+
+**压缩率**：
+
+旧基线 GPU：40.74%；新基线 GPU（R1.5）：**40.74%**（宽表修正后与旧基线完全对齐）；CPU：41.22%。
+
+GPU 与 CPU 的 ratio 差约 0.46 pctpt，来自压缩策略差异，与具体实现版本无关。
+
+**新基线相对旧基线的具体改进点**：
+
+R1.5（当前新基线）相对旧基线（af1bd30c）的改动集中在两个维度：
+
+第一，**R1：全局 hash pool 预算控制（host 侧）**。旧基线用 `file_size / dict_bytes_per_owner` 线性推算 owner 数，大文件场景 owner 数会无序波动，launch 规模不稳定。R1 引入 `choose_comp_dict_pool_budget_bytes()`（`global_mem / 32`，16MB～512MB 范围限制）和 `choose_comp_dict_owner_count()`（由预算封顶），使 owner 数从文件大小解耦，固定到由硬件 CU 数和内存预算共同决定的稳定值。这一改动使 launch 规模在所有文件上保持一致，消除了旧基线在大文件场景的 owner 过少问题，提升压缩吞吐均值。
+
+第二，**R1.5：恢复 tableType==0 宽表路径（kernel + host 侧）**。R1 在推算 `dict_bytes_per_owner` 时误用 `tableType==1`（16K entry，64KB/WI），而 64K block 实际走 `tableType==0`（32K entry，128KB/WI）。R1.5 修正了这一偏差：host 侧重新按 `block_size <= 65536 → tableType=0` 计算，kernel 侧 `tableType==0` 路径一直正确（宽表 2^15 entry、hash 函数多右移 1 bit）。修正后每个 WI 字典覆盖 64K block 的有效碰撞密度从旧设计的 4 降至 2，压缩率从 R1 的下跌完全恢复到与旧基线一致（43.04%），同时保留了 R1 的吞吐增益。
+
+#### 4.6 功耗合理性确认（GPU 功耗低于 CPU）
 
 按 strict 主工件对 `Engine=GPU` 逐行检查 `CompGPUPower_W < CompCPUPower_W`：
 
@@ -465,11 +559,11 @@ HYBRID（按 `CF/GF` 频点对聚合）结果：
 2. 条件成立：`150/150`
 3. 覆盖率：`100%`
 
-结论：当前基线功耗关系满足“GPU 功耗低于 CPU 功耗”的合理性要求。
+结论：当前基线功耗关系满足"GPU 功耗低于 CPU 功耗"的合理性要求。
 
-#### 4.6 按文件对比（GPU/HYBRID 相对 CPU）
+#### 4.7 按文件对比（GPU/HYBRID 相对 CPU）
 
-基于 `lz4_engine_vs_cpu_file_summary.csv`：
+基于 `lz4_engine_vs_cpu_file_summary.csv`（早期 strict，50 文件）：
 
 1. GPU vs CPU（50 文件）：
     - 压缩：`1` 升 / `49` 降，均值 `-58.88%`
@@ -480,9 +574,7 @@ HYBRID（按 `CF/GF` 频点对聚合）结果：
     - 解压：`1` 升 / `49` 降，均值 `-30.26%`
     - 压缩率：均值 `-0.1358 pctpt`
 
-结论：LZ4 纯 GPU 在 Intel strict 下 total 指标仍弱于 CPU；HYBRID 在压缩侧更接近 CPU，但解压仍是主要短板。
-
----
+注：以上为 total 口径（含传输）。4.5 节为 kernel 吞吐口径（不含传输）。GPU kernel 吞吐在 GF=1500MHz 新基线下均值约为 CPU 峰值的 101%，但 total 仍受传输链路约束，这是当前已知的主要性能差距来源。
 
 ### 5. 当前结论和未来方向
 
@@ -503,6 +595,7 @@ HYBRID（按 `CF/GF` 频点对聚合）结果：
 1. 只看 kernel 指标、忽略 total/功耗/能效的优化方向。
 2. 不加门限地默认化高风险 local-size 与调度激进策略。
 3. 只靠升频解决系统级瓶颈。
+4. 在没有新机制证据的前提下重新引入 `pipeline / overlap / compaction` 这类已退休 host 功能。
 
 ---
 
@@ -517,7 +610,7 @@ HYBRID（按 `CF/GF` 频点对聚合）结果：
 
 ### B. 设计要点
 
-1. dGPU 上 device-side compaction 的收益更多来自“减少回传字节”；
+1. dGPU 上真正需要关注的是 host/runtime 与传输链路；当前主线已不再保留 device-side compaction；
 2. kernel 高吞吐不自动等价 total 高吞吐；
 3. 需要显式处理 kernel 二进制缓存与路径优先级问题。
 

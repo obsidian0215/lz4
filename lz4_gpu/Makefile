@@ -1,3 +1,11 @@
+ifeq ($(OS),Windows_NT)
+MSYS2_USR_BIN ?= C:/msys64/usr/bin
+ifneq ($(wildcard $(MSYS2_USR_BIN)/sh.exe),)
+SHELL := $(MSYS2_USR_BIN)/sh.exe
+export PATH := $(MSYS2_USR_BIN);$(PATH)
+endif
+endif
+
 CC ?= cc
 HOSTCC ?= cc
 
@@ -11,7 +19,7 @@ OPENCL_LIB_NAME ?= OpenCL
 OPENCL_CFLAGS := $(if $(OPENCL_INCLUDE_DIR),-I$(OPENCL_INCLUDE_DIR),)
 OPENCL_LDFLAGS := $(if $(OPENCL_LIB_DIR),-L$(OPENCL_LIB_DIR),) -l$(OPENCL_LIB_NAME)
 CFLAGS ?= -O2 -Wall -DCL_TARGET_OPENCL_VERSION=200 -DWIN32_LEAN_AND_MEAN -I. -I../lib -I.. $(OPENCL_CFLAGS)
-LDFLAGS ?= $(OPENCL_LDFLAGS) -lm $(PTHREAD_LIB)
+LDFLAGS ?= $(OPENCL_LDFLAGS) -lm $(PTHREAD_LIB) -lws2_32
 HOST_OPENCL_CFLAGS ?=
 HOST_OPENCL_LDFLAGS ?=-lOpenCL -lm -lpthread
 PRECOMPILE_HELPER := build_clbin_host$(HOSTEXEEXT)
@@ -51,9 +59,9 @@ build_clbin_host: build_clbin.c
 
 precompile: $(PRECOMPILE_HELPER)
 	@echo "Precompiling LZ4 GPU kernels for various hash sizes..."
-	@for bits in 14 15; do \
-		echo "Building lz4_gpu_$$bits.clbin (LZ4_HASHLOG=$$bits)..."; \
-		./$(PRECOMPILE_HELPER) -o lz4_gpu_$$bits.clbin "-I. -DLZ4_HASHLOG=$$bits" || exit 1; \
+	@for bits in 14; do \
+		echo "Building lz4_gpu_$${bits}.clbin (LZ4_HASHLOG=$$bits)..."; \
+		./$(PRECOMPILE_HELPER) -o lz4_gpu_$${bits}.clbin "-I. -DLZ4_HASHLOG=$$bits" || exit 1; \
 	done
 
 clean:

@@ -1,223 +1,249 @@
-# LZ4 GPU 优化路线（可读版）
+# LZ4 GPU 优化路线
 
-## Wave-0 噪声阈值（G1 门禁，2026-04-06）
+## 1. 文档边界
 
-测量口径
+- 本文件用于记录优化路径与实验历史；
+- `PERFORMANCE_SUMMARY.md` 仅保留“当前并线实现结果 + 基线比较”；
+- 本文件中的实验按两类维护：
+  1. 已采纳修改：必须包含动机、设计、实现、测试结果；
+  2. 未采纳修改：仅维护未采纳表格。
 
-- 样本目录：`/root/samples_subset`
-- 重复次数：`3`
-- 单轮时长：`bench_seconds=3.5`
-- 代表配置：`GPU-only, block=64K, local=1, accel=1, no-freq-scan`
-- 阈值公式：`|Δ| > max(1.5×MAD, P95(|noise_delta|))`
-- 判定方向：`CompTotalMBs`、`DecTotalMBs`、`Ratio%` 均按“越大越好”；`Δ <= -threshold_abs` 记为明显回退，`Δ >= threshold_abs` 记为明显提升。
-- 阈值工件：`/root/lz4/exp_results/noise_profiles/g1/thresholds/lz4_gpu.json`
+---
 
-当前门禁阈值（LZ4 GPU）
+## 2. 已采纳修改（当前主线）
 
-- `CompTotalMBs(mean)`：`threshold_abs=0.7376 MB/s`
-- `CompTotalMBs(median)`：`threshold_abs=0.1200 MB/s`
-- `DecTotalMBs(mean)`：`threshold_abs=2.7521 MB/s`
-- `DecTotalMBs(median)`：`threshold_abs=0.1650 MB/s`
-- `Ratio%(mean)`：`threshold_abs=0.0000 pctpt`
-- `Ratio%(median)`：`threshold_abs=0.0000 pctpt`
+### 2.1 Mapped host copy 默认开启
 
-说明
+#### 动机
 
-- 以上阈值用于当前 Wave-0 的 subset/fullset 采纳门禁；若后续切换配置空间或计时口径，需要重新测量并覆盖本节。
-- `Ratio%` 阈值为 `0` 表示噪声测量中几乎无抖动，后续仍按“均值+中位数双判 + 全样本10轮”执行。
+- Intel/Linux 的 all-off host 组合矩阵表明：`mapped` 是唯一稳定、可解释、值得默认开启的 host 特性；
+- `pipeline / overlap / compaction` 长期保留只会增加状态空间，并污染后续 hash/dict 优化的对比基线。
 
-## 全集基线结果（当前保留）
+#### 设计
 
-- 基线全集目录：`/root/lz4/exp_results/runs/fullset_allcfg_current_lz4/runs/20260403_151152`
-- 基线全集主结果：`lz4_param_sweep.csv`
-- 主结果哈希：`sha256=41fa025e53b917bb270e93b710cd3a76e6f3a5bdff75074d1e49cb8ddde3cf88`
-- 配置汇总哈希：`sha256=976e6bff7acc1fe4f01812e787b5ce2278f305f07786ca4717695002af7dfafa`
-- 行数与完整性：`rows=1150`，`Roundtrip_OK=1150/1150`，引擎覆盖 `CPU/GPU/HYBRID`
-- GPU 引擎聚合：`CompTotal mean=989.55 MB/s`，`DecTotal mean=2683.94 MB/s`，`Ratio mean=27.8264%`
+- 统一内存设备默认走 `LZ4_STANDARD_COPY=0`（mapped）路径；
+- `LZ4_STANDARD_COPY=1` 只保留为显式 A/B 或 dGPU fallback；
+- 不再围绕默认配置保留 `pipeline / overlap / compaction` 开关。
 
-## 已采纳修改
+#### 实现
 
-### Compaction 输出 mapped 直写优先
+- 文件：`lz4_gpu/lz4_gpu_core.c`
+- 关键函数：`lz4_prefers_standard_copy()`、`write_buffer_auto()`、`read_buffer_auto()`
+- 关键记录：`lz4_gpu/variant_validation/intel/records/host/intel_host_combo_matrix_mapped_pipeline_overlap_compaction.md`
 
-动机
+#### 测试结果
 
-- compaction 分支使用 chunked readback 时 host 开销明显。
+- 组合矩阵最终把 `m1 p0 o0 c0` 作为 host 收敛方向：`mapped` 保留，`pipeline / overlap / compaction` 退休；
+- 独立 `compaction-on` rerun（`intel_host_r5_pack_gate_compaction_enable`）给出：`comp_kernel_execution_ms avg -4.9327%`、`comp_inclusive_tp_mbs avg -1.9592%`、`ratio 0`；
+- 结论：host 默认路径应当简化为 `mapped`，而不是继续围绕已退休功能做门控调参。
 
-设计
+---
 
-- packed 输出优先走 mapped contiguous 写回，失败才回退 chunked readback。
+### 2.2 压缩并行度按 block 数分段选择
 
-实现
+#### 动机
 
-- 主要文件：`/root/lz4/lz4_gpu/lz4_gpu_core.c`
-- 关键 run：`..._R3_subset_ab.json`、`..._R3_REP1_subset_ab.json`、`..._R3_FULLSET_PREADOPT_ab.json`
+- mapped 写回落地后，压缩并行饱和度仍有提升空间。
 
-测试结果
+#### 设计
 
-- subset：`Comp +3.5799%/+3.4295%`，`Dec +0.0390%/+0.4441%`
-- subset 复验：`Comp +3.7254%/+2.9292%`
-- fullset：`Comp +4.0159%/+2.8889%`，`Dec -0.1679%`（噪声内）
+- `choose_comp_worker_count()` 改为按 block 数分段取值，替代固定策略。
 
-采纳原因
+#### 实现
 
-- 压缩侧显著稳定增益，复验一致。
+- 文件：`lz4_gpu/lz4_gpu_core.c`
+- 关键函数：`choose_comp_worker_count()`
 
-### 压缩并行度按 block 数分段选择
+#### 测试结果
 
-动机
+- subset：`Comp +2.2179% / -0.0489%`
+- fullset：`Comp +2.2321% / -0.1206%`
+- 采纳后复核：`Comp +2.0454% / +0.0360%`
 
-- 在 mapped 写回优化后继续提升压缩并行饱和度。
+---
 
-设计
+### 2.3 回退过激 occupancy，保留 null-sink 快路与按需 offsets
 
-- `choose_comp_worker_count()` 改为按 block 数分段选择并行度。
+#### 动机
 
-实现
+- 需要在压缩收益与解压副作用之间做稳态平衡。
 
-- 文件：`/root/lz4/lz4_gpu/lz4_gpu_core.c`
-- 关键 run：`..._R6_subset_ab.json`、`..._R6_FULLSET_PREADOPT_ab.json`、`..._MAIN_AFTER_R6_FULLSET_ab.json`
+#### 设计
 
-测试结果
+- 回退过激 occupancy 调整；
+- 保留 null-sink 快路；
+- 保留按需 offsets 构建。
 
-- subset：`Comp +2.2179%/-0.0489%`，`Dec -0.4026%/+0.1163%`
-- fullset：`Comp +2.2321%/-0.1206%`，`Dec -0.5505%/-0.0080%`
-- 采纳后复核：`Comp +2.0454%/+0.0360%`，`Dec -0.7145%/-0.0440%`
+#### 实现
 
-采纳原因
+- 文件：`lz4_gpu/lz4_gpu_core.c`
 
-- 压缩收益稳定，满足主线目标。
+#### 测试结果
 
-### 回退过激 occupancy，保留 null-sink 快路与按需 offsets
-
-动机
-
-- 在保留压缩收益的同时收敛解压副作用。
-
-设计
-
-- 回退过激 occupancy 调整，保留 null-sink 快路与按需 offsets。
-
-实现
-
-- 文件：`/root/lz4/lz4_gpu/lz4_gpu_core.c`
-- 关键 run：`..._R13_subset_ab.json`、`..._R13_FULLSET_PREADOPT_ab.json`
-
-测试结果
-
-- subset：`Comp +2.5761%/+2.5714%`，`Dec -0.4391%/-2.2426%`
-- fullset：`Comp +2.7644%/+1.9320%`，`Dec -0.7839%/-0.4742%`
+- subset：`Comp +2.5761% / +2.5714%`，`Dec -0.4391% / -2.2426%`
+- fullset：`Comp +2.7644% / +1.9320%`，`Dec -0.7839% / -0.4742%`
 - 压缩文件占比：`48/50` 提升
 
-采纳原因
+---
 
-- 在压缩主目标上收益最稳，整体权衡优于备选方案。
+### 2.4 解压 metadata 条件上传（保留 `sizes_out` 读回）
 
-### 解压 metadata 条件上传（保留 sizes_out 读回）
+#### 动机
 
-动机
+- bench 循环中 metadata 重复上传带来固定耗时。
 
-- 解压 bench 元数据重复上传带来固定开销。
+#### 设计
 
-设计
+- metadata 不变时跳过 `comp_off/comp_size` 上传；
+- 保留每轮 `sizes_out` 读回，避免稳定性回退。
 
-- metadata 不变时跳过 `comp_off/comp_size` 重复上传。
-- 保留 `sizes_out` 每轮读回，避免不稳定副作用。
+#### 实现
 
-实现
+- 文件：`lz4_gpu/lz4_gpu.c`
 
-- 文件：`/root/lz4/lz4_gpu/lz4_gpu.c`
-- 结果文件：`/root/lz4/exp_results/runs/gpu_dec_meta_cache_r1/results/lz4_subset_ab_cleanhead_v1.json`
+#### 测试结果
 
-测试结果
+- `Comp +0.1180% / +0.6098%`
+- `Dec +0.8131% / +1.6361%`
+- `Dec` 文件占比：`8/8` 提升
 
-- `Comp +0.1180%/+0.6098%`
-- `Dec +0.8131%/+1.6361%`
-- 解压文件占比：`8/8` 提升
+---
 
-采纳原因
+### 2.5 块内 lazy-match 建模（深改，首轮并线）
 
-- 解压稳定正向，且压缩侧无门限外退化。
+#### 动机
 
-### R1 深改候选：Compaction 分布感知门控 + Packed 自动回写
+- 常规块大小（`64K`）口径下仍存在压缩率尾部；
+- 需要“非策略切换、非文件名驱动”的结构级改动，提升块内匹配质量。
 
-动机
+#### 设计
 
-- 旧版 compaction 决策主要依赖固定阈值，对“块分布差异”与“传输路径差异（standard-copy vs mapped）”不敏感。
-- packed 输出路径在 compaction 分支上长期固定 chunked readback，未利用 iGPU 下的 mapped contiguous 写回优势。
+- 在 `lz4_compress_core_accelerated()` 中加入一次 look-ahead：
+  - 当前匹配点 `ip` 与 `ip+1` 进行候选比较；
+  - 当 `nextLen >= curLen + gain` 时，采用 `ip+1` 的匹配（lazy 选择）；
+- 默认参数：`enable=1, gain=1, accel_max=2`；
+- 通过编译宏暴露可控项：
+  - `LZ4_GPU_ENABLE_LAZY`
+  - `LZ4_GPU_LAZY_GAIN`
+  - `LZ4_GPU_LAZY_ACCEL_MAX`
 
-设计
+#### 实现
 
-- 引入块分布统计：`fill_ratio`、`active_ratio`、`mad_ratio`（平均绝对偏差归一化）。
-- 在 `min_gain_pct` 上叠加自适应修正：同时考虑 `use_standard_copy` 与分布统计，得到 `adaptive_gain_pct`。
-- 增加“致密且均匀分布”微收益保护：避免在几乎无洞布局上误触发 pack kernel。
-- packed 输出新增自动写回策略：
-  - non-standard-copy 下优先 mapped contiguous 写回；
-  - mapped 失败自动回退 chunked readback；
-  - 对低 fill 场景自适应收敛 readback chunk。
+- 内核文件：`lz4_gpu/lz4_gpu.cl`
+  - 新增 lazy 宏默认值；
+  - 在主匹配循环插入 look-ahead 决策逻辑。
+- 主机端编译参数：`lz4_gpu/lz4_gpu_core.c`
+  - `lz4_load_program()` 新增 lazy 宏注入；
+  - 仅当 lazy 参数为默认值时，允许加载预编译 `clbin`。
+- 预编译产物命名：`lz4_gpu/Makefile`
+  - 输出改为 `lz4_gpu_14_model_v2.clbin`、`lz4_gpu_15_model_v2.clbin`。
 
-实现
+#### 测试结果（Windows / RTX 4070 Ti SUPER / `bench samples=50`）
 
-- 代码文件：`/root/lz4/lz4_gpu/lz4_gpu_core.c`
-- 新增核心逻辑：
-  - `lz4_collect_compaction_stats(...)`
-  - `lz4_compaction_adaptive_gain_pct(...)`
-  - `lz4_write_compacted_payload_auto(...)`
-- 工件与哈希：
-  - `/root/lz4/exp_results/runs/gpu_deep_compaction_r1/artifacts/adoption_manifest_r1.txt`
-  - candidate binary sha256：`645e4046a89f4d32f7ef0f7479eabd4b719f4439c64370687690ead1dca10d98`
-  - baseline binary sha256：`730253128ef8c18c166544eeb29cd45385377ffef090f8eb7fde333c91dd3074`
+- 工件：`lz4/exp_results/baseline/lazy_ab_samples_64k1_rerun_20260408.csv`
+- 配置：`BS=64K; ACC=1; LSZ=1; bench=1s`，对比 `lazy=0 -> lazy=1`
+- 汇总（`avg/pos/neg/neg_worst_abs`）：
+  - `CompTotal = +0.8747% / 29 / 21 / 2.7744%`
+  - `DecTotal  = +0.6127% / 27 / 23 / 8.8492%`
+  - `RatioX    = +0.0341% / 27 / 1 / 0.0265%`
+  - 同时满足 `CompTotal>0` 且 `RatioX>0` 的文件：`13/50`
+  - 迭代对比（相对上一版）：`CompTotal avg -0.1759 pct`、`RatioX avg -0.0032 pct`，但 `CompTotal neg_worst_abs` 从 `6.6755%` 收敛到 `2.7744%`（下降约 `58.4%`）
 
-测试结果（subset + fullset，均为 10 轮）
+结论：完成口径切换后，64K 官方样本依然保持压缩吞吐与压缩率双正向（均值口径）。
 
-- 子集口径（8 文件）：`/root/samples` 固定 8 文件，`bench_seconds=3.5`，`B=64K`，`local=1`，`accel=1`
-  - 汇总：`/root/lz4/exp_results/runs/gpu_deep_compaction_r1/results/lz4_gpu_r1_8files_10round_ab_summary.json`
-  - 分文件：`/root/lz4/exp_results/runs/gpu_deep_compaction_r1/results/lz4_gpu_r1_8files_10round_ab_per_file.json`
-  - `CompTotalMBs`：`+3.5043% / +3.5297%`（mean / median）
-  - `DecTotalMBs`：`+0.0913% / +0.1084%`
-  - `Ratio%`：`0.0000 pctpt / 0.0000 pctpt`
-  - `CompTime_s`：`-3.3855% / -3.4094%`
-  - `DecTime_s`：`-0.0912% / -0.1083%`
-  - 分文件占比：压缩提升 `8/8`，解压提升 `7/8`，最大幅度文件 `mr`（压缩均值 `+4.0560%`）
+---
 
-- 全集口径（50 文件）：`/root/samples` 全样本，配置同上（10 轮）
-  - 汇总：`/root/lz4/exp_results/runs/gpu_deep_compaction_r1/results/lz4_gpu_r1_fullset_10round_ab_summary.json`
-  - 分文件：`/root/lz4/exp_results/runs/gpu_deep_compaction_r1/results/lz4_gpu_r1_fullset_10round_ab_per_file.json`
-  - `CompTotalMBs`：`+3.8452% / +3.7562%`
-  - `DecTotalMBs`：`-0.4954% / -0.4641%`
-  - `Ratio%`：`0.0000 pctpt / 0.0000 pctpt`
-  - `CompTime_s`：`-3.7022% / -3.6202%`
-  - `DecTime_s`：`+0.4984% / +0.4663%`
-  - 分文件占比：压缩提升 `50/50`，解压提升 `33/50`、回退 `17/50`
-  - 变化幅度最大文件：`yolo_parent_0_pages_img.tar`（压缩 `+10.8205%`，解压 `-2.6947%`）
+## 3. 未采纳修改（仅保留未采纳项）
 
-- 日志健康扫描（subset/fullset）：`error/failed/traceback/mismatch = 0/0/0/0`
+### 3.1 Host 路径退役：pipeline / overlap / compaction
 
-当前结论
+#### 动机
 
-- 按 strict 门禁看，R1 的 fullset 解压存在回退（`-0.4954% / -0.4641%`），不满足“其余指标不明显回退”。
-- 结合当前决策策略（压缩优先），R1 已作为**有条件采纳**基线保留，并进入后续“解压补偿轮次”继续优化。
+- 这三条线的维护成本高，而且会显著放大 host 状态空间；
+- 在正式 host 稳态口径下，它们没有给出足够稳的默认收益。
 
-## 未采纳修改（表格汇总）
+#### 设计
 
-| 修改名（实际语义） | 动机 | 设计与实现 | 测试结果 | 拒绝原因 |
-| --- | --- | --- | --- | --- |
-| R3：压缩/解压协同重构（解压 auto-local 调度） | 期望在保持 R1 压缩收益时抬升解压吞吐 | 在 `lz4_gpu.c` bench 解压路径与 `lz4_gpu_core.c` 解压路径引入“local=1 时自动提档 local size”策略（`gpu_deep_compaction_r3`） | subset：`Comp -0.1916%/-0.0480%`，`Dec -0.0145%/-0.0374%`；fullset：`Comp -0.4526%/-0.4134%`，`Dec -2.9275%/-2.7367%`，`Ratio 0` | 全集压缩与解压均显著回退，拒绝并已回退代码 |
-| R2：decomp-friendly compaction 风险门控 | 在保留 R1 压缩收益前提下修复 fullset 解压回退 | 新增 `LZ4_GPU_COMPACTION_DECSAFE_*` 门控，对高块数+分布致密且收益边际不足场景抑制 compaction 触发（`gpu_deep_compaction_r2`） | subset：`Comp -0.0133%/+0.0140%`，`Dec +0.0005%/-0.0023%`；fullset：`Comp -0.0642%/+0.0048%`，`Dec -0.3185%/-0.1901%`，`Ratio 0` | 未有效改善 Dec 且引入额外负向波动，暂不采纳 |
-| 稀疏写回改 `writev` 聚合 | 降低 host 写调用开销 | 稀疏块写回改 `writev`（`..._R1_subset_ab.json`） | `Comp -0.2671%/+0.0151%`，`Dec -0.1504%/-0.0959%` | 压缩主判未过 |
-| 扩大 mapped 稀疏写优先级 | 提升 mapped 路径覆盖率 | 优先 mapped，失败回退 readback（`..._R2_subset_ab.json`） | `Comp -0.3411%/-0.0507%`，`Dec -0.2692%/+0.0797%` | 无确定收益 |
-| pack local size 自适应 | 提升不同块规模适配 | local size 自适应 + 环境变量覆盖（`..._R4_subset_ab.json`） | `Comp -0.2279%/+0.0859%`，`Dec -0.0475%/-0.0631%` | 压缩未过门禁 |
-| 激进 compaction gate + 回写自适应 | 冲击压缩吞吐 | 更激进 gate + pack/readback 自适应 + stride 写回（`..._R5_subset_ab.json`） | `Comp -0.3225%/+0.0053%`，`Dec -0.0899%/+0.1666%` | 主判未过 |
-| standard-copy 不试 mapped + fallback `writev` | 降低 mapped 失败分支成本 | standard-copy 直接常规路径，fallback 稀疏偏 `writev`（`..._R7_subset_ab.json`） | `Comp -0.9439%/+0.0904%`，`Dec +0.3475%/+0.0416%` | 压缩均值负向 |
-| 压缩路径去 `h_out_offsets` 填充 | 减少固定填充开销 | helper 支持 `offsets==NULL + stride`（`..._R8_subset_ab.json`） | `Comp -0.7112%/-0.0602%`，`Dec -0.1420%/-0.0924%` | 双侧无收益 |
-| 并行度分段调为 `64/48/40/32/24` | 冲击中高 block 场景 | 调整 `choose_comp_worker_count()`（`..._R9_subset_ab.json`） | `Comp +0.7773%/-0.1259%`，`Dec -0.4262%/+0.0582%` | 压缩主判未过 |
-| 并行度分段调为 `80/64/48/32/24` | 更激进提升 occupancy | subset+fullset 双检（`..._R10_*.json`） | subset：`Comp +3.0743%/-0.2287%`；fullset：`Comp +1.0747%/+0.0125%`，`Dec -0.6275%/-0.0011%` | fullset 未过 |
-| 按需 sparse offsets + 并行度微调 | 降低元数据准备开销 | 压缩阶段按需构建 offsets（`..._R11_subset_ab.json`） | `Comp +1.0614%/+0.1242%`，`Dec -0.3680%/+0.1644%` | 压缩主判未过 |
-| null sink 跳过 payload 回传 | 去掉 bench 固定损耗 | `/dev/null` 仅保留必要统计（`..._R12_*.json`） | subset：`Comp +4.1813%/+2.8310%`；fullset：`Comp +3.6418%/+1.9892%`，`Dec -0.8712%/-0.3714%` | Dec 副作用劣于已采纳方案 |
-| 关闭 dec 调试计数 + 复用 comp_total 元数据 | 继续压缩 host 固定损耗 | hostpath deep v1（`gpu_hostpath_deep_r1/.../lz4_subset_ab_v2_3s.json`） | `Comp -0.2454%/+0.6214%`，`Dec -0.0199%/+0.6875%` | 压缩未跨门限 |
-| event 生命周期释放优化 | 降低长跑事件管理开销 | kernel wait 后补 `clReleaseEvent(ev)`（旧 run：`gpu_hostpath_deep_r2/...`） | `Comp +11.7017%/+6.6001%`，`Dec -1.3256%/-0.6825%` | 基线链不一致且 Dec 超门限负向 |
-| metadata cache 二阶段（跳过 `sizes_out` 读回） | 继续压缩解压 readback 时间 | metadata 不变时同时跳过 sizes_out readback（`gpu_dec_meta_cache_r2/...`） | `Comp -0.2840%/-0.1925%`，`Dec +0.1073%/-0.0358%` | 提升不稳定且压缩无收益 |
+- 先用显式 `all-off` 基线跑完 host 组合矩阵；
+- 再单独 rerun 可疑分支，确认不是因为解析或阈值口径问题被误判。
 
-## 当前代码一致性检查结论
+#### 实现
 
-- `lz4_gpu.c` 当前保留“metadata 条件上传 + 每轮 sizes_out 读回”。
-- `lz4_gpu_core.c` 当前主线包含“分布感知 compaction 门控 + packed 自动回写 + 分段并行度/保守 occupancy”。
+- 记录：`lz4_gpu/variant_validation/intel/records/host/intel_host_combo_matrix_mapped_pipeline_overlap_compaction.md`
+- 记录：`lz4_gpu/variant_validation/intel/records/host/intel_host_r5_pack_gate_compaction_enable.md`
+- 活代码处置：回归最小 host 路径；README / validation docs 同步删除旧入口。
+
+#### 测试结果
+
+- `mapped` 是唯一稳定、可解释、值得保留的 host 特性；
+- `pipeline` 在强制触发条件下整体更容易拉低压缩 steady-state；
+- `overlap` 只在 `standard-copy + pipeline` 上有局部条件性作用，一旦 `pipeline` 退役即失去价值；
+- `compaction` 单独打开主信号不佳，在组合矩阵中也只在部分 pipeline 基座上有条件价值；
+- 结论：三条线全部退休，不再进入未来默认候选池。
+
+| 修改主题 | 动机 | 关键实现 | 代表工件 | 结果摘要 | 未采纳原因 |
+| --- | --- | --- | --- | --- | --- |
+| 稀疏写回改 `writev` 聚合 | 降低 host 写调用开销 | 稀疏块写回改 `writev` | `..._subset_ab.json` | `Comp -0.2671%/+0.0151%`，`Dec -0.1504%/-0.0959%` | 压缩主判未过 |
+| 扩大 mapped 稀疏写优先级 | 提升 mapped 路径覆盖 | mapped 优先，失败回退 readback | `..._subset_ab.json` | `Comp -0.3411%/-0.0507%`，`Dec -0.2692%/+0.0797%` | 无稳定收益 |
+| pack local size 自适应默认化 | 提升块规模适配 | pack local-size 自适应 | `..._subset_ab.json` | `Comp -0.2279%/+0.0859%`，`Dec -0.0475%/-0.0631%` | 压缩未过门限 |
+| standard-copy 直走常规 + fallback `writev` | 降低 mapped 失败分支成本 | standard-copy 不尝试 mapped | `..._subset_ab.json` | `Comp -0.9439%/+0.0904%`，`Dec +0.3475%/+0.0416%` | 压缩均值负向 |
+| 压缩路径去 `h_out_offsets` 填充 | 减少固定填充开销 | `offsets==NULL + stride` | `..._subset_ab.json` | `Comp -0.7112%/-0.0602%`，`Dec -0.1420%/-0.0924%` | 双侧无收益 |
+| 并行度分段 `64/48/40/32/24` | 冲击中高 block 场景 | 调整 `choose_comp_worker_count()` | `..._subset_ab.json` | `Comp +0.7773%/-0.1259%`，`Dec -0.4262%/+0.0582%` | 压缩主判未过 |
+| 并行度分段 `80/64/48/32/24` | 更激进 occupancy | subset + fullset 双检 | `..._subset_fullset_ab.json` | subset 正向但 fullset 未通过 | 全样本未过 |
+| 按需 sparse offsets + 并行度微调 | 降低元数据准备开销 | 压缩阶段按需构建 offsets | `..._subset_ab.json` | `Comp +1.0614%/+0.1242%`，`Dec -0.3680%/+0.1644%` | 压缩主判未过 |
+| null sink 跳过 payload 回传 | 去掉 bench 固定损耗 | `/dev/null` 仅保留必要统计 | `..._subset_fullset_ab.json` | 压缩提升明显，解压副作用偏大 | 稳态权衡不优 |
+| 关闭 dec 调试计数 + 复用 comp_total 元数据 | 继续压缩 host 固定损耗 | hostpath deep v1 | `.../lz4_subset_ab_v2_3s.json` | `Comp -0.2454%/+0.6214%`，`Dec -0.0199%/+0.6875%` | 压缩未跨门限 |
+| event 生命周期释放优化 | 降低事件管理开销 | kernel wait 后释放 event | `gpu_hostpath_deep/...` | `Comp +11.7017%/+6.6001%`，`Dec -1.3256%/-0.6825%` | 基线链不一致且 Dec 超门限 |
+| metadata cache 二阶段（跳过 `sizes_out`） | 压缩解压 readback 时间 | metadata 不变时跳过 sizes_out 读回 | `gpu_dec_meta_cache/...` | `Comp -0.2840%/-0.1925%`，`Dec +0.1073%/-0.0358%` | 提升不稳定 |
+| 执行模型 PoC 分段调度（全样本） | 期望优化大文件吞吐 | PoC 分段 dispatch + chunk 配置 | `gpu_accel_scan_123_poc_execmodel_r3/runs/20260407_112007/` | 相对并线基线出现系统性回退 | 不满足并线门槛 |
+| large profile 默认强化策略 | 期望提升大文件路径 | 调整 `lz4_should_use_large_profile` 触发策略 | `gpu_accel_scan_123_poc_execmodel_r3b/runs/20260407_122606/` | 相比上版进一步恶化 | 回退幅度扩大 |
+| 解压 chunk 默认放大到 16K | 降低 launch 次数 | 提高 `LZ4_GPU_POC_DEC_CHUNK_BLOCKS` 默认值 | `gpu_accel_scan_123_poc_execmodel_r4_fix/runs/20260407_151705/` | 局部样本有利，全量不稳 | 默认值已回收 |
+| PoC 压缩计时口径候选 | 统一统计口径 | 调整 PoC 压缩计时路径 | `gpu_accel_scan_123_poc_execmodel_r4_timing/runs/20260407_161900/` | 相比上一版收敛但仍未优于并线基线 | 不并线 |
+| PoC 分段按 chunk 动态 `g_ws` | 减少尾段空转 work-item | 压缩 PoC 路径每个 chunk 重算 dispatch `g_ws` | `gpu_accel_scan_123_poc_execmodel_chunkgws/runs/20260407_174539/` | vs `default_v2`：`CompTotal -11.6608%`，`DecTotal -6.7555%`；`Comp/Dec` 负向文件分别 `150/150`、`147/150` | 系统性回退，已回退代码 |
+| 解压并行度固定 `DECOMP_WI_PER_CU=80`（环境候选） | 尝试抬升 `DecKernel` 长尾 | 仅设置环境变量 `LZ4_GPU_DECOMP_WI_PER_CU=80`，不改代码默认值 | `gpu_dec_wi_unset_full/runs/20260407_190333/`、`gpu_dec_wi80_full/runs/20260407_185233/` | **vs 上一版（unset）**：`CompTotal +2.4304%`（`pos/neg=107/43`），`DecTotal +0.0302%`（`91/59`），`DecTotal neg_worst_abs=12.4798%`（`webster`）；**vs 并线基线 `default_v2`**：`CompTotal -11.5349%`（`0/150`），`DecTotal -6.0971%`（`17/131`） | 对并线基线系统性回退，且负向尾部过大；不进入默认实现 |
+
+结论补充：该候选仅在“同轮 unset 控制组”口径下出现边际正向，但在并线基线口径下明显回退，按未采纳处理并保留为环境实验项。
+
+### nvCOMP 同口径修正与默认配置基线（2026-04-08）
+
+#### 动机
+
+- 需满足“同测试方式/同文件/同统计语义”下的硬对位：`kernel + total + ratio + power`。
+- 按当前规则，参数调优与非默认块大小扫描不再保留，避免无意义 tune。
+
+#### 实现与工件
+
+- 修脚本：
+  - `nvcomp/benchmarks/bench_nvcomp_lz4_python.py`：补齐 `Comp/Dec CPU/GPU Power` 字段；
+  - `nvcomp/benchmarks/compare_nvcomp_consistent_vs_lz4_modes.py`：统一 Python-only 对位口径。
+- nvCOMP 基线：`nvcomp/exp_results/baseline/nvcomp_lz4_python/runs/20260408_031151/`
+- LZ4 仅保留 bench 默认配置工件：`lz4/exp_results/baseline/gpu_only_default/runs/20260408_032757/`
+- 对位汇总仅保留：`lz4/exp_results/baseline/compare_nvcomp_consistent_vs_lz4_modes_20260408.{json,csv}`
+
+#### 结果摘要（核心）
+
+- 默认配置口径下已完成 nvCOMP vs LZ4 的统一统计对位；
+- 吞吐/压缩率/功耗指标可在同一套默认配置结果中复核；
+- 参数调优相关汇总与文档说明已移除。
+
+#### 采纳结论
+
+- 后续仅允许使用 bench 脚本默认配置进行评估与归档；
+- 不再新增或保留 tune 类工件与对应说明。
+
+---
+
+## 4. 后续优化方向
+
+1. **压缩长尾收敛**：持续压缩 `CompKernel/CompTotal` 负向尾部。
+2. **解压尾部专项**：针对 `DecKernel` 最差样本做定向策略。
+3. **采纳门槛**：每轮必须给出 `avg/pos/neg/neg_worst_abs`，并与上一版及并线基线双对比。
+4. **并线规则**：任何候选若对并线基线产生系统性回退，不进入默认实现。
+
+---
+
+## 5. 当前主线一致性快照
+
+- `lz4_gpu.c`：保留 metadata 条件上传 + 每轮 `sizes_out` 读回；不再保留 pipeline/compaction bench 分支。
+- `lz4_gpu_core.c`：保留 `mapped / standard-copy` 双路径 + 分段并行度 + 保守 occupancy 策略；不再保留 pipeline/compaction 活代码。
+- `lz4_gpu.cl`：仅保留压缩/解压 kernel；`pack` kernel 已随 host 路径退休一起删除。

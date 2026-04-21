@@ -22,6 +22,7 @@
 #include <limits.h>
 #include <time.h>
 #include "lz4_gpu_core.h"
+#include "lz4_gpu_debug.h"
 #include "lz4_gpu_protocol.h"
 #include "lz4_gpu_utils.h"
 #include "timing.h"
@@ -48,7 +49,7 @@ int run_lz4_client(int mode, const char* input_path, const char* output_path, in
 
 int g_verbose = 0;
 static size_t g_cli_local_size = 1;
-static size_t g_cli_fixed_block_bytes = 32 * 1024;
+static size_t g_cli_fixed_block_bytes = 64 * 1024;
 static int g_cli_acceleration = 1;
 
 static cl_context ctx;
@@ -165,9 +166,20 @@ static void ocl_init() {
         ctx = NULL;
         return;
     }
+#if defined(CL_VERSION_2_0)
+    {
+        const cl_queue_properties qprops[] = {
+            CL_QUEUE_PROPERTIES,
+            (cl_queue_properties)CL_QUEUE_PROFILING_ENABLE,
+            0
+        };
+        queue = clCreateCommandQueueWithProperties(ctx, dev, qprops, &err);
+    }
+#else
     queue = clCreateCommandQueue(ctx, dev, CL_QUEUE_PROFILING_ENABLE, &err);
+#endif
     if (err != CL_SUCCESS || queue == NULL) {
-        fprintf(stderr, "OpenCL init failed: clCreateCommandQueue err=%d\n", err);
+        fprintf(stderr, "OpenCL init failed: command queue creation err=%d\n", err);
         if (ctx) clReleaseContext(ctx);
         ctx = NULL;
         queue = NULL;
@@ -196,6 +208,10 @@ static void show_help(const char* prog_name) {
     fprintf(stderr, "Streaming:\n");
     fprintf(stderr, "  input '-'            Read input from stdin (standalone mode only)\n");
     fprintf(stderr, "  output '-'           Write output to stdout (standalone mode only)\n");
+    fprintf(stderr, "\nEnvironment:\n");
+    fprintf(stderr, "  LZ4_STANDARD_COPY=0|1         0=map/unmap, 1=clEnqueueRead/WriteBuffer (default: auto)\n");
+    fprintf(stderr, "  LZ4_GPU_DEBUG=0|1             Enable host/device debug counters (forces source build)\n");
+    fprintf(stderr, "  LZ4_GPU_DEBUG_BLOCK_LIMIT=N   Print first N blocks of debug counters\n");
 }
 
 static int stop_daemon_cmd() {
@@ -406,26 +422,12 @@ static int run_lz4_bench(const char* input_path,
         free(input_ref);
         return 1;
     }
-    cl_kernel kpack = clCreateKernel(prog, "lz4_pack_blocks", &err);
-    if (err != CL_SUCCESS || !kpack) {
-        fprintf(stderr, "bench error: create pack kernel failed (%d)\n", err);
-        clReleaseKernel(kdec);
-        clReleaseKernel(kcomp);
-        clReleaseProgram(prog);
-        clReleaseCommandQueue(queue);
-        clReleaseContext(ctx);
-        free(input_ref);
-        return 1;
-    }
-
     lz4_gpu_workspace_t ws;
     lz4_gpu_workspace_init(&ws);
 
     size_t cap = 16, n = 0;
     double* comp_tp = (double*)malloc(cap * sizeof(double));
-    double* comp_total_tp = (double*)malloc(cap * sizeof(double));
     double* dec_tp = (double*)malloc(cap * sizeof(double));
-    double* dec_total_tp = (double*)malloc(cap * sizeof(double));
     double* ratio_pct = (double*)malloc(cap * sizeof(double));
     int verify_ok = 1;
 
@@ -446,11 +448,12 @@ static int run_lz4_bench(const char* input_path,
 
     cl_uint kernel_num_args_dec = 0;
     int kernel_has_dbg_dec = 0;
+    lz4_gpu_debug_config_t dbg_cfg = lz4_gpu_get_debug_config();
     if (clGetKernelInfo(kdec, CL_KERNEL_NUM_ARGS, sizeof(kernel_num_args_dec), &kernel_num_args_dec, NULL) == CL_SUCCESS) {
         kernel_has_dbg_dec = (kernel_num_args_dec >= 9U);
     }
 
-    if (!comp_tp || !comp_total_tp || !dec_tp || !dec_total_tp || !ratio_pct) {
+    if (!comp_tp || !dec_tp || !ratio_pct) {
         fprintf(stderr, "bench error: malloc failed\n");
         verify_ok = 0;
     }
@@ -476,6 +479,7 @@ static int run_lz4_bench(const char* input_path,
 
     unsigned warmup_rounds = parse_unsigned_env_with_default("LZ4_GPU_BENCH_WARMUP_ROUNDS", 1U);
     unsigned warmup_done = 0;
+    int input_uploaded_once = 0;
     int timer_started = 0;
 
     struct timespec ts0, ts1;
@@ -488,13 +492,22 @@ static int run_lz4_bench(const char* input_path,
         timing_t tc;
         memset(&tc, 0, sizeof(tc));
 
-        int rc = lz4_compress_core(ctx, queue, kcomp, kpack, input_path, "/dev/null",
-                                   (size_t)block_size, acceleration, &ws, &tc,
-                                   local_size, (n > 0) ? 1 : 0);
+        int rc = lz4_compress_core(ctx,
+                                   queue,
+                                   kcomp,
+                                   input_path,
+                                   NULL,
+                                   (size_t)block_size,
+                                   acceleration,
+                                   &ws,
+                                   &tc,
+                                   local_size,
+                                   input_uploaded_once ? 1 : 0);
         if (rc != 0) {
             verify_ok = 0;
             break;
         }
+        input_uploaded_once = 1;
 
         size_t nblk = (size_t)tc.nblk;
         size_t blk = (size_t)tc.blk_size_bytes;
@@ -545,26 +558,28 @@ static int run_lz4_bench(const char* input_path,
             h_prev_blocks_capacity = nblk;
             prev_meta_valid = 0;
         }
-        void* map_sizes = clEnqueueMapBuffer(queue, ws.output_size_buf, CL_TRUE, CL_MAP_READ,
-                                             0, nblk * sizeof(cl_uint), 0, NULL, NULL, &err);
-        if (err != CL_SUCCESS || !map_sizes) {
-            verify_ok = 0;
-            break;
-        }
-        memcpy(h_sizes, map_sizes, nblk * sizeof(cl_uint));
-        clEnqueueUnmapMemObject(queue, ws.output_size_buf, map_sizes, 0, NULL, NULL);
-
-        for (size_t i = 0; i < nblk; ++i) {
-            size_t csz = (size_t)h_sizes[i];
-            h_comp_off[i] = (cl_uint)(i * worst_blk);
-            if (csz > worst_blk) {
+        {
+            void* map_sizes = clEnqueueMapBuffer(queue, ws.output_size_buf, CL_TRUE, CL_MAP_READ,
+                                                 0, nblk * sizeof(cl_uint), 0, NULL, NULL, &err);
+            if (err != CL_SUCCESS || !map_sizes) {
                 verify_ok = 0;
                 break;
             }
-        }
-        if (!verify_ok) {
-            verify_ok = 0;
-            break;
+            memcpy(h_sizes, map_sizes, nblk * sizeof(cl_uint));
+            clEnqueueUnmapMemObject(queue, ws.output_size_buf, map_sizes, 0, NULL, NULL);
+
+            for (size_t i = 0; i < nblk; ++i) {
+                size_t csz = (size_t)h_sizes[i];
+                h_comp_off[i] = (cl_uint)(i * worst_blk);
+                if (csz > worst_blk) {
+                    verify_ok = 0;
+                    break;
+                }
+            }
+            if (!verify_ok) {
+                verify_ok = 0;
+                break;
+            }
         }
 
         d_out = ensure_buffer(ctx, d_out, (size_t)tc.in_size, &d_out_capacity, &err);
@@ -620,8 +635,8 @@ static int run_lz4_bench(const char* input_path,
             prev_meta_valid = 1;
         }
 
-        if (kernel_has_dbg_dec) {
-            size_t dbg_bytes = nblk * 5U * sizeof(cl_uint);
+        if (dbg_cfg.enabled && kernel_has_dbg_dec) {
+            size_t dbg_bytes = nblk * LZ4_DBG_DEC_N * sizeof(cl_uint);
             d_dbg_dec = clCreateBuffer(ctx, CL_MEM_READ_WRITE, dbg_bytes, NULL, &err);
             if (err == CL_SUCCESS && d_dbg_dec) {
                 cl_uint zero = 0;
@@ -710,7 +725,6 @@ static int run_lz4_bench(const char* input_path,
             break;
         }
         clWaitForEvents(1, &read_sizes_evt);
-        double dec_read_us = event_elapsed_us(read_sizes_evt);
         clReleaseEvent(read_sizes_evt);
 
         size_t out_total = 0;
@@ -734,8 +748,6 @@ static int run_lz4_bench(const char* input_path,
 
         if (d_dbg_dec) clReleaseMemObject(d_dbg_dec);
         if (!verify_ok) break;
-        double dec_total_us = dec_upload_us + dec_kernel_us + dec_read_us;
-
         if (warmup_done < warmup_rounds) {
             warmup_done++;
             if (warmup_done == warmup_rounds) {
@@ -754,26 +766,12 @@ static int run_lz4_bench(const char* input_path,
             }
             comp_tp = nc;
 
-            double* nct = (double*)realloc(comp_total_tp, new_cap * sizeof(double));
-            if (!nct) {
-                verify_ok = 0;
-                break;
-            }
-            comp_total_tp = nct;
-
             double* nd = (double*)realloc(dec_tp, new_cap * sizeof(double));
             if (!nd) {
                 verify_ok = 0;
                 break;
             }
             dec_tp = nd;
-
-            double* ndt = (double*)realloc(dec_total_tp, new_cap * sizeof(double));
-            if (!ndt) {
-                verify_ok = 0;
-                break;
-            }
-            dec_total_tp = ndt;
 
             double* nr = (double*)realloc(ratio_pct, new_cap * sizeof(double));
             if (!nr) {
@@ -786,11 +784,7 @@ static int run_lz4_bench(const char* input_path,
 
         double in_mb = (double)tc.in_size / (1024.0 * 1024.0);
         comp_tp[n] = (tc.kernel_exec_us > 0) ? (in_mb * 1000000.0 / (double)tc.kernel_exec_us) : 0.0;
-        /* Total throughput = device upload + kernel + device download (exclude verify / wall-time). */
-        double comp_total_us = (double)tc.data_upload_us + (double)tc.kernel_exec_us + (double)tc.download_total_us;
-        comp_total_tp[n] = (comp_total_us > 0.0) ? (in_mb * 1000000.0 / comp_total_us) : 0.0;
         dec_tp[n] = (dec_kernel_us > 0.0) ? (in_mb * 1000000.0 / dec_kernel_us) : 0.0;
-        dec_total_tp[n] = (dec_total_us > 0.0) ? (in_mb * 1000000.0 / dec_total_us) : 0.0;
         ratio_pct[n] = (tc.in_size > 0) ? (100.0 * (double)tc.out_size / (double)tc.in_size) : 0.0;
         n++;
 
@@ -799,23 +793,19 @@ static int run_lz4_bench(const char* input_path,
     }
 
     clock_gettime(CLOCK_MONOTONIC, &ts1);
-    double sec = timer_started ? elapsed_sec(&ts0, &ts1) : 0.0;
 
     if (n > 0) {
-        printf("Bench Compress : kernel_tp=%.2f MB/s total_tp=%.2f MB/s ratio=%.2f%%\n",
-               median_double(comp_tp, n), median_double(comp_total_tp, n), median_double(ratio_pct, n));
-        printf("Bench Decompress : kernel_tp=%.2f MB/s total_tp=%.2f MB/s verify=%s\n",
-               median_double(dec_tp, n), median_double(dec_total_tp, n), verify_ok ? "OK" : "FAIL");
-        printf("Bench Summary : iterations=%zu seconds=%.2f\n", n, sec);
+        printf("Bench Compress : kernel_tp=%.2f MB/s ratio=%.2f%%\n",
+            median_double(comp_tp, n), median_double(ratio_pct, n));
+        printf("Bench Decompress : kernel_tp=%.2f MB/s verify=%s\n",
+            median_double(dec_tp, n), verify_ok ? "OK" : "FAIL");
     } else {
         fprintf(stderr, "bench error: no successful iteration\n");
         verify_ok = 0;
     }
 
     free(comp_tp);
-    free(comp_total_tp);
     free(dec_tp);
-    free(dec_total_tp);
     free(ratio_pct);
     free(h_sizes);
     free(h_comp_off);
@@ -825,7 +815,6 @@ static int run_lz4_bench(const char* input_path,
     if (d_out) clReleaseMemObject(d_out);
     free(input_ref);
     lz4_gpu_workspace_free(&ws);
-    clReleaseKernel(kpack);
     clReleaseKernel(kdec);
     clReleaseKernel(kcomp);
     clReleaseProgram(prog);
@@ -852,7 +841,6 @@ int run_lz4_standalone(int argc, char** argv) {
     int ret = -1;
     cl_program prog = NULL;
     cl_kernel kernel = NULL;
-    cl_kernel pack_kernel = NULL;
     cl_int err = CL_SUCCESS;
     lz4_gpu_workspace_t ws;
     int ws_inited = 0;
@@ -992,9 +980,6 @@ int run_lz4_standalone(int argc, char** argv) {
 
     if (mode == mode_compress) {
         kernel = clCreateKernel(prog, "lz4_compress_block", &err);
-        if (err == CL_SUCCESS && kernel) {
-            pack_kernel = clCreateKernel(prog, "lz4_pack_blocks", &err);
-        }
     } else {
         kernel = clCreateKernel(prog, "lz4_decompress_blocks", &err);
     }
@@ -1010,7 +995,7 @@ int run_lz4_standalone(int argc, char** argv) {
     memset(&t_out, 0, sizeof(t_out));
 
     if (mode == mode_compress) {
-        ret = lz4_compress_core(ctx, queue, kernel, pack_kernel,
+        ret = lz4_compress_core(ctx, queue, kernel,
                                 effective_input_path,
                                 effective_output_path,
                                 (int)g_cli_fixed_block_bytes,
@@ -1069,7 +1054,6 @@ int run_lz4_standalone(int argc, char** argv) {
 
 cleanup:
     if (ws_inited) lz4_gpu_workspace_free(&ws);
-    if (pack_kernel) clReleaseKernel(pack_kernel);
     if (kernel) clReleaseKernel(kernel);
     if (prog) clReleaseProgram(prog);
     if (queue) { clReleaseCommandQueue(queue); queue = NULL; }
@@ -1085,7 +1069,9 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (argc >= 2) {
-        if (strcmp(argv[1], "--daemon") == 0) return run_daemon();
+        if (strcmp(argv[1], "--daemon") == 0) {
+            return run_daemon();
+        }
         if (strcmp(argv[1], "--stop-daemon") == 0) return stop_daemon_cmd();
         if (strcmp(argv[1], "--use-daemon") == 0) {
             int mode = mode_compress;

@@ -29,11 +29,74 @@ typedef unsigned short U16;
 typedef unsigned int U32;
 typedef unsigned long U64;
 typedef unsigned char U8;
-/* Fingerprint value type (we support up to 16 bits for compact storage) */
-#if LZ4_GPU_FINGERPRINT_BITS <= 8
-typedef U8 fp_t;
+
+#ifndef LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+#define LZ4_GPU_DEBUG_COUNTERS_RUNTIME 0
+#endif
+
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+#include "lz4_gpu_debug.h"
+#define LZ4_GPU_COMP_DEBUG_ARGS_DECL , __global U32* dbg_stats, U32 dbg_index, U32 dbg_enabled
+#define LZ4_GPU_COMP_DEBUG_ARGS_PASS , dbg_stats, b, dbg_enabled
+#define LZ4_GPU_DEC_DEBUG_ARGS_DECL , __global U32* dbg_stats, U32 dbg_index, U32 dbg_enabled
+#define LZ4_GPU_DEC_DEBUG_ARGS_PASS , dbg_stats, idx, dbg_enabled
+
+inline void lz4_gpu_debug_write_comp_stats(
+    __global U32* dbg_stats,
+    U32 dbg_index,
+    U32 dbg_enabled,
+    U32 search_iters,
+    U32 hash_tag_hits,
+    U32 distance_rejects,
+    U32 match_found,
+    U32 hash_inserts,
+    U32 literal_bytes,
+    U32 match_bytes,
+    U32 lastlit_bytes
+) {
+    if (!dbg_enabled) return;
+    {
+        __global U32* block_stats = dbg_stats + (size_t)dbg_index * LZ4_DBG_COMP_N;
+        block_stats[LZ4_DBG_COMP_SEARCH_ITERS] = search_iters;
+        block_stats[LZ4_DBG_COMP_HASH_TAG_HITS] = hash_tag_hits;
+        block_stats[LZ4_DBG_COMP_HASH_DISTANCE_REJECTS] = distance_rejects;
+        block_stats[LZ4_DBG_COMP_MATCH_FOUND] = match_found;
+        block_stats[LZ4_DBG_COMP_HASH_INSERTS] = hash_inserts;
+        block_stats[LZ4_DBG_COMP_LITERAL_BYTES] = literal_bytes;
+        block_stats[LZ4_DBG_COMP_MATCH_BYTES] = match_bytes;
+        block_stats[LZ4_DBG_COMP_LASTLIT_BYTES] = lastlit_bytes;
+    }
+}
+
+inline void lz4_gpu_debug_write_dec_stats(
+    __global U32* dbg_stats,
+    U32 dbg_index,
+    U32 dbg_enabled,
+    U32 tokens,
+    U32 literal_bytes,
+    U32 match_bytes,
+    U32 small_offsets,
+    U32 fast_literals,
+    U32 fast_matches,
+    U32 output_errors
+) {
+    if (!dbg_enabled) return;
+    {
+        __global U32* block_stats = dbg_stats + (size_t)dbg_index * LZ4_DBG_DEC_N;
+        block_stats[LZ4_DBG_DEC_TOKENS] = tokens;
+        block_stats[LZ4_DBG_DEC_LITERAL_BYTES] = literal_bytes;
+        block_stats[LZ4_DBG_DEC_MATCH_BYTES] = match_bytes;
+        block_stats[LZ4_DBG_DEC_SMALL_OFFSETS] = small_offsets;
+        block_stats[LZ4_DBG_DEC_FAST_LITERAL_PATHS] = fast_literals;
+        block_stats[LZ4_DBG_DEC_FAST_MATCH_PATHS] = fast_matches;
+        block_stats[LZ4_DBG_DEC_OUTPUT_ERROR] = output_errors;
+    }
+}
 #else
-typedef U16 fp_t;
+#define LZ4_GPU_COMP_DEBUG_ARGS_DECL
+#define LZ4_GPU_COMP_DEBUG_ARGS_PASS
+#define LZ4_GPU_DEC_DEBUG_ARGS_DECL
+#define LZ4_GPU_DEC_DEBUG_ARGS_PASS
 #endif
 
 // --- Memory Access ---
@@ -141,13 +204,6 @@ inline void LZ4_COPY_MATCH(__global BYTE* op, const __global BYTE* m_pos, uint l
             if (len) *op++ = p0;
             return;
         }
-        if (offset == 3) {
-            BYTE p0 = m_pos[0], p1 = m_pos[1], p2 = m_pos[2];
-            while (len >= 3) { *op++ = p0; *op++ = p1; *op++ = p2; len -= 3; }
-            if (len == 2) { *op++ = p0; *op++ = p1; }
-            else if (len == 1) { *op++ = p0; }
-            return;
-        }
         if (offset == 4) {
             BYTE p0 = m_pos[0], p1 = m_pos[1], p2 = m_pos[2], p3 = m_pos[3];
             uchar16 v16 = (uchar16)(p0, p1, p2, p3, p0, p1, p2, p3, p0, p1, p2, p3, p0, p1, p2, p3);
@@ -166,23 +222,6 @@ inline void LZ4_COPY_MATCH(__global BYTE* op, const __global BYTE* m_pos, uint l
             while (len--) { *op = *m_pos; op++; m_pos++; }
             return;
         }
-    }
-    if (offset < 8) {
-        while (len >= 8) {
-            op[0] = m_pos[0];
-            op[1] = m_pos[1];
-            op[2] = m_pos[2];
-            op[3] = m_pos[3];
-            op[4] = m_pos[4];
-            op[5] = m_pos[5];
-            op[6] = m_pos[6];
-            op[7] = m_pos[7];
-            op += 8;
-            m_pos += 8;
-            len -= 8;
-        }
-        while (len > 0) { *op++ = *m_pos++; len--; }
-        return;
     }
     if (offset >= 64) {
         while (len >= 64) {
@@ -228,26 +267,6 @@ inline void LZ4_memcpy(__global BYTE* dst, const __global BYTE* src, int size) {
 
 
 #ifndef LZ4_GPU_DISABLE_VEC_COPY
-// Use LZ4_UA_COPYN for literal-copy helpers (input -> output)
-inline void LZ4_lit_memcpy(__global BYTE* dst, const __global BYTE* src, int size) {
-    LZ4_UA_COPYN(dst, src, (uint)size);
-}
-
-inline void LZ4_match_memcpy(__global BYTE* dst, const __global BYTE* src, int size) {
-    LZ4_UA_COPYN(dst, src, (uint)size);
-}
-
-inline void LZ4_match_wildCopy8(__global BYTE* dst, const __global BYTE* src, __global BYTE* dstEnd) {
-    LZ4_UA_COPYN(dst, src, (uint)(dstEnd - dst));
-}
-
-inline void LZ4_wildCopy8(__global BYTE* dst, const __global BYTE* src, __global BYTE* dstEnd) {
-    /* Forward-copy semantics for possible overlaps */
-    while (dst < dstEnd) {
-        *dst++ = *src++;
-    }
-}
-
 inline void LZ4_lit_wildCopy8(__global BYTE* dst, const __global BYTE* src, __global BYTE* dstEnd) {
     if (dstEnd - dst <= 8) {
         LZ4_write64(dst, LZ4_read64(src));
@@ -258,80 +277,26 @@ inline void LZ4_lit_wildCopy8(__global BYTE* dst, const __global BYTE* src, __gl
         LZ4_UA_COPYN(dst, src, (uint)(dstEnd - dst));
     }
 }
-
-inline void LZ4_wildCopy32(__global BYTE* dst, const __global BYTE* src, __global BYTE* dstEnd) {
-    LZ4_UA_COPYN(dst, src, (uint)(dstEnd - dst));
-}
 #else
-// --- Scalar literal-copy helpers (input -> output) ---
-// These are safe to use for literal copying because source (ip) is the input
-// buffer and does not overlap with destination; use 8-byte chunks for speed.
-inline void LZ4_lit_memcpy(__global BYTE* dst, const __global BYTE* src, int size) {
-    int i = 0;
-    int end64 = size & ~7;
-    for (; i < end64; i += 8) {
-        U32 lo = LZ4_read32(src + i);
-        U32 hi = LZ4_read32(src + i + 4);
-        LZ4_write32(dst + i, lo);
-        LZ4_write32(dst + i + 4, hi);
-    }
-    for (; i < size; ++i) dst[i] = src[i];
-}
-
-// --- Scalar match-copy helpers (用于 match -> dst 的拷贝)
-// Forward-copy semantics are required for match-copy (src < dst)
-inline void LZ4_match_memcpy(__global BYTE* dst, const __global BYTE* src, int size) {
-    int i = 0;
-    int end64 = size & ~7;
-    for (; i < end64; i += 8) {
-        U32 lo = LZ4_read32(src + i);
-        U32 hi = LZ4_read32(src + i + 4);
-        LZ4_write32(dst + i, lo);
-        LZ4_write32(dst + i + 4, hi);
-    }
-    for (; i < size; ++i) dst[i] = src[i];
-}
-
-inline void LZ4_match_wildCopy8(__global BYTE* dst, const __global BYTE* src, __global BYTE* dstEnd) {
-    while (dst < dstEnd) {
-        U32 a = LZ4_read32(src);
-        U32 b = LZ4_read32(src + 4);
-        LZ4_write32(dst, a);
-        LZ4_write32(dst + 4, b);
-        dst += 8; src += 8;
-    }
-}
-
-inline void LZ4_memmove(__global BYTE* dst, const __global BYTE* src, int size) {
-    if (dst < src) {
-        LZ4_memcpy(dst, src, size);
-    } else {
-        for (int i = size - 1; i >= 0; --i) dst[i] = src[i];
-    }
-}
-
-inline void LZ4_wildCopy8(__global BYTE* dst, const __global BYTE* src, __global BYTE* dstEnd) {
-    do {
-        LZ4_memcpy(dst, src, 8);
-        dst += 8; src += 8;
-    } while (dst < dstEnd);
-}
-
-// lit-specific wild copy (safe for input -> output because src is input zone)
 inline void LZ4_lit_wildCopy8(__global BYTE* dst, const __global BYTE* src, __global BYTE* dstEnd) {
     while (dst < dstEnd) {
         LZ4_memcpy(dst, src, 8);
         dst += 8; src += 8;
     }
 }
-
-inline void LZ4_wildCopy32(__global BYTE* dst, const __global BYTE* src, __global BYTE* dstEnd) {
-    do {
-        LZ4_memcpy(dst, src, 32);
-        dst += 32; src += 32;
-    } while (dst < dstEnd);
-}
 #endif
+
+// --- Fast Direct Match Copy Helper (M2 backport from v2-r11) ---
+inline void lz4_v1_fast_direct_match_copy_18(__global BYTE* op,
+                                             const __global BYTE* match,
+                                             uint mlen_fast) {
+    LZ4_write64(op, LZ4_read64(match));
+    LZ4_write64(op + 8, LZ4_read64(match + 8));
+    if (mlen_fast > 16U) {
+        op[16] = match[16];
+        if (mlen_fast > 17U) op[17] = match[17];
+    }
+}
 
 // --- Hashing ---
 inline U32 LZ4_hash4(U32 sequence, int tableType) __attribute__((always_inline)) {
@@ -341,58 +306,47 @@ inline U32 LZ4_hash4(U32 sequence, int tableType) __attribute__((always_inline))
         return ((sequence * 2654435761U) >> ((MINMATCH*8)-LZ4_HASHLOG));
 }
 
-inline U32 LZ4_hash5(U64 sequence, int tableType) __attribute__((always_inline)) {
-    const U32 hashLog = (tableType == 0) ? LZ4_HASHLOG+1 : LZ4_HASHLOG;
-    const U64 prime5bytes = 889523592379ULL;
-    return (U32)(((sequence << 24) * prime5bytes) >> (64 - hashLog));
-}
-
 inline U32 LZ4_hashPosition(const __global BYTE* p, int tableType, U32* sequence) __attribute__((always_inline)) {
     U32 s = LZ4_read32(p);
     if (sequence) *sequence = s;
     return LZ4_hash4(s, tableType);
 }
 
-inline U32 LZ4_fp8(U32 sequence) __attribute__((always_inline)) {
-    return ((sequence * 0x9E3779B1U) >> 24) & 0xFF;
+inline U32 LZ4_hashMaskForTableType(int tableType) __attribute__((always_inline)) {
+    U32 const hashLog = (tableType == 0) ? (LZ4_HASHLOG + 1) : LZ4_HASHLOG;
+    return (1U << hashLog) - 1U;
 }
 
-inline void LZ4_putIndexOnHash(U32 idx, U32 h, __global U32* tableBase, int tableType, U32 fp, U32 epoch) __attribute__((always_inline)) {
-    U32 const hashLog = (tableType == 0) ? (LZ4_HASHLOG + 1) : LZ4_HASHLOG;
-    U32 const mask = (1U << hashLog) - 1U;
-    /* Compact 32-bit entry: [8-bit epoch | 8-bit fingerprint | 16-bit low position]
-     * Store the low 16 bits of the byte position and reconstruct the full match
-     * position relative to the current byte offset on lookup. This keeps the
-     * 8-bit fingerprint filter while allowing blocks > 64KB to continue using
-     * the last 64KB search window correctly. */
-    U32 packed = ((epoch & 0xFF) << 24) | (fp << 16) | (idx & 0xFFFF);
+inline void LZ4_putIndexOnHashMasked(U32 idx, U32 h, __global U32* tableBase, U32 mask, U32 epoch) __attribute__((always_inline)) {
+    /* Compact 32-bit entry: [12-bit epoch | 20-bit low position]. */
+    U32 packed = ((epoch & 0xFFF) << 20) | (idx & 0xFFFFF);
     tableBase[h & mask] = packed;
 }
 
-inline U32 LZ4_getIndexOnHash(U32 h, __global U32* tableBase, int tableType, U32 fp, int* fp_match, U32 epoch, U32 current) __attribute__((always_inline)) {
-    U32 const hashLog = (tableType == 0) ? (LZ4_HASHLOG + 1) : LZ4_HASHLOG;
-    U32 const mask = (1U << hashLog) - 1U;
+inline U32 LZ4_getIndexOnHashMasked(U32 h, __global U32* tableBase, U32 mask, int* entry_valid, U32 epoch, U32 current) __attribute__((always_inline)) {
     U32 const packed = tableBase[h & mask];
-    U32 const tag = (packed >> 24);
-    if (tag != (epoch & 0xFF)) {
-        *fp_match = 0;
+    U32 const tag = (packed >> 20);
+    if (tag != (epoch & 0xFFF)) {
+        *entry_valid = 0;
         return 0;
     }
-    *fp_match = (((packed >> 16) & 0xFF) == (fp & 0xFF));
+    *entry_valid = 1;
     {
-        U32 pos16 = packed & 0xFFFF;
-        U32 matchIndex = (current & 0xFFFF0000U) | pos16;
-        if (matchIndex > current) matchIndex -= 0x10000U;
+        U32 pos20 = packed & 0xFFFFF;
+        U32 matchIndex = (current & 0xFFF00000U) | pos20;
+        if (matchIndex > current) matchIndex -= 0x100000U;
         return matchIndex;
     }
 }
 
-inline void LZ4_putIndexOnHashLocal(U32 idx, U32 h, __local U16* table) __attribute__((always_inline)) {
-    table[h & ((1 << (LZ4_HASHLOG + 1)) - 1)] = (U16)idx;
+inline void LZ4_putIndexOnHash(U32 idx, U32 h, __global U32* tableBase, int tableType, U32 epoch) __attribute__((always_inline)) {
+    U32 const mask = LZ4_hashMaskForTableType(tableType);
+    LZ4_putIndexOnHashMasked(idx, h, tableBase, mask, epoch);
 }
 
-inline U32 LZ4_getIndexOnHashLocal(U32 h, __local U16* table) __attribute__((always_inline)) {
-    return (U32)table[h & ((1 << (LZ4_HASHLOG + 1)) - 1)];
+inline U32 LZ4_getIndexOnHash(U32 h, __global U32* tableBase, int tableType, int* entry_valid, U32 epoch, U32 current) __attribute__((always_inline)) {
+    U32 const mask = LZ4_hashMaskForTableType(tableType);
+    return LZ4_getIndexOnHashMasked(h, tableBase, mask, entry_valid, epoch, current);
 }
 
 // --- Matching ---
@@ -457,6 +411,11 @@ int lz4_compress_core_accelerated(
     __global U32* restrict hashTable,
     int acceleration,
     U32 epoch
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+    , __global U32* dbg_stats,
+    U32 dbg_index,
+    U32 dbg_enabled
+#endif
 ) {
     const __global BYTE* ip = src;
     __global BYTE* op = dst;
@@ -465,12 +424,27 @@ int lz4_compress_core_accelerated(
     const __global BYTE* anchor = ip;
     const __global BYTE* const mflimitPlusOne = iend - MFLIMIT + 1;
     const __global BYTE* const matchlimit = iend - LASTLITERALS;
+    const U32 hashMask = LZ4_hashMaskForTableType(tableType);
+
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+    U32 stat_search_iters = 0;
+    U32 stat_hash_tag_hits = 0;
+    U32 stat_distance_rejects = 0;
+    U32 stat_match_found = 0;
+    U32 stat_hash_inserts = 0;
+    U32 stat_literal_bytes = 0;
+    U32 stat_match_bytes = 0;
+    U32 stat_lastlit_bytes = 0;
+#endif
 
     if (srcSize < (MFLIMIT+1)) goto _last_literals_g;
 
     U32 ipValue, forwardIpValue;
     U32 h_init = LZ4_hashPosition(ip, tableType, &ipValue);
-    LZ4_putIndexOnHash(0, h_init, hashTable, tableType, LZ4_fp8(ipValue), epoch);
+    LZ4_putIndexOnHashMasked(0, h_init, hashTable, hashMask, epoch);
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+    if (dbg_enabled) stat_hash_inserts++;
+#endif
     ip++;
     U32 forwardH = LZ4_hashPosition(ip, tableType, &forwardIpValue);
 
@@ -485,18 +459,35 @@ int lz4_compress_core_accelerated(
                 U32 h_iter = forwardH;
                 ipValue = forwardIpValue;
                 U32 current = (U32)(forwardIp - src);
-                U32 fp = LZ4_fp8(ipValue);
-                int fp_match;
-                U32 matchIndex = LZ4_getIndexOnHash(h_iter, hashTable, tableType, fp, &fp_match, epoch, current);
+                int entry_valid;
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+                if (dbg_enabled) stat_search_iters++;
+#endif
+                U32 matchIndex = LZ4_getIndexOnHashMasked(h_iter, hashTable, hashMask, &entry_valid, epoch, current);
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+                if (dbg_enabled && entry_valid) stat_hash_tag_hits++;
+#endif
                 ip = forwardIp;
                 forwardIp += step;
                 step = (searchMatchNb++ >> 6);
                 if (forwardIp > mflimitPlusOne) goto _last_literals_g;
                 forwardH = LZ4_hashPosition(forwardIp, tableType, &forwardIpValue);
-                LZ4_putIndexOnHash(current, h_iter, hashTable, tableType, fp, epoch);
-                if (fp_match && (matchIndex < current) && (current - matchIndex < LZ4_DISTANCE_MAX)) {
+                LZ4_putIndexOnHashMasked(current, h_iter, hashTable, hashMask, epoch);
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+                if (dbg_enabled) stat_hash_inserts++;
+#endif
+                if (entry_valid && (matchIndex < current) && (current - matchIndex < LZ4_DISTANCE_MAX)) {
                     match = src + matchIndex;
-                    if (LZ4_read32(match) == ipValue) break;
+                    if (LZ4_read32(match) == ipValue) {
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+                        if (dbg_enabled) stat_match_found++;
+#endif
+                        break;
+                    }
+                } else if (entry_valid) {
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+                    if (dbg_enabled) stat_distance_rejects++;
+#endif
                 }
             } while(1);
         }
@@ -504,7 +495,18 @@ int lz4_compress_core_accelerated(
         {
             unsigned litLength = (unsigned)(ip - anchor);
             token = op++;
-            if (op + litLength + (2 + 1 + LASTLITERALS) + (litLength/255) > oend) return 0;
+            if (op + litLength + (2 + 1 + LASTLITERALS) + (litLength/255) > oend) {
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+                lz4_gpu_debug_write_comp_stats(dbg_stats, dbg_index, dbg_enabled,
+                                               stat_search_iters, stat_hash_tag_hits, stat_distance_rejects,
+                                               stat_match_found, stat_hash_inserts, stat_literal_bytes,
+                                               stat_match_bytes, stat_lastlit_bytes);
+#endif
+                return 0;
+            }
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+            if (dbg_enabled) stat_literal_bytes += litLength;
+#endif
             if (litLength >= RUN_MASK) {
                 unsigned len = litLength - RUN_MASK;
                 *token = (RUN_MASK << ML_BITS);
@@ -521,6 +523,9 @@ _next_match_g:
         {
             unsigned matchCode = LZ4_count(ip + MINMATCH, match + MINMATCH, matchlimit);
             ip += matchCode + MINMATCH;
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+            if (dbg_enabled) stat_match_bytes += (matchCode + MINMATCH);
+#endif
             if (matchCode >= ML_MASK) {
                 *token += ML_MASK;
                 matchCode -= ML_MASK;
@@ -532,28 +537,55 @@ _next_match_g:
         }
         anchor = ip;
         if (ip >= mflimitPlusOne) break;
-        U32 seq2, seq_ip, seq_f;
-        U32 fp2, fp_ip;
+        U32 seq2, seq_ip;
         U32 h2 = LZ4_hashPosition(ip - 2, tableType, &seq2);
-        fp2 = LZ4_fp8(seq2);
-        LZ4_putIndexOnHash((U32)(ip - 2 - src), h2, hashTable, tableType, fp2, epoch);
+        LZ4_putIndexOnHashMasked((U32)(ip - 2 - src), h2, hashTable, hashMask, epoch);
+    #if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+        if (dbg_enabled) stat_hash_inserts++;
+    #endif
         U32 h_ip = LZ4_hashPosition(ip, tableType, &seq_ip);
-        fp_ip = LZ4_fp8(seq_ip);
         U32 current = (U32)(ip - src);
-        int fp_match;
-        U32 matchIndex = LZ4_getIndexOnHash(h_ip, hashTable, tableType, fp_ip, &fp_match, epoch, current);
-        LZ4_putIndexOnHash(current, h_ip, hashTable, tableType, fp_ip, epoch);
-        if (fp_match && (matchIndex < current) && (current - matchIndex < LZ4_DISTANCE_MAX)) {
+        int entry_valid;
+    #if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+        if (dbg_enabled) stat_search_iters++;
+    #endif
+        U32 matchIndex = LZ4_getIndexOnHashMasked(h_ip, hashTable, hashMask, &entry_valid, epoch, current);
+    #if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+        if (dbg_enabled && entry_valid) stat_hash_tag_hits++;
+    #endif
+        LZ4_putIndexOnHashMasked(current, h_ip, hashTable, hashMask, epoch);
+    #if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+        if (dbg_enabled) stat_hash_inserts++;
+    #endif
+        if (entry_valid && (matchIndex < current) && (current - matchIndex < LZ4_DISTANCE_MAX)) {
             if (LZ4_read32(src + matchIndex) == seq_ip) {
+    #if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+            if (dbg_enabled) stat_match_found++;
+    #endif
                 token = op++; *token = 0; match = src + matchIndex; goto _next_match_g;
             }
+        } else if (entry_valid) {
+    #if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+            if (dbg_enabled) stat_distance_rejects++;
+    #endif
         }
         forwardH = LZ4_hashPosition(++ip, tableType, &forwardIpValue);
     }
 _last_literals_g:
     {
         size_t lastRun = (size_t)(iend - anchor);
-        if (op + lastRun + 1 + ((lastRun + 255 - RUN_MASK) / 255) > oend) return 0;
+        if (op + lastRun + 1 + ((lastRun + 255 - RUN_MASK) / 255) > oend) {
+    #if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+            lz4_gpu_debug_write_comp_stats(dbg_stats, dbg_index, dbg_enabled,
+                           stat_search_iters, stat_hash_tag_hits, stat_distance_rejects,
+                           stat_match_found, stat_hash_inserts, stat_literal_bytes,
+                           stat_match_bytes, stat_lastlit_bytes);
+    #endif
+            return 0;
+        }
+    #if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+        if (dbg_enabled) stat_lastlit_bytes += (U32)lastRun;
+    #endif
         if (lastRun >= RUN_MASK) {
             size_t accumulator = lastRun - RUN_MASK;
             *op++ = RUN_MASK << ML_BITS;
@@ -565,22 +597,14 @@ _last_literals_g:
         LZ4_memcpy(op, anchor, lastRun);
         op += lastRun;
     }
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+    lz4_gpu_debug_write_comp_stats(dbg_stats, dbg_index, dbg_enabled,
+                                   stat_search_iters, stat_hash_tag_hits, stat_distance_rejects,
+                                   stat_match_found, stat_hash_inserts, stat_literal_bytes,
+                                   stat_match_bytes, stat_lastlit_bytes);
+#endif
     return (int)(op - dst);
 }
-
-#ifdef LZ4_GPU_ENABLE_STATS
-    /* Write collected stats for this block */
-    block_stats[stats_index * ST_N_STATS + ST_MATCH_SEARCH] = stat_match_search;
-    block_stats[stats_index * ST_N_STATS + ST_MATCH_FOUND] = stat_match_found;
-    block_stats[stats_index * ST_N_STATS + ST_LIT_EMITS] = stat_lit_emits;
-    block_stats[stats_index * ST_N_STATS + ST_MATCH_EMITS] = stat_match_emits;
-    block_stats[stats_index * ST_N_STATS + ST_MEMCPY_CALLS] = stat_memcpy_calls;
-    block_stats[stats_index * ST_N_STATS + ST_MATCH_COMPARES] = stat_match_compares;
-    block_stats[stats_index * ST_N_STATS + ST_MATCH_COMPARES_FAILED] = stat_match_compares_failed;
-    block_stats[stats_index * ST_N_STATS + ST_SEARCH_ITERS] = stat_search_iters;
-    block_stats[stats_index * ST_N_STATS + ST_FP_FILTERS] = stat_fp_filters;
-    block_stats[stats_index * ST_N_STATS + ST_TABLE_INIT_WRITES] = stat_table_init_writes;
-#endif
 
 // --- Decompression Core ---
 // Implements LZ4_decompress_safe_generic logic
@@ -590,47 +614,108 @@ void lz4_decompress_generic(
     int srcSize,
     int outputSize,
     __global U32* outputSizePtr
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+    , __global U32* dbg_stats,
+    U32 dbg_index,
+    U32 dbg_enabled
+#endif
 ) {
     const __global BYTE* ip = src;
     const __global BYTE* const iend = ip + srcSize;
-    __global BYTE* op = dst;
-    __global BYTE* const oend = op + outputSize;
-    __global BYTE* cpy;
+    const U32 output_end = (U32)outputSize;
+    const U32 fast_output_limit = (outputSize >= 32) ? (output_end - 32U) : 0U;
+    const uint fast_output_ok = (outputSize >= 32) ? 1U : 0U;
+    __global BYTE* const oend = dst + outputSize;
+    U32 op_rel = 0U;
+
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+    U32 stat_tokens = 0;
+    U32 stat_literal_bytes = 0;
+    U32 stat_match_bytes = 0;
+    U32 stat_small_offsets = 0;
+    U32 stat_fast_literals = 0;
+    U32 stat_fast_matches = 0;
+    U32 stat_output_errors = 0;
+#endif
 
     const __global BYTE* const shortiend = iend - 14 - 2;
     const __global BYTE* const shortoend = oend - 14 - 18;
 
-    if (srcSize == 0) { *outputSizePtr = 0; return; }
+    if (srcSize == 0) {
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+        lz4_gpu_debug_write_dec_stats(dbg_stats, dbg_index, dbg_enabled,
+                                      stat_tokens, stat_literal_bytes, stat_match_bytes,
+                                      stat_small_offsets, stat_fast_literals, stat_fast_matches,
+                                      stat_output_errors);
+#endif
+        *outputSizePtr = 0;
+        return;
+    }
 
     for (;;) {
         unsigned token = *ip++;
-        size_t length = token >> ML_BITS;
-        size_t offset;
+        U32 length = token >> ML_BITS;
+        U32 offset = 0U;
+        U32 match_rel = 0U;
+        __global BYTE* op;
         __global BYTE* match;
+        __global BYTE* cpy;
+
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+        if (dbg_enabled) stat_tokens++;
+#endif
 
         // Fast path
-        if ((length != RUN_MASK) && (ip < shortiend) && (op <= shortoend)) {
+        if ((length != RUN_MASK) && (ip < shortiend) && fast_output_ok && (op_rel <= fast_output_limit)) {
+            op = dst + (size_t)op_rel;
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+            if (dbg_enabled) {
+                stat_fast_literals++;
+                stat_literal_bytes += length;
+            }
+#endif
             LZ4_memcpy(op, ip, 16);
-            op += length; ip += length;
+            op_rel += length;
+            ip += length;
 
-            length = token & ML_MASK;
-            offset = LZ4_readLE16(ip); ip += 2;
-            match = op - offset;
+            length = (U32)(token & ML_MASK);
+            offset = LZ4_readLE16(ip);
+            ip += 2;
+            if (offset > op_rel) goto _output_error;
+            match_rel = op_rel - offset;
+            op = dst + (size_t)op_rel;
+            match = dst + (size_t)match_rel;
+
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+            if (dbg_enabled && offset < 8) stat_small_offsets++;
+#endif
 
             {
-                uint mlen_fast = (uint)(length + MINMATCH);
-                if ((length != ML_MASK) && (match >= dst) && (offset >= mlen_fast)) {
-                    LZ4_UA_COPYN(op, match, mlen_fast);
-                    op += mlen_fast;
+                U32 mlen_fast = length + MINMATCH;
+                if ((length != ML_MASK) && (offset >= mlen_fast)) {
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+                    if (dbg_enabled) {
+                        stat_fast_matches++;
+                        stat_match_bytes += mlen_fast;
+                    }
+#endif
+                    lz4_v1_fast_direct_match_copy_18(op, match, mlen_fast);
+                    op_rel += mlen_fast;
                     continue;
                 }
             }
 
-            if ((length != ML_MASK) && (offset >= 8) && (match >= dst)) {
+            if ((length != ML_MASK) && (offset >= 8)) {
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+                if (dbg_enabled) {
+                    stat_fast_matches++;
+                    stat_match_bytes += (length + MINMATCH);
+                }
+#endif
                 LZ4_memcpy(op, match, 8);
                 LZ4_memcpy(op + 8, match + 8, 8);
                 LZ4_memcpy(op + 16, match + 16, 2);
-                op += length + MINMATCH;
+                op_rel += length + MINMATCH;
                 continue;
             }
             goto _copy_match;
@@ -646,22 +731,34 @@ void lz4_decompress_generic(
             } while (s == 255);
         }
 
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+    if (dbg_enabled) stat_literal_bytes += length;
+#endif
+
         // Copy literals
+    op = dst + (size_t)op_rel;
         cpy = op + length;
         if ((cpy > oend - MFLIMIT) || (ip + length > iend - (2 + 1 + LASTLITERALS))) {
             if (ip + length != iend) goto _output_error;
             if (cpy > oend) goto _output_error;
             LZ4_memcpy(op, ip, length);
-            op += length;
+        op_rel += length;
             break; // End of block
         }
         LZ4_lit_wildCopy8(op, ip, cpy);
-        ip += length; op = cpy;
+    ip += length;
+    op_rel += length;
 
         // Get offset
-        offset = LZ4_readLE16(ip); ip += 2;
-        match = op - offset;
-        length = token & ML_MASK;
+    offset = LZ4_readLE16(ip);
+    ip += 2;
+    if (offset > op_rel) goto _output_error;
+    match_rel = op_rel - offset;
+    length = (U32)(token & ML_MASK);
+
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+    if (dbg_enabled && offset < 8) stat_small_offsets++;
+#endif
 
 _copy_match:
         if (length == ML_MASK) {
@@ -674,17 +771,35 @@ _copy_match:
         }
         length += MINMATCH;
 
-        if (match < dst) goto _output_error;
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+    if (dbg_enabled) stat_match_bytes += length;
+#endif
+
+    op = dst + (size_t)op_rel;
+    match = dst + (size_t)match_rel;
 
         cpy = op + length;
         LZ4_COPY_MATCH(op, match, (uint)length);
-        op = cpy;
+    op_rel += length;
     }
 
-    *outputSizePtr = (U32)(op - dst);
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+    lz4_gpu_debug_write_dec_stats(dbg_stats, dbg_index, dbg_enabled,
+                                  stat_tokens, stat_literal_bytes, stat_match_bytes,
+                                  stat_small_offsets, stat_fast_literals, stat_fast_matches,
+                                  stat_output_errors);
+#endif
+    *outputSizePtr = op_rel;
     return;
 
 _output_error:
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+    if (dbg_enabled) stat_output_errors++;
+    lz4_gpu_debug_write_dec_stats(dbg_stats, dbg_index, dbg_enabled,
+                                  stat_tokens, stat_literal_bytes, stat_match_bytes,
+                                  stat_small_offsets, stat_fast_literals, stat_fast_matches,
+                                  stat_output_errors);
+#endif
     *outputSizePtr = 0xFFFFFFFF;
 }
 
@@ -703,11 +818,18 @@ __kernel void lz4_compress_block(
     int acceleration,
     int globalIndexBase,
     __global U32* globalHashTablePool,
+    U32 active_lanes,
     U32 epoch_base
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+    , __global U32* dbg_stats,
+    U32 dbg_enabled
+#endif
 ) {
     const uint wi = get_global_id(0);
-    const uint total_wi = get_global_size(0);
+    const uint total_wi = active_lanes;
     const uint dict_entries = (tableType == 0) ? (1U << (LZ4_HASHLOG + 1)) : (1U << LZ4_HASHLOG);
+
+    if (wi >= total_wi) return;
 
     __global U32* dict = globalHashTablePool + (size_t)wi * dict_entries;
     U32 epoch = epoch_base + 1U;
@@ -721,6 +843,9 @@ __kernel void lz4_compress_block(
             __global BYTE* dst = output + (size_t)b * (size_t)singleBlockMaxOut;
             blockSizes[globalIndexBase + b] = lz4_compress_core_accelerated(
                 input + start, dst, thisBlockSize, dstCapacity, tableType, dict, acceleration, epoch
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+                , dbg_stats, b, dbg_enabled
+#endif
             );
         } else {
             blockSizes[globalIndexBase + b] = 0;
@@ -741,11 +866,18 @@ __kernel void lz4_compress_blocks_mapped(
     int acceleration,
     int globalIndexBase,
     __global U32* globalHashTablePool,
+    U32 active_lanes,
     U32 epoch_base
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+    , __global U32* dbg_stats,
+    U32 dbg_enabled
+#endif
 ) {
     const uint wi = get_global_id(0);
-    const uint total_wi = get_global_size(0);
+    const uint total_wi = active_lanes;
     const uint dict_entries = (tableType == 0) ? (1U << (LZ4_HASHLOG + 1)) : (1U << LZ4_HASHLOG);
+
+    if (wi >= total_wi) return;
 
     __global U32* dict = globalHashTablePool + (size_t)wi * dict_entries;
     U32 epoch = epoch_base + 1U;
@@ -760,6 +892,9 @@ __kernel void lz4_compress_blocks_mapped(
             __global BYTE* dst = output + (size_t)b * (size_t)singleBlockMaxOut;
             blockSizes[globalIndexBase + b] = lz4_compress_core_accelerated(
                 input + start, dst, thisBlockSize, dstCapacity, tableType, dict, acceleration, epoch
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+                , dbg_stats, b, dbg_enabled
+#endif
             );
         } else {
             blockSizes[globalIndexBase + b] = 0;
@@ -776,6 +911,10 @@ __kernel void lz4_decompress_block(
     U32 max_output_size,
     __global U32* output_sizes,
     U32 block_index
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+    , __global U32* dbg_stats,
+    U32 dbg_enabled
+#endif
 ) {
     lz4_decompress_generic(
         input + compressed_offset,
@@ -783,6 +922,9 @@ __kernel void lz4_decompress_block(
         (int)compressed_size,
         (int)max_output_size,
         &output_sizes[block_index]
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+        , dbg_stats, block_index, dbg_enabled
+#endif
     );
 }
 
@@ -794,6 +936,10 @@ __kernel void lz4_decompress_blocks(
     __global U32* sizes_out,
     U32 block_size,
     U32 totalBlocks
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+    , __global U32* dbg_stats,
+    U32 dbg_enabled
+#endif
 ) {
     int gid = get_global_id(0);
     int gsz = get_global_size(0);
@@ -805,6 +951,9 @@ __kernel void lz4_decompress_blocks(
             (int)comp_sizes[idx],
             (int)block_size,
             &sizes_out[idx]
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+            , dbg_stats, (U32)idx, dbg_enabled
+#endif
         );
     }
 }
@@ -818,6 +967,10 @@ __kernel void lz4_decompress_blocks_mapped(
     __global U32* sizes_out,
     U32 block_size,
     U32 totalMappedBlocks
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+    , __global U32* dbg_stats,
+    U32 dbg_enabled
+#endif
 ) {
     int gid = get_global_id(0);
     int gsz = get_global_size(0);
@@ -830,78 +983,10 @@ __kernel void lz4_decompress_blocks_mapped(
             (int)comp_sizes[src_idx],
             (int)block_size,
             &sizes_out[idx]
+#if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
+            , dbg_stats, (U32)idx, dbg_enabled
+#endif
         );
-    }
-}
-
-__kernel void lz4_pack_blocks(
-    const __global BYTE* sparse_output,
-    __global BYTE* packed_output,
-    __global const U32* packed_offsets,
-    __global const U32* block_sizes,
-    U32 singleBlockMaxOut,
-    U32 totalBlocks
-) {
-    uint blk = get_group_id(0);
-    uint lane = get_local_id(0);
-    uint lanes = get_local_size(0);
-
-    if (blk >= totalBlocks) return;
-
-    {
-        U32 sz = block_sizes[blk];
-        __global BYTE* dst = packed_output + packed_offsets[blk];
-        const __global BYTE* src = sparse_output + (size_t)blk * (size_t)singleBlockMaxOut;
-
-        if (sz == 0) return;
-
-        if (sz <= 32U) {
-            if (lane == 0) {
-                U32 pos = 0;
-                if (sz >= 16U) {
-                    uchar16 c16 = vload16(0, (const __global uchar*)src);
-                    vstore16(c16, 0, (__global uchar*)dst);
-                    pos = 16U;
-                }
-                if (sz - pos >= 8U) {
-                    uchar8 c8 = vload8(0, (const __global uchar*)(src + pos));
-                    vstore8(c8, 0, (__global uchar*)(dst + pos));
-                    pos += 8U;
-                }
-                for (; pos < sz; ++pos) dst[pos] = src[pos];
-            }
-            return;
-        }
-
-        if (sz <= 128U) {
-            U32 vec16_end = sz & ~15U;
-            for (U32 pos = lane * 16U; pos < vec16_end; pos += lanes * 16U) {
-                uchar16 c = vload16(0, (const __global uchar*)(src + pos));
-                vstore16(c, 0, (__global uchar*)(dst + pos));
-            }
-            for (U32 pos = vec16_end + lane; pos < sz; pos += lanes) {
-                dst[pos] = src[pos];
-            }
-            return;
-        }
-
-        U32 vec32_end = sz & ~31U;
-        for (U32 pos = lane * 32U; pos < vec32_end; pos += lanes * 32U) {
-            uchar16 c0 = vload16(0, (const __global uchar*)(src + pos));
-            uchar16 c1 = vload16(0, (const __global uchar*)(src + pos + 16U));
-            vstore16(c0, 0, (__global uchar*)(dst + pos));
-            vstore16(c1, 0, (__global uchar*)(dst + pos + 16U));
-        }
-
-        U32 vec16_end = sz & ~15U;
-        for (U32 pos = vec32_end + lane * 16U; pos < vec16_end; pos += lanes * 16U) {
-            uchar16 c = vload16(0, (const __global uchar*)(src + pos));
-            vstore16(c, 0, (__global uchar*)(dst + pos));
-        }
-
-        for (U32 pos = vec16_end + lane; pos < sz; pos += lanes) {
-            dst[pos] = src[pos];
-        }
     }
 }
 

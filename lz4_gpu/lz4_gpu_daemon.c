@@ -12,12 +12,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <time.h>
+#include <limits.h>
 #include <CL/cl.h>
 #include "lz4_gpu_protocol.h"
 #include "lz4_gpu_core.h"
 #include "lz4_gpu_utils.h"
 
-#define MAX_WORKERS 4
+#define MAX_WORKERS_CAP 16
 #define MIN_HASH_LOG 10
 #define MAX_HASH_LOG 16
 
@@ -25,7 +26,6 @@ typedef struct {
     int id;
     cl_command_queue queue;
     cl_kernel kernel_comp[MAX_HASH_LOG + 1];
-    cl_kernel kernel_pack[MAX_HASH_LOG + 1];
     cl_kernel kernel_decomp;
     lz4_gpu_workspace_t ws;
     pthread_t thread;
@@ -41,7 +41,8 @@ struct {
     cl_context context;
     cl_program program_comp[MAX_HASH_LOG + 1];
     pthread_mutex_t compile_lock;
-    worker_res_t workers[MAX_WORKERS];
+    worker_res_t workers[MAX_WORKERS_CAP];
+    int active_workers;
     int server_sock;
     volatile int running;
     int pid_fd;
@@ -74,6 +75,43 @@ static void signal_handler(int sig) {
     g_state.running = 0;
 }
 
+static int clamp_int(int v, int lo, int hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static int parse_env_int(const char* name, int* out_value) {
+    const char* env = getenv(name);
+    char* end = NULL;
+    long v;
+    if (!env || !*env) return 0;
+    v = strtol(env, &end, 10);
+    if (end == env || *end != '\0') return 0;
+    *out_value = (int)v;
+    return 1;
+}
+
+static int choose_daemon_worker_count(cl_device_id device) {
+    int env_workers = 0;
+    if (parse_env_int("LZ4_DAEMON_WORKERS", &env_workers)) {
+        return clamp_int(env_workers, 1, MAX_WORKERS_CAP);
+    }
+
+    cl_uint cu = 0;
+    long cpu_online = sysconf(_SC_NPROCESSORS_ONLN);
+    int cpu_budget = (cpu_online > 0) ? (int)cpu_online / 2 : 1;
+    int cu_budget = 1;
+
+    if (cpu_budget < 1) cpu_budget = 1;
+    if (clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cu), &cu, NULL) == CL_SUCCESS && cu > 0) {
+        cu_budget = (int)((cu + 7) / 8); /* about 1 daemon worker per 8 CUs */
+        if (cu_budget < 1) cu_budget = 1;
+    }
+
+    return clamp_int((cpu_budget < cu_budget) ? cpu_budget : cu_budget, 1, MAX_WORKERS_CAP);
+}
+
 static char* read_file_bin(const char* path, size_t* out_len) {
     FILE* f = fopen(path, "rb"); if (!f) return NULL;
     fseek(f, 0, SEEK_END); long s = ftell(f); fseek(f, 0, SEEK_SET);
@@ -84,35 +122,140 @@ static char* read_file_bin(const char* path, size_t* out_len) {
     return buf;
 }
 
+static int path_join2(char* out, size_t out_len, const char* a, const char* b) {
+    size_t la, lb;
+    if (!out || !a || !b || out_len == 0) return -1;
+    la = strlen(a); lb = strlen(b);
+    if (la + 1 + lb + 1 > out_len) return -1;
+    memcpy(out, a, la);
+    out[la] = '/';
+    memcpy(out + la + 1, b, lb);
+    out[la + 1 + lb] = '\0';
+    return 0;
+}
+
+static int path_join3(char* out, size_t out_len, const char* a, const char* b, const char* c) {
+    char tmp[PATH_MAX];
+    if (path_join2(tmp, sizeof(tmp), a, b) != 0) return -1;
+    return path_join2(out, out_len, tmp, c);
+}
+
+static int get_exe_dir(char* out, size_t out_len) {
+    char exe[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0) return -1;
+    exe[n] = '\0';
+    char* slash = strrchr(exe, '/');
+    if (!slash) return -1;
+    *slash = '\0';
+    if (strlen(exe) + 1 > out_len) return -1;
+    strcpy(out, exe);
+    return 0;
+}
+
+static int dirname_of_path(const char* path, char* out, size_t out_len) {
+    const char* slash;
+    size_t len;
+    if (!path || !out || out_len == 0) return -1;
+    slash = strrchr(path, '/');
+    if (!slash) return -1;
+    len = (size_t)(slash - path);
+    if (len + 1 > out_len) return -1;
+    memcpy(out, path, len);
+    out[len] = '\0';
+    return 0;
+}
+
+static int resolve_daemon_file(const char* env_name, const char* filename, char* out, size_t out_len) {
+    char cwd[PATH_MAX];
+    char exe_dir[PATH_MAX];
+    const char* env = getenv(env_name);
+    if (env && *env && access(env, R_OK) == 0) {
+        if (strlen(env) + 1 > out_len) return -1;
+        strcpy(out, env);
+        return 0;
+    }
+
+    if (getcwd(cwd, sizeof(cwd)) && path_join2(out, out_len, cwd, filename) == 0 && access(out, R_OK) == 0) {
+        return 0;
+    }
+
+    if (get_exe_dir(exe_dir, sizeof(exe_dir)) == 0) {
+        if (path_join2(out, out_len, exe_dir, filename) == 0 && access(out, R_OK) == 0) {
+            return 0;
+        }
+        if (path_join3(out, out_len, exe_dir, "../lz4_gpu", filename) == 0 && access(out, R_OK) == 0) {
+            return 0;
+        }
+    }
+
+    if (access(filename, R_OK) == 0) {
+        if (strlen(filename) + 1 > out_len) return -1;
+        strcpy(out, filename);
+        return 0;
+    }
+
+    return -1;
+}
+
 cl_program load_program(cl_context context, cl_device_id device) {
     const int hash_log = 14;
     uint64_t t1 = get_us();
     char bin_name[128];
-    snprintf(bin_name, sizeof(bin_name), "/root/lz4/lz4_gpu/lz4_gpu_%d.clbin", hash_log);
-    size_t sz = 0;
-    char* bin = read_file_bin(bin_name, &sz);
-    if (bin) {
-        cl_int status, err;
-        cl_program prog = clCreateProgramWithBinary(context, 1, &device, &sz, (const unsigned char**)&bin, &status, &err);
-        free(bin);
-        if (err == CL_SUCCESS) {
-            clBuildProgram(prog, 1, &device, NULL, NULL, NULL);
-            return prog;
+    char bin_path[PATH_MAX];
+
+    snprintf(bin_name, sizeof(bin_name), "lz4_gpu_%d.clbin", hash_log);
+    if (resolve_daemon_file("LZ4_GPU_DAEMON_CLBIN", bin_name, bin_path, sizeof(bin_path)) == 0) {
+        size_t sz = 0;
+        char* bin = read_file_bin(bin_path, &sz);
+        if (bin) {
+            cl_int status, err;
+            cl_program prog = clCreateProgramWithBinary(context, 1, &device, &sz, (const unsigned char**)&bin, &status, &err);
+            free(bin);
+            if (err == CL_SUCCESS && status == CL_SUCCESS) {
+                if (clBuildProgram(prog, 1, &device, NULL, NULL, NULL) == CL_SUCCESS) {
+                    return prog;
+                }
+                clReleaseProgram(prog);
+            }
         }
     }
-    // Fallback: compile from source
-    char flags[128];
-    snprintf(flags, sizeof(flags), "-I. -DLZ4_HASHLOG=%d", hash_log);
-    FILE* f = fopen("/root/lz4/lz4_gpu/lz4_gpu.cl", "r");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END); size_t s_sz = ftell(f); fseek(f, 0, SEEK_SET);
-    char* src = malloc(s_sz + 1); fread(src, 1, s_sz, f); src[s_sz] = 0; fclose(f);
-    cl_int err;
-    cl_program prog = clCreateProgramWithSource(context, 1, (const char**)&src, &s_sz, &err);
-    free(src);
-    clBuildProgram(prog, 1, &device, flags, NULL, NULL);
-    g_kernel_load_us += (get_us() - t1);
-    return prog;
+
+    {
+        char src_path[PATH_MAX];
+        char include_dir[PATH_MAX];
+        char flags[PATH_MAX + 64];
+        FILE* f;
+        size_t s_sz;
+        char* src;
+        cl_int err;
+
+        if (resolve_daemon_file("LZ4_GPU_DAEMON_CL", "lz4_gpu.cl", src_path, sizeof(src_path)) != 0) {
+            return NULL;
+        }
+
+        if (dirname_of_path(src_path, include_dir, sizeof(include_dir)) != 0) {
+            strcpy(include_dir, ".");
+        }
+
+        snprintf(flags, sizeof(flags), "-I. -I%s -DLZ4_HASHLOG=%d", include_dir, hash_log);
+        f = fopen(src_path, "r");
+        if (!f) return NULL;
+        fseek(f, 0, SEEK_END); s_sz = (size_t)ftell(f); fseek(f, 0, SEEK_SET);
+        src = malloc(s_sz + 1);
+        if (!src) { fclose(f); return NULL; }
+        fread(src, 1, s_sz, f); src[s_sz] = 0; fclose(f);
+
+        cl_program prog = clCreateProgramWithSource(context, 1, (const char**)&src, &s_sz, &err);
+        free(src);
+        if (err != CL_SUCCESS || !prog) return NULL;
+        if (clBuildProgram(prog, 1, &device, flags, NULL, NULL) != CL_SUCCESS) {
+            clReleaseProgram(prog);
+            return NULL;
+        }
+        g_kernel_load_us += (get_us() - t1);
+        return prog;
+    }
 }
 
 int init_resources(void) {
@@ -133,8 +276,9 @@ int init_resources(void) {
     g_ocl_init_us = get_us() - t1;
 
     pthread_mutex_init(&g_state.compile_lock, NULL);
+    g_state.active_workers = choose_daemon_worker_count(g_state.device);
 
-    for (int i = 0; i < MAX_WORKERS; i++) {
+    for (int i = 0; i < g_state.active_workers; i++) {
         g_state.workers[i].id = i;
         {
             cl_queue_properties props[] = { CL_QUEUE_PROPERTIES, 0, 0 };
@@ -164,16 +308,12 @@ void process_request(worker_res_t* w, request_t* req, response_t* res) {
         if (!w->kernel_comp[h_log] && prog) {
             cl_int err;
             w->kernel_comp[h_log] = clCreateKernel(prog, "lz4_compress_block", &err);
-            if (err == CL_SUCCESS && w->kernel_comp[h_log]) {
-                w->kernel_pack[h_log] = clCreateKernel(prog, "lz4_pack_blocks", &err);
-            }
         }
         cl_kernel kernel = w->kernel_comp[h_log];
-        cl_kernel pack_kernel = w->kernel_pack[h_log];
         pthread_mutex_unlock(&g_state.compile_lock);
 
         if (kernel) {
-            ret = lz4_compress_core(g_state.context, w->queue, kernel, pack_kernel, req->input_path, req->output_path,
+            ret = lz4_compress_core(g_state.context, w->queue, kernel, req->input_path, req->output_path,
                                   req->block_size, req->acceleration, &w->ws, &t, req->local_size, 0);
         }
     } else {
@@ -232,14 +372,16 @@ int run_daemon() {
     if (bind(g_state.server_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) return 1;
     listen(g_state.server_sock, 5);
     g_state.running = 1;
-    for (int i = 0; i < MAX_WORKERS; i++) pthread_create(&g_state.workers[i].thread, NULL, worker_thread, &g_state.workers[i]);
-    printf("LZ4 GPU Daemon started. Listening on %s\n", SOCKET_PATH); fflush(stdout);
+    for (int i = 0; i < g_state.active_workers; i++) {
+        pthread_create(&g_state.workers[i].thread, NULL, worker_thread, &g_state.workers[i]);
+    }
+    printf("LZ4 GPU Daemon started. workers=%d, listening on %s\n", g_state.active_workers, SOCKET_PATH); fflush(stdout);
     while (g_state.running) {
         int client = accept(g_state.server_sock, NULL, NULL);
         if (client < 0) { if (errno == EINTR) continue; break; }
         int assigned = 0;
         while (g_state.running && !assigned) {
-            for (int i = 0; i < MAX_WORKERS; i++) {
+            for (int i = 0; i < g_state.active_workers; i++) {
                 if (pthread_mutex_trylock(&g_state.workers[i].lock) == 0) {
                     if (!g_state.workers[i].has_work) {
                         g_state.workers[i].client_fd = client;
