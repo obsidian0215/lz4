@@ -1583,8 +1583,10 @@ static int lz4_find_file_path(const char* name, char* out, size_t outlen) {
 cl_program lz4_load_program(cl_context context, cl_device_id device) {
     const int hash_log = 14;
     int dbg_enabled = lz4_debug_counters_enabled();
+    int use_clbin_set = 0;
+    int use_clbin = lz4_env_flag_value("LZ4_GPU_USE_CLBIN", &use_clbin_set);
 
-    if (!dbg_enabled) {
+    if (!dbg_enabled && use_clbin_set && use_clbin) {
         char bin_name[128];
         char resolved_path[PATH_MAX];
         snprintf(bin_name, sizeof(bin_name), "lz4_gpu_%d.clbin", hash_log);

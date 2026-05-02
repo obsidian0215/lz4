@@ -290,6 +290,10 @@ inline void LZ4_lit_wildCopy8(__global BYTE* dst, const __global BYTE* src, __gl
 inline void lz4_v1_fast_direct_match_copy_18(__global BYTE* op,
                                              const __global BYTE* match,
                                              uint mlen_fast) {
+    if (mlen_fast <= 8U) {
+        LZ4_write64(op, LZ4_read64(match));
+        return;
+    }
     LZ4_write64(op, LZ4_read64(match));
     LZ4_write64(op + 8, LZ4_read64(match + 8));
     if (mlen_fast > 16U) {
@@ -674,7 +678,11 @@ void lz4_decompress_generic(
                 stat_literal_bytes += length;
             }
 #endif
-            LZ4_memcpy(op, ip, 16);
+            if (length <= 8U) {
+                LZ4_write64(op, LZ4_read64(ip));
+            } else {
+                LZ4_memcpy(op, ip, 16);
+            }
             op_rel += length;
             ip += length;
 
@@ -712,9 +720,16 @@ void lz4_decompress_generic(
                     stat_match_bytes += (length + MINMATCH);
                 }
 #endif
-                LZ4_memcpy(op, match, 8);
-                LZ4_memcpy(op + 8, match + 8, 8);
-                LZ4_memcpy(op + 16, match + 16, 2);
+                if (length <= 4U) {
+                    LZ4_write64(op, LZ4_read64(match));
+                } else {
+                    LZ4_write64(op, LZ4_read64(match));
+                    LZ4_write64(op + 8, LZ4_read64(match + 8));
+                    if (length > 12U) {
+                        op[16] = match[16];
+                        if (length > 13U) op[17] = match[17];
+                    }
+                }
                 op_rel += length + MINMATCH;
                 continue;
             }

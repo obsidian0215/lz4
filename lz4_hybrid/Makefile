@@ -7,52 +7,68 @@ endif
 endif
 
 CC ?= cc
+HOSTCC ?= cc
 
 ifeq ($(OS),Windows_NT)
 EXEEXT ?= .exe
+HOSTEXEEXT ?=
 PTHREAD_LIB ?= -lpthread
 OPENCL_INCLUDE_DIR ?=
 OPENCL_LIB_DIR ?=
 OPENCL_LIB_NAME ?= OpenCL
 OPENCL_CFLAGS := $(if $(OPENCL_INCLUDE_DIR),-I$(OPENCL_INCLUDE_DIR),)
 OPENCL_LDFLAGS := $(if $(OPENCL_LIB_DIR),-L$(OPENCL_LIB_DIR),) -l$(OPENCL_LIB_NAME)
-CFLAGS ?= -O2 -Wall -DCL_TARGET_OPENCL_VERSION=200 -DWIN32_LEAN_AND_MEAN -I. -I../lz4_gpu -I../lib $(OPENCL_CFLAGS)
-LDFLAGS ?= $(OPENCL_LDFLAGS) -lm $(PTHREAD_LIB)
+CFLAGS ?= -O2 -Wall -DCL_TARGET_OPENCL_VERSION=200 -DWIN32_LEAN_AND_MEAN -I. -I../lib -I.. $(OPENCL_CFLAGS)
+LDFLAGS ?= $(OPENCL_LDFLAGS) -lm $(PTHREAD_LIB) -lws2_32
+HOST_OPENCL_CFLAGS ?=
+HOST_OPENCL_LDFLAGS ?=-lOpenCL -lm -lpthread
+PRECOMPILE_HELPER := build_clbin_host$(HOSTEXEEXT)
 else
 EXEEXT ?=
+HOSTEXEEXT ?=$(EXEEXT)
 PTHREAD_CFLAGS ?= -pthread
 PTHREAD_LIB ?= -pthread
 OPENCL_CFLAGS ?=
 OPENCL_LDFLAGS ?=-lOpenCL
-CFLAGS ?= -O2 -Wall -DCL_TARGET_OPENCL_VERSION=200 -I. -I../lz4_gpu -I../lib $(OPENCL_CFLAGS) $(PTHREAD_CFLAGS)
+CFLAGS ?= -O2 -Wall -DCL_TARGET_OPENCL_VERSION=200 -I. -I../lib -I.. $(OPENCL_CFLAGS) $(PTHREAD_CFLAGS)
 LDFLAGS ?= $(OPENCL_LDFLAGS) -lm $(PTHREAD_LIB)
+HOST_OPENCL_CFLAGS ?=$(OPENCL_CFLAGS)
+HOST_OPENCL_LDFLAGS ?=$(LDFLAGS)
+PRECOMPILE_HELPER := build_clbin$(EXEEXT)
 endif
 
-GPU_DIR = ../lz4_gpu
+COMMON_SRCS = lz4_hybrid.c lz4_gpu_utils.c lz4_gpu_core.c
+ifeq ($(OS),Windows_NT)
+DAEMON_SRCS =
+else
+DAEMON_SRCS = lz4_gpu_daemon.c lz4_gpu_client.c
+endif
+SRCS = $(COMMON_SRCS) $(DAEMON_SRCS)
 
-all: sync-kernels lz4_hybrid
+all: lz4_hybrid build_clbin
 
-lz4_hybrid: lz4_hybrid.c ../lz4_gpu/lz4_gpu_core.c ../lz4_gpu/lz4_gpu_utils.c ../lib/lz4.c
+lz4_hybrid: $(SRCS)
 	$(CC) $(CFLAGS) -o $@$(EXEEXT) $^ $(LDFLAGS)
 
-sync-kernels:
-	@for f in $(GPU_DIR)/*.cl $(GPU_DIR)/*.clbin; do \
-		[ -e "$$f" ] || continue; \
-		bn=$$(basename "$$f"); \
-		needs_sync=0; \
-		if [ ! -e "$$bn" ]; then \
-			needs_sync=1; \
-		elif [ -f "$$bn" ]; then \
-			linktxt=$$(tr -d '\r\n' < "$$bn" 2>/dev/null || true); \
-			case "$$linktxt" in \
-				../lz4_gpu/*) needs_sync=1 ;; \
-			esac; \
-		fi; \
-		if [ $$needs_sync -eq 1 ]; then ln -sf "$$f" "$$bn" 2>/dev/null || cp -f "$$f" "$$bn"; fi; \
+build_clbin: build_clbin.c
+	$(CC) $(CFLAGS) -o $@$(EXEEXT) $^ $(LDFLAGS)
+
+build_clbin_host: build_clbin.c
+	$(HOSTCC) -O2 -Wall -DCL_TARGET_OPENCL_VERSION=200 -I. -I../lib -I.. $(HOST_OPENCL_CFLAGS) -o $@$(HOSTEXEEXT) $^ $(HOST_OPENCL_LDFLAGS)
+
+precompile: $(PRECOMPILE_HELPER)
+	@echo "Precompiling LZ4 hybrid OpenCL kernels..."
+	@for bits in 14; do \
+		echo "Building lz4_gpu_$${bits}.clbin (LZ4_HASHLOG=$$bits)..."; \
+		./$(PRECOMPILE_HELPER) -o lz4_gpu_$${bits}.clbin "-I. -DLZ4_HASHLOG=$$bits" || exit 1; \
 	done
 
 clean:
-	rm -f lz4_hybrid lz4_hybrid.exe
-	rm -f *.cl *.clbin
+	rm -f lz4_hybrid lz4_hybrid.exe build_clbin build_clbin.exe build_clbin_host *.o
 
-.PHONY: all clean sync-kernels
+clean-clbin:
+	rm -f *.clbin
+
+distclean: clean clean-clbin
+
+.PHONY: all clean clean-clbin distclean precompile

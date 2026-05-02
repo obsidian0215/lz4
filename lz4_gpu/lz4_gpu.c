@@ -210,6 +210,10 @@ static void show_help(const char* prog_name) {
     fprintf(stderr, "  output '-'           Write output to stdout (standalone mode only)\n");
     fprintf(stderr, "\nEnvironment:\n");
     fprintf(stderr, "  LZ4_STANDARD_COPY=0|1         0=map/unmap, 1=clEnqueueRead/WriteBuffer (default: auto)\n");
+    fprintf(stderr, "  LZ4_GPU_DECOMP_FORCE_CHUNKED=0|1  Force decompression chunked readback/write\n");
+    fprintf(stderr, "  LZ4_GPU_DECOMP_DISABLE_CHUNKED=1  Disable decompression chunked readback/write\n");
+    fprintf(stderr, "  LZ4_GPU_DECOMP_CHUNKED_THRESHOLD_KB=N  Chunked output threshold (default: 16384)\n");
+    fprintf(stderr, "  LZ4_GPU_DECOMP_READBACK_KB=N     Chunked readback size (default: 8192)\n");
     fprintf(stderr, "  LZ4_GPU_DEBUG=0|1             Enable host/device debug counters (forces source build)\n");
     fprintf(stderr, "  LZ4_GPU_DEBUG_BLOCK_LIMIT=N   Print first N blocks of debug counters\n");
 }

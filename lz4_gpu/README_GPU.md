@@ -96,6 +96,10 @@ LZ4_STANDARD_COPY=1 ./lz4_gpu --bench 3 -b 64K file
 | `LZ4_GPU_DECOMP_WI_PER_CU` | 正整数（默认自动） | 覆盖解压 worker 并发目标 |
 | `LZ4_GPU_WI_PER_CU` | 正整数（默认空） | 压缩/解压共享的 fallback 并发目标 |
 | `LZ4_GPU_DISABLE_DECOMP_MAPPED_WRITE` | `0/1`（默认 `0`） | 关闭解压输出的 mapped 直写路径 |
+| `LZ4_GPU_DECOMP_FORCE_CHUNKED` | `0/1`（默认空） | 强制开启/关闭解压 chunked readback/write |
+| `LZ4_GPU_DECOMP_DISABLE_CHUNKED` | `0/1`（默认 `0`） | 禁用平台默认的 chunked readback/write |
+| `LZ4_GPU_DECOMP_CHUNKED_THRESHOLD_KB` | 正整数（默认 `16384`） | 触发 chunked 解压输出的文件大小阈值 |
+| `LZ4_GPU_DECOMP_READBACK_KB` | 正整数（默认 `8192`） | chunked 解压输出每次 readback 大小 |
 | `LZ4_GPU_BENCH_WARMUP_ROUNDS` | 正整数（默认 `1`） | 控制 bench 计时前的 warmup 轮数 |
 
 建议：实验报告至少记录 `FORCE_OPENCL_DEVICE`、`LZ4_STANDARD_COPY` 与所有显式设置的 `WI_PER_CU` 开关。

@@ -87,3 +87,4 @@ exp_results/
 *.csv
 *.log
 lz4_hybrid/lz4_hybrid
+lz4_gpu_v2
