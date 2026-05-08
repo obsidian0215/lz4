@@ -56,87 +56,11 @@ static cl_context ctx;
 static cl_command_queue queue;
 static cl_device_id dev;
 
-static cl_int lz4_try_get_device(cl_platform_id* platforms,
-                                 cl_uint num_platforms,
-                                 cl_device_type dtype,
-                                 cl_device_id* out_dev,
-                                 cl_platform_id* out_pf) {
-    for (cl_uint pi = 0; pi < num_platforms; ++pi) {
-        cl_device_id tmp_dev = NULL;
-        cl_int r = clGetDeviceIDs(platforms[pi], dtype, 1, &tmp_dev, NULL);
-        if (r == CL_SUCCESS && tmp_dev != NULL) {
-            *out_dev = tmp_dev;
-            *out_pf = platforms[pi];
-            return CL_SUCCESS;
-        }
-    }
-    return CL_DEVICE_NOT_FOUND;
-}
-
-static cl_device_type preferred_opencl_device_type(void) {
-    const char* pref = getenv("FORCE_OPENCL_DEVICE");
-    if (!pref || !*pref) return CL_DEVICE_TYPE_GPU;
-    if (strcasecmp(pref, "CPU") == 0) return CL_DEVICE_TYPE_CPU;
-    if (strcasecmp(pref, "GPU") == 0) return CL_DEVICE_TYPE_GPU;
-    if (strcasecmp(pref, "DEFAULT") == 0) return CL_DEVICE_TYPE_DEFAULT;
-    if (strcasecmp(pref, "ALL") == 0) return CL_DEVICE_TYPE_ALL;
-    return CL_DEVICE_TYPE_GPU;
-}
-
 static void ocl_init() {
     cl_int err;
-    cl_device_type pref_type = preferred_opencl_device_type();
-
-    cl_uint num_platforms = 0;
-    err = clGetPlatformIDs(0, NULL, &num_platforms);
-    if (err != CL_SUCCESS || num_platforms == 0) {
-        fprintf(stderr, "OpenCL init failed: clGetPlatformIDs err=%d\n", err);
-        ctx = NULL;
-        queue = NULL;
-        return;
-    }
-
-    cl_platform_id* platforms = (cl_platform_id*)malloc(num_platforms * sizeof(cl_platform_id));
-    if (!platforms) {
-        fprintf(stderr, "OpenCL init failed: malloc platforms\n");
-        ctx = NULL;
-        queue = NULL;
-        return;
-    }
-
-    err = clGetPlatformIDs(num_platforms, platforms, NULL);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr, "OpenCL init failed: clGetPlatformIDs err=%d\n", err);
-        free(platforms);
-        ctx = NULL;
-        queue = NULL;
-        return;
-    }
-
-    dev = NULL;
     cl_platform_id selected_pf = NULL;
-    cl_int r = CL_DEVICE_NOT_FOUND;
-
-    if (pref_type == CL_DEVICE_TYPE_GPU) {
-        r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_GPU, &dev, &selected_pf);
-        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_DEFAULT, &dev, &selected_pf);
-        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_ALL, &dev, &selected_pf);
-        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_CPU, &dev, &selected_pf);
-    } else if (pref_type == CL_DEVICE_TYPE_CPU) {
-        r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_CPU, &dev, &selected_pf);
-        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_DEFAULT, &dev, &selected_pf);
-        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_ALL, &dev, &selected_pf);
-        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_GPU, &dev, &selected_pf);
-    } else if (pref_type == CL_DEVICE_TYPE_DEFAULT) {
-        r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_DEFAULT, &dev, &selected_pf);
-        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_GPU, &dev, &selected_pf);
-        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_CPU, &dev, &selected_pf);
-        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_ALL, &dev, &selected_pf);
-    } else {
-        r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_ALL, &dev, &selected_pf);
-    }
-
-    free(platforms);
+    dev = NULL;
+    cl_int r = lz4_select_opencl_platform_device(&selected_pf, &dev);
 
     if (r != CL_SUCCESS || dev == NULL) {
         fprintf(stderr, "OpenCL init failed: clGetDeviceIDs failed for all type/plat combos\n");

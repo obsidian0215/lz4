@@ -2,12 +2,85 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
 
 uint64_t g_ocl_init_us = 0;
 uint64_t g_kernel_load_us = 0;
+
+static cl_int lz4_try_get_device(cl_platform_id* platforms,
+                                 cl_uint num_platforms,
+                                 cl_device_type dtype,
+                                 cl_device_id* out_dev,
+                                 cl_platform_id* out_pf) {
+    for (cl_uint pi = 0; pi < num_platforms; ++pi) {
+        cl_device_id tmp_dev = NULL;
+        cl_int r = clGetDeviceIDs(platforms[pi], dtype, 1, &tmp_dev, NULL);
+        if (r == CL_SUCCESS && tmp_dev != NULL) {
+            *out_dev = tmp_dev;
+            *out_pf = platforms[pi];
+            return CL_SUCCESS;
+        }
+    }
+    return CL_DEVICE_NOT_FOUND;
+}
+
+static cl_device_type lz4_preferred_opencl_device_type(void) {
+    const char* pref = getenv("FORCE_OPENCL_DEVICE");
+    if (!pref || !*pref) return CL_DEVICE_TYPE_GPU;
+    if (strcasecmp(pref, "CPU") == 0) return CL_DEVICE_TYPE_CPU;
+    if (strcasecmp(pref, "GPU") == 0) return CL_DEVICE_TYPE_GPU;
+    if (strcasecmp(pref, "DEFAULT") == 0) return CL_DEVICE_TYPE_DEFAULT;
+    if (strcasecmp(pref, "ALL") == 0) return CL_DEVICE_TYPE_ALL;
+    return CL_DEVICE_TYPE_GPU;
+}
+
+cl_int lz4_select_opencl_platform_device(cl_platform_id* out_pf, cl_device_id* out_dev) {
+    cl_uint num_platforms = 0;
+    cl_platform_id* platforms = NULL;
+    cl_int err = clGetPlatformIDs(0, NULL, &num_platforms);
+    cl_int r = CL_DEVICE_NOT_FOUND;
+    cl_device_type pref_type = lz4_preferred_opencl_device_type();
+
+    if (!out_pf || !out_dev) return CL_INVALID_VALUE;
+    *out_pf = NULL;
+    *out_dev = NULL;
+
+    if (err != CL_SUCCESS || num_platforms == 0) return CL_DEVICE_NOT_FOUND;
+
+    platforms = (cl_platform_id*)malloc(num_platforms * sizeof(cl_platform_id));
+    if (!platforms) return CL_OUT_OF_HOST_MEMORY;
+
+    err = clGetPlatformIDs(num_platforms, platforms, NULL);
+    if (err != CL_SUCCESS) {
+        free(platforms);
+        return err;
+    }
+
+    if (pref_type == CL_DEVICE_TYPE_GPU) {
+        r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_GPU, out_dev, out_pf);
+        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_DEFAULT, out_dev, out_pf);
+        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_ALL, out_dev, out_pf);
+        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_CPU, out_dev, out_pf);
+    } else if (pref_type == CL_DEVICE_TYPE_CPU) {
+        r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_CPU, out_dev, out_pf);
+        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_DEFAULT, out_dev, out_pf);
+        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_ALL, out_dev, out_pf);
+        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_GPU, out_dev, out_pf);
+    } else if (pref_type == CL_DEVICE_TYPE_DEFAULT) {
+        r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_DEFAULT, out_dev, out_pf);
+        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_GPU, out_dev, out_pf);
+        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_CPU, out_dev, out_pf);
+        if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_ALL, out_dev, out_pf);
+    } else {
+        r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_ALL, out_dev, out_pf);
+    }
+
+    free(platforms);
+    return r;
+}
 
 uint64_t get_us(void) {
     struct timespec ts;

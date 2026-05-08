@@ -46,7 +46,7 @@ endif
 SRCS = $(COMMON_SRCS) $(DAEMON_SRCS)
 OBJS = $(SRCS:.c=.o)
 
-all: lz4_gpu build_clbin precompile
+all: lz4_gpu
 
 lz4_gpu: $(SRCS)
 	$(CC) $(CFLAGS) -o $@$(EXEEXT) $^ $(LDFLAGS)

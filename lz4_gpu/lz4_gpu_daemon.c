@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/socket.h>
@@ -48,33 +49,6 @@ struct {
     int pid_fd;
 } g_state;
 
-static int create_pidfile(void) {
-    int fd = open("/tmp/lz4_gpu_daemon.pid", O_RDWR | O_CREAT, 0644);
-    if (fd < 0) return -1;
-    if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
-        close(fd);
-        return -1;
-    }
-    char buf[16];
-    int n = snprintf(buf, sizeof(buf), "%d\n", getpid());
-    ftruncate(fd, 0);
-    write(fd, buf, n);
-    g_state.pid_fd = fd;
-    return 0;
-}
-
-static void remove_pidfile(void) {
-    if (g_state.pid_fd >= 0) {
-        flock(g_state.pid_fd, LOCK_UN);
-        close(g_state.pid_fd);
-        unlink("/tmp/lz4_gpu_daemon.pid");
-    }
-}
-
-static void signal_handler(int sig) {
-    g_state.running = 0;
-}
-
 static int clamp_int(int v, int lo, int hi) {
     if (v < lo) return lo;
     if (v > hi) return hi;
@@ -105,7 +79,7 @@ static int choose_daemon_worker_count(cl_device_id device) {
 
     if (cpu_budget < 1) cpu_budget = 1;
     if (clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cu), &cu, NULL) == CL_SUCCESS && cu > 0) {
-        cu_budget = (int)((cu + 7) / 8); /* about 1 daemon worker per 8 CUs */
+        cu_budget = (int)((cu + 15) / 16);
         if (cu_budget < 1) cu_budget = 1;
     }
 
@@ -113,31 +87,36 @@ static int choose_daemon_worker_count(cl_device_id device) {
 }
 
 static char* read_file_bin(const char* path, size_t* out_len) {
-    FILE* f = fopen(path, "rb"); if (!f) return NULL;
-    fseek(f, 0, SEEK_END); long s = ftell(f); fseek(f, 0, SEEK_SET);
-    char* buf = malloc(s); if (!buf) { fclose(f); return NULL; }
-    if (fread(buf,1,s,f) != (size_t)s) { free(buf); fclose(f); return NULL; }
-    if (out_len) *out_len = (size_t)s;
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long s = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char* buf = malloc(s);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+    if (fread(buf, 1, s, f) != (size_t)s) {
+        free(buf);
+        fclose(f);
+        return NULL;
+    }
     fclose(f);
+    if (out_len) *out_len = (size_t)s;
     return buf;
 }
 
 static int path_join2(char* out, size_t out_len, const char* a, const char* b) {
-    size_t la, lb;
     if (!out || !a || !b || out_len == 0) return -1;
-    la = strlen(a); lb = strlen(b);
-    if (la + 1 + lb + 1 > out_len) return -1;
-    memcpy(out, a, la);
-    out[la] = '/';
-    memcpy(out + la + 1, b, lb);
-    out[la + 1 + lb] = '\0';
+    if (snprintf(out, out_len, "%s/%s", a, b) >= (int)out_len) return -1;
     return 0;
 }
 
 static int path_join3(char* out, size_t out_len, const char* a, const char* b, const char* c) {
-    char tmp[PATH_MAX];
-    if (path_join2(tmp, sizeof(tmp), a, b) != 0) return -1;
-    return path_join2(out, out_len, tmp, c);
+    if (!out || !a || !b || !c || out_len == 0) return -1;
+    if (snprintf(out, out_len, "%s/%s/%s", a, b, c) >= (int)out_len) return -1;
+    return 0;
 }
 
 static int get_exe_dir(char* out, size_t out_len) {
@@ -154,7 +133,7 @@ static int get_exe_dir(char* out, size_t out_len) {
 }
 
 static int dirname_of_path(const char* path, char* out, size_t out_len) {
-    const char* slash;
+    char* slash;
     size_t len;
     if (!path || !out || out_len == 0) return -1;
     slash = strrchr(path, '/');
@@ -164,6 +143,33 @@ static int dirname_of_path(const char* path, char* out, size_t out_len) {
     memcpy(out, path, len);
     out[len] = '\0';
     return 0;
+}
+
+static int create_pidfile(void) {
+    int fd = open("/tmp/lz4_gpu_daemon.pid", O_RDWR | O_CREAT, 0644);
+    if (fd < 0) return -1;
+    if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+        close(fd);
+        return -1;
+    }
+    char buf[16];
+    int n = snprintf(buf, sizeof(buf), "%d\n", getpid());
+    ftruncate(fd, 0);
+    write(fd, buf, n);
+    g_state.pid_fd = fd;
+    return 0;
+}
+
+static void remove_pidfile(void) {
+    if (g_state.pid_fd >= 0) {
+        flock(g_state.pid_fd, LOCK_UN);
+        close(g_state.pid_fd);
+        unlink("/tmp/lz4_gpu_daemon.pid");
+    }
+}
+
+static void signal_handler(int sig) {
+    g_state.running = 0;
 }
 
 static int resolve_daemon_file(const char* env_name, const char* filename, char* out, size_t out_len) {
@@ -261,16 +267,24 @@ cl_program load_program(cl_context context, cl_device_id device) {
 int init_resources(void) {
     uint64_t t1 = get_us();
     cl_int err;
-    err = clGetPlatformIDs(1, &g_state.platform, NULL);
-    if (err != CL_SUCCESS) return -1;
-    err = clGetDeviceIDs(g_state.platform, CL_DEVICE_TYPE_GPU, 1, &g_state.device, NULL);
-    if (err != CL_SUCCESS) {
-        err = clGetDeviceIDs(g_state.platform, CL_DEVICE_TYPE_DEFAULT, 1, &g_state.device, NULL);
+    err = lz4_select_opencl_platform_device(&g_state.platform, &g_state.device);
+    if (err != CL_SUCCESS || g_state.device == NULL || g_state.platform == NULL) return -1;
+
+    {
+        char pfname[256] = {0};
+        char devname[256] = {0};
+        cl_device_type devtype = 0;
+        clGetPlatformInfo(g_state.platform, CL_PLATFORM_NAME, sizeof(pfname), pfname, NULL);
+        clGetDeviceInfo(g_state.device, CL_DEVICE_NAME, sizeof(devname), devname, NULL);
+        clGetDeviceInfo(g_state.device, CL_DEVICE_TYPE, sizeof(devtype), &devtype, NULL);
+        fprintf(stderr, "[DAEMON OpenCL] Selected platform=%s, device=%s (type=%s)\n",
+                pfname,
+                devname,
+                (devtype & CL_DEVICE_TYPE_GPU) ? "GPU" :
+                (devtype & CL_DEVICE_TYPE_CPU) ? "CPU" :
+                (devtype & CL_DEVICE_TYPE_DEFAULT) ? "DEFAULT" : "UNKNOWN");
     }
-    if (err != CL_SUCCESS) {
-        err = clGetDeviceIDs(g_state.platform, CL_DEVICE_TYPE_ALL, 1, &g_state.device, NULL);
-    }
-    if (err != CL_SUCCESS) return -1;
+
     g_state.context = clCreateContext(NULL, 1, &g_state.device, NULL, NULL, &err);
     if (err != CL_SUCCESS) return -1;
     g_ocl_init_us = get_us() - t1;
