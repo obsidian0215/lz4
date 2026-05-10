@@ -5,6 +5,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -22,8 +23,9 @@ CPU_CONTROL = SCRIPT_DIR / "cpu_control.sh"
 GPU_CONTROL = SCRIPT_DIR / "gpu_control.sh"
 BENCH_LZ4 = SCRIPT_DIR / "bench_lz4.py"
 
-DEFAULT_CPU_FREQ_MHZ = "1900,3500,NA"
-DEFAULT_GPU_FREQ_MHZ = "1000,NA"
+DEFAULT_CPU_FREQ_MHZ = "NA" if os.name == "nt" else "1900,3500,NA"
+DEFAULT_GPU_FREQ_MHZ = "NA" if os.name == "nt" else "1000,NA"
+MAX_IDLE_SHARE = 0.95
 
 
 def parse_frequency_points(text):
@@ -150,15 +152,6 @@ def effective_engines(args_list):
     text = bench_arg_value(args_list, "--engines")
     if text:
         return set(split_csv_text(text))
-    cpu_only = "--cpu-only" in args_list
-    gpu_only = "--gpu-only" in args_list
-    hybrid_only = "--hybrid-only" in args_list
-    if cpu_only:
-        return {"native_cpu"}
-    if gpu_only:
-        return {"gpu"}
-    if hybrid_only:
-        return {"hybrid"}
     return {"gpu", "native_cpu"}
 
 
@@ -183,31 +176,8 @@ def is_gpu_only_ratio(ratio):
         return False
 
 
-def strip_engine_flags(args_list):
-    out = list(args_list)
-    for opt in ("--cpu-only", "--gpu-only", "--hybrid-only"):
-        out = [x for x in out if x != opt]
-    return out
-
-
-def detect_run_modes(args_list):
-    cpu_only = "--cpu-only" in args_list
-    gpu_only = "--gpu-only" in args_list
-    hybrid_only = "--hybrid-only" in args_list
-
-    only_flags = sum([cpu_only, gpu_only, hybrid_only])
-    if only_flags > 1:
-        raise SystemExit("Cannot combine --cpu-only, --gpu-only, --hybrid-only in wrapper pass-through args")
-
-    run_cpu = not gpu_only and not hybrid_only
-    run_gpu = not cpu_only and not hybrid_only
-    run_hybrid = (not cpu_only and not gpu_only) or hybrid_only
-    return run_cpu, run_gpu, run_hybrid
-
-
 def build_work_items(args, cpu_points, gpu_points):
-    run_cpu, run_gpu, run_hybrid = detect_run_modes(args.bench_args)
-    base = strip_engine_flags(args.bench_args)
+    base = list(args.bench_args)
     engines = effective_engines(base)
     hybrid_ratios = effective_hybrid_ratios(base)
 
@@ -223,19 +193,19 @@ def build_work_items(args, cpu_points, gpu_points):
         seen.add(key)
         items.append({"label": label, "cpu": cpu_point, "gpu": gpu_point, "bench_args": bench_args})
 
-    if run_cpu and "native_cpu" in engines:
-        bench_args = with_option(with_option(base, "--engines", "native_cpu"), "--cpu-only", None)
+    if "native_cpu" in engines:
+        bench_args = with_option(base, "--engines", "native_cpu")
         for cpu_point in cpu_points:
             add("cpu", cpu_point, none_gpu, bench_args)
 
-    if run_gpu and "gpu" in engines:
-        bench_args = with_option(with_option(base, "--engines", "gpu"), "--gpu-only", None)
+    if "gpu" in engines:
+        bench_args = with_option(base, "--engines", "gpu")
         for gpu_point in gpu_points:
             add("gpu", none_cpu, gpu_point, bench_args)
 
-    if run_hybrid and "hybrid" in engines:
+    if "hybrid" in engines:
         for ratio in hybrid_ratios:
-            bench_args = with_option(with_option(with_option(base, "--engines", "hybrid"), "--hybrid-gpu-ratios", ratio), "--hybrid-only", None)
+            bench_args = with_option(with_option(base, "--engines", "hybrid"), "--hybrid-gpu-ratios", ratio)
             if str(ratio).strip().lower() == "adaptive":
                 for cpu_point in cpu_points:
                     for gpu_point in gpu_points:
@@ -254,17 +224,20 @@ def build_work_items(args, cpu_points, gpu_points):
     return items
 
 
-def run_bench(args, item):
+def run_bench(args, item, bench_args_override=None, sample_tag=""):
     cpu_point = item["cpu"]
     gpu_point = item["gpu"]
     safe_label = "".join(ch if ch.isalnum() or ch in ("_", "-", ".") else "_" for ch in item["label"])
-    run_dir = Path(args.output_dir) / f"{safe_label}_cpu_{cpu_point['label']}_gpu_{gpu_point['label']}"
+    base_dir = Path(args.output_dir) / f"{safe_label}_cpu_{cpu_point['label']}_gpu_{gpu_point['label']}"
+    if sample_tag:
+        safe_sample = "".join(ch if ch.isalnum() or ch in ("_", "-", ".") else "_" for ch in str(sample_tag))
+        run_dir = base_dir / safe_sample
+    else:
+        run_dir = base_dir
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    bench_args = list(item["bench_args"])
+    bench_args = list(bench_args_override if bench_args_override is not None else item["bench_args"])
     bench_args = with_option(bench_args, "--results-dir", str(run_dir))
-    bench_args = with_option(bench_args, "--no-freq-scan", None)
-    bench_args = with_option(bench_args, "--no-telemetry", None)
 
     cmd = [sys.executable, str(BENCH_LZ4)]
     cmd.extend(bench_args)
@@ -281,37 +254,108 @@ def run_bench(args, item):
     )
     return proc, cmd, run_dir, start
 
+def telemetry_worker_main(worker_out: Path, worker_stop: Path, interval_s: float):
+    telemetry = TelemetryProbe()
+    worker_out.parent.mkdir(parents=True, exist_ok=True)
+    with worker_out.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["ts", "cpu_power_w", "gpu_power_w", "cpu_freq_mhz", "gpu_freq_mhz", "cpu_energy_j", "core_energy_j", "gpu_energy_j"])
+        while not worker_stop.exists():
+            snap = telemetry.snapshot()
+            w.writerow([
+                f"{float(snap.get('ts') or 0.0):.9f}",
+                f"{float(snap.get('cpu_power_w') or 0.0):.9f}",
+                f"{float(snap.get('gpu_power_w') or 0.0):.9f}",
+                f"{float(snap.get('cpu_freq_mhz') or 0.0):.6f}",
+                f"{float(snap.get('gpu_freq_mhz') or 0.0):.6f}",
+                "" if snap.get("cpu_energy_j") is None else f"{float(snap.get('cpu_energy_j') or 0.0):.9f}",
+                "" if snap.get("core_energy_j") is None else f"{float(snap.get('core_energy_j') or 0.0):.9f}",
+                "" if snap.get("gpu_energy_j") is None else f"{float(snap.get('gpu_energy_j') or 0.0):.9f}",
+            ])
+            f.flush()
+            time.sleep(max(interval_s, 0.05))
+    return 0
 
-def collect_until_done(proc, telemetry, interval_s):
+
+def start_telemetry_worker(interval_s: float):
+    fd_csv, csv_path = tempfile.mkstemp(prefix="lz4_wrap_worker_", suffix=".csv")
+    os.close(fd_csv)
+    fd_stop, stop_path = tempfile.mkstemp(prefix="lz4_wrap_worker_", suffix=".stop")
+    os.close(fd_stop)
+    worker_csv = Path(csv_path)
+    worker_stop = Path(stop_path)
+    worker_stop.unlink(missing_ok=True)
+
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--telemetry-worker",
+            "--worker-out",
+            str(worker_csv),
+            "--worker-stop",
+            str(worker_stop),
+            "--worker-interval",
+            str(interval_s),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
+        try:
+            if worker_csv.exists() and worker_csv.stat().st_size > 24:
+                return proc, worker_csv, worker_stop
+        except Exception:
+            pass
+        if proc.poll() is not None:
+            break
+        time.sleep(0.02)
+    raise RuntimeError("failed to start telemetry worker")
+
+
+def stop_telemetry_worker(proc, worker_csv: Path, worker_stop: Path):
     samples = []
-    lines = []
-    stop = threading.Event()
-
-    def sampler():
-        while not stop.wait(interval_s):
-            try:
-                samples.append(telemetry.snapshot())
-            except Exception:
-                pass
-            if proc.poll() is not None:
-                break
-
-    thread = threading.Thread(target=sampler, daemon=True)
     try:
-        samples.append(telemetry.snapshot())
+        worker_stop.write_text("stop", encoding="utf-8")
     except Exception:
         pass
-    thread.start()
+    try:
+        proc.wait(timeout=5.0)
+    except Exception:
+        proc.kill()
+
+    if worker_csv.exists():
+        with worker_csv.open("r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                try:
+                    samples.append({
+                        "ts": float(row.get("ts") or 0.0),
+                        "cpu_power_w": float(row.get("cpu_power_w") or 0.0),
+                        "gpu_power_w": float(row.get("gpu_power_w") or 0.0),
+                        "cpu_freq_mhz": float(row.get("cpu_freq_mhz") or 0.0),
+                        "gpu_freq_mhz": float(row.get("gpu_freq_mhz") or 0.0),
+                        "cpu_energy_j": None if row.get("cpu_energy_j", "") == "" else float(row.get("cpu_energy_j") or 0.0),
+                        "core_energy_j": None if row.get("core_energy_j", "") == "" else float(row.get("core_energy_j") or 0.0),
+                        "gpu_energy_j": None if row.get("gpu_energy_j", "") == "" else float(row.get("gpu_energy_j") or 0.0),
+                    })
+                except Exception:
+                    continue
+
+    worker_csv.unlink(missing_ok=True)
+    worker_stop.unlink(missing_ok=True)
+    return samples
+
+
+def collect_until_done(proc, telemetry, interval_s, workload_label):
+    lines = []
+    worker_proc, worker_csv, worker_stop = start_telemetry_worker(interval_s)
     for line in proc.stdout:
         lines.append(line)
         print(line, end="")
     rc = proc.wait()
-    stop.set()
-    thread.join(timeout=max(1.0, interval_s * 2.0))
-    try:
-        samples.append(telemetry.snapshot())
-    except Exception:
-        pass
+    samples = stop_telemetry_worker(worker_proc, worker_csv, worker_stop)
     return rc, "".join(lines), samples
 
 
@@ -319,6 +363,64 @@ def summarize_samples(telemetry, samples):
     if not samples:
         return telemetry.summarize_samples([])
     return telemetry.summarize_samples(samples)
+
+
+def measure_idle_baseline(telemetry, idle_seconds, sample_interval):
+    idle_seconds = float(idle_seconds or 0.0)
+    if idle_seconds <= 0:
+        return {
+            "cpu_pkg_idle_power_w": 0.0,
+            "cpu_core_idle_power_w": 0.0,
+            "gpu_idle_power_w": 0.0,
+        }
+    if hasattr(telemetry, "measure_idle_pkg_power_w") and hasattr(telemetry, "measure_idle_gpu_power_w"):
+        cpu_idle = float(telemetry.measure_idle_pkg_power_w(idle_seconds) or 0.0)
+        core_idle = float(getattr(telemetry, "measure_idle_core_power_w", telemetry.measure_idle_pkg_power_w)(idle_seconds) or 0.0)
+        gpu_idle = float(telemetry.measure_idle_gpu_power_w(idle_seconds) or 0.0)
+        return {
+            "cpu_pkg_idle_power_w": cpu_idle,
+            "cpu_core_idle_power_w": core_idle,
+            "gpu_idle_power_w": gpu_idle,
+        }
+    samples = []
+    deadline = time.perf_counter() + idle_seconds
+    while time.perf_counter() < deadline:
+        samples.append(telemetry.snapshot())
+        time.sleep(max(0.05, float(sample_interval or 0.2)))
+    if not samples:
+        return {
+            "cpu_pkg_idle_power_w": 0.0,
+            "cpu_core_idle_power_w": 0.0,
+            "gpu_idle_power_w": 0.0,
+        }
+    return {
+        "cpu_pkg_idle_power_w": sum(float(s.get("cpu_power_w") or 0.0) for s in samples) / len(samples),
+        "cpu_core_idle_power_w": sum(float(s.get("core_power_w") or 0.0) for s in samples) / len(samples),
+        "gpu_idle_power_w": sum(float(s.get("gpu_power_w") or 0.0) for s in samples) / len(samples),
+    }
+
+
+def net_power(avg_power, idle_power):
+    avg = float(avg_power or 0.0)
+    idle = max(0.0, float(idle_power or 0.0))
+    if avg <= 0.0:
+        return 0.0
+    capped_idle = min(idle, avg * MAX_IDLE_SHARE)
+    return max(0.0, avg - capped_idle)
+
+
+def power_main_domain(workload):
+    wl = str(workload or "")
+    if wl.startswith("cpu"):
+        return "cpu"
+    return "gpu"
+
+
+def power_main_value(workload, summary):
+    domain = power_main_domain(workload)
+    if domain == "cpu":
+        return float(summary.get("cpu_pkg_avg_power_w", 0.0) or 0.0)
+    return float(summary.get("gpu_avg_power_w", 0.0) or 0.0)
 
 
 def write_csv(path, rows, fieldnames):
@@ -343,14 +445,24 @@ def read_csv_rows(path):
 
 
 def main(argv):
+    if "--telemetry-worker" in argv:
+        worker_parser = argparse.ArgumentParser(description="telemetry worker")
+        worker_parser.add_argument("--telemetry-worker", action="store_true")
+        worker_parser.add_argument("--worker-out", required=True)
+        worker_parser.add_argument("--worker-stop", required=True)
+        worker_parser.add_argument("--worker-interval", type=float, default=0.2)
+        wargs = worker_parser.parse_args(argv)
+        return telemetry_worker_main(Path(wargs.worker_out), Path(wargs.worker_stop), max(0.05, float(wargs.worker_interval)))
+
     parser = argparse.ArgumentParser(
         description="External power/frequency wrapper for bench_lz4.py. Arguments after -- are passed to bench_lz4.py."
     )
     parser.add_argument("--platform-id", default=os.environ.get("LZ4_PLATFORM_ID", "local"))
     parser.add_argument("--output-dir", default=str(REPO_ROOT / "exp_results" / "power_freq_runs" / time.strftime("%Y%m%d_%H%M%S")))
-    parser.add_argument("--cpu-frequencies", "--cpu-points", default=DEFAULT_CPU_FREQ_MHZ, help='Comma list: "2100,3400,NA" or "50%,100%,NA"')
-    parser.add_argument("--gpu-frequencies", "--gpu-points", default=DEFAULT_GPU_FREQ_MHZ, help='Comma list: "1000,NA" or "70%,NA"')
+    parser.add_argument("--cpu-frequencies", "--cpu-points", default=DEFAULT_CPU_FREQ_MHZ, help='Comma list: "2100,3400,NA" or "50%%,100%%,NA"')
+    parser.add_argument("--gpu-frequencies", "--gpu-points", default=DEFAULT_GPU_FREQ_MHZ, help='Comma list: "1000,NA" or "70%%,NA"')
     parser.add_argument("--sample-interval", type=float, default=0.2)
+    parser.add_argument("--idle-seconds", type=float, default=2.0, help="Idle baseline sampling seconds before each workload point")
     parser.add_argument("--no-reset-before", action="store_true")
     parser.add_argument("bench_args", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -378,90 +490,133 @@ def main(argv):
     for idx, item in enumerate(points, start=1):
         cpu_point = item["cpu"]
         gpu_point = item["gpu"]
-        rc = -1
-        run_dir = ""
-        elapsed = 0.0
-        summary = {}
+        item_samples = bench_samples_from_args(item["bench_args"])
+
+        if not args.no_reset_before:
+            run_control_reset(CPU_CONTROL)
+            run_control_reset(GPU_CONTROL)
+        apply_frequency(CPU_CONTROL, cpu_point)
+        apply_frequency(GPU_CONTROL, gpu_point)
+
+        idle_baseline = measure_idle_baseline(telemetry, args.idle_seconds, args.sample_interval)
+        print(
+            f"[wrapper] idle_baseline cpu_pkg={idle_baseline['cpu_pkg_idle_power_w']:.3f}W "
+            f"cpu_core={idle_baseline['cpu_core_idle_power_w']:.3f}W gpu={idle_baseline['gpu_idle_power_w']:.3f}W"
+        )
 
         try:
-            if not args.no_reset_before:
-                run_control_reset(CPU_CONTROL)
-                run_control_reset(GPU_CONTROL)
+            for sample_idx, sample_path in enumerate(item_samples, start=1):
+                rc = -1
+                run_dir = ""
+                elapsed = 0.0
+                summary = {}
+                sample_name = Path(sample_path).name
+                bench_args_single = with_option(item["bench_args"], "--single-file", str(sample_path))
 
-            apply_frequency(CPU_CONTROL, cpu_point)
-            apply_frequency(GPU_CONTROL, gpu_point)
+                max_attempts = 8
+                for attempt in range(1, max_attempts + 1):
+                    try:
+                        proc, cmd, run_dir_path, start = run_bench(args, item, bench_args_override=bench_args_single, sample_tag=sample_name)
+                        rc, output, samples = collect_until_done(proc, telemetry, max(0.05, args.sample_interval), item["label"])
+                        elapsed = max(0.0, time.perf_counter() - start)
+                        run_dir = str(run_dir_path)
+                        summary = summarize_samples(telemetry, samples)
+                        main_raw = power_main_value(item["label"], summary)
+                        if rc == 0 and main_raw <= 0.0:
+                            raise RuntimeError("invalid telemetry: main raw average power is zero")
 
-            proc, cmd, run_dir_path, start = run_bench(args, item)
-            rc, output, samples = collect_until_done(proc, telemetry, max(0.05, args.sample_interval))
-            elapsed = max(0.0, time.perf_counter() - start)
-            run_dir = str(run_dir_path)
-            summary = summarize_samples(telemetry, samples)
+                        with open(run_dir_path / "wrapper_command.txt", "w", encoding="utf-8") as handle:
+                            handle.write(" ".join(str(x) for x in cmd) + "\n")
+                        with open(run_dir_path / "wrapper_output.log", "w", encoding="utf-8") as handle:
+                            handle.write(output)
+                        break
+                    except Exception as exc:
+                        output = f"wrapper run exception (attempt {attempt}/{max_attempts}): {type(exc).__name__}: {exc}"
+                        rc = 1
+                        if attempt < max_attempts:
+                            time.sleep(1.0)
 
-            with open(run_dir_path / "wrapper_command.txt", "w", encoding="utf-8") as handle:
-                handle.write(" ".join(str(x) for x in cmd) + "\n")
-            with open(run_dir_path / "wrapper_output.log", "w", encoding="utf-8") as handle:
-                handle.write(output)
+                cpu_pkg_avg = float(summary.get("cpu_pkg_avg_power_w", 0.0) or 0.0)
+                cpu_core_avg = float(summary.get("cpu_core_avg_power_w", 0.0) or 0.0)
+                gpu_avg = float(summary.get("gpu_avg_power_w", 0.0) or 0.0)
+
+                cpu_pkg_idle = float(idle_baseline.get("cpu_pkg_idle_power_w", 0.0) or 0.0)
+                cpu_core_idle = float(idle_baseline.get("cpu_core_idle_power_w", 0.0) or 0.0)
+                gpu_idle = float(idle_baseline.get("gpu_idle_power_w", 0.0) or 0.0)
+
+                cpu_pkg_net = net_power(cpu_pkg_avg, cpu_pkg_idle)
+                cpu_core_net = net_power(cpu_core_avg, cpu_core_idle)
+                gpu_net = net_power(gpu_avg, gpu_idle)
+                main_domain = power_main_domain(item["label"])
+
+                record = {
+                    "workload": item["label"],
+                    "sample": sample_name,
+                    "elapsed_s": elapsed,
+                    "run_dir": run_dir,
+                    "bench_args": shlex.join(bench_args_single),
+                    "telemetry_sources": telemetry.describe_sources(),
+                    "cpu_freq_avg_mhz": summary.get("cpu_freq_avg_mhz", 0.0),
+                    "gpu_freq_avg_mhz": summary.get("gpu_freq_avg_mhz", 0.0),
+                    "cpu_energy_j": summary.get("cpu_energy_j", 0.0),
+                    "core_energy_j": summary.get("core_energy_j", 0.0),
+                    "dram_energy_j": summary.get("dram_energy_j", 0.0),
+                    "gpu_energy_j": summary.get("gpu_energy_j", 0.0),
+                    "cpu_pkg_avg_power_w": cpu_pkg_avg,
+                    "cpu_core_avg_power_w": cpu_core_avg,
+                    "gpu_avg_power_w": gpu_avg,
+                    "cpu_pkg_idle_power_w": cpu_pkg_idle,
+                    "cpu_core_idle_power_w": cpu_core_idle,
+                    "gpu_idle_power_w": gpu_idle,
+                    "cpu_pkg_net_power_w": cpu_pkg_net,
+                    "cpu_core_net_power_w": cpu_core_net,
+                    "gpu_net_power_w": gpu_net,
+                    "cpu_pkg_peak_power_w": summary.get("cpu_pkg_peak_power_w", 0.0),
+                    "cpu_core_peak_power_w": summary.get("cpu_core_peak_power_w", 0.0),
+                    "gpu_peak_power_w": summary.get("gpu_peak_power_w", 0.0),
+                    "power_main_domain": main_domain,
+                    "power_main_avg_w": (cpu_pkg_net if main_domain == "cpu" else gpu_net),
+                    "power_main_raw_avg_w": (cpu_pkg_avg if main_domain == "cpu" else gpu_avg),
+                    "rc": rc,
+                }
+                records.append(record)
+                if rc != 0:
+                    any_fail = True
+                write_csv(output_dir / "power_frequency_summary.csv", records, list(record.keys()))
+
+                per_file_path = find_per_file_summary(run_dir)
+                for pf in read_csv_rows(per_file_path):
+                    pf_record = {
+                        "workload": item["label"],
+                        "sample": pf.get("sample", sample_name),
+                        "engine": pf.get("engine", ""),
+                        "ratio_pct_median": pf.get("ratio_pct_median", ""),
+                        "manual_comp_no_ocl_mbs_mean": pf.get("manual_comp_no_ocl_mbs_mean", ""),
+                        "manual_dec_no_ocl_mbs_mean": pf.get("manual_dec_no_ocl_mbs_mean", ""),
+                        "elapsed_s": elapsed,
+                        "run_dir": run_dir,
+                        "cpu_pkg_avg_power_w": cpu_pkg_avg,
+                        "cpu_core_avg_power_w": cpu_core_avg,
+                        "gpu_avg_power_w": gpu_avg,
+                        "cpu_pkg_idle_power_w": cpu_pkg_idle,
+                        "cpu_core_idle_power_w": cpu_core_idle,
+                        "gpu_idle_power_w": gpu_idle,
+                        "cpu_pkg_net_power_w": cpu_pkg_net,
+                        "cpu_core_net_power_w": cpu_core_net,
+                        "gpu_net_power_w": gpu_net,
+                        "power_main_domain": main_domain,
+                        "power_main_avg_w": (cpu_pkg_net if main_domain == "cpu" else gpu_net),
+                        "power_main_raw_avg_w": (cpu_pkg_avg if main_domain == "cpu" else gpu_avg),
+                        "telemetry_note": "file_level_power(net=avg-idle)",
+                    }
+                    per_file_records.append(pf_record)
+                if per_file_records:
+                    write_csv(output_dir / "per_file_power_summary.csv", per_file_records, list(per_file_records[0].keys()))
+
+                print(f"[wrapper] point={idx} sample={sample_idx}/{len(item_samples)} rc={rc}")
         finally:
             run_control_reset(CPU_CONTROL)
             run_control_reset(GPU_CONTROL)
-
-        record = {
-            "workload": item["label"],
-            "elapsed_s": elapsed,
-            "run_dir": run_dir,
-            "bench_args": shlex.join(item["bench_args"]),
-            "telemetry_sources": telemetry.describe_sources(),
-            "cpu_freq_avg_mhz": summary.get("cpu_freq_avg_mhz", 0.0),
-            "gpu_freq_avg_mhz": summary.get("gpu_freq_avg_mhz", 0.0),
-            "cpu_energy_j": summary.get("cpu_energy_j", 0.0),
-            "core_energy_j": summary.get("core_energy_j", 0.0),
-            "dram_energy_j": summary.get("dram_energy_j", 0.0),
-            "gpu_energy_j": summary.get("gpu_energy_j", 0.0),
-            "cpu_pkg_avg_power_w": summary.get("cpu_pkg_avg_power_w", 0.0),
-            "cpu_core_avg_power_w": summary.get("cpu_core_avg_power_w", 0.0),
-            "dram_avg_power_w": summary.get("dram_avg_power_w", 0.0),
-            "gpu_avg_power_w": summary.get("gpu_avg_power_w", 0.0),
-            "cpu_pkg_peak_power_w": summary.get("cpu_pkg_peak_power_w", 0.0),
-            "cpu_core_peak_power_w": summary.get("cpu_core_peak_power_w", 0.0),
-            "dram_peak_power_w": summary.get("dram_peak_power_w", 0.0),
-            "gpu_peak_power_w": summary.get("gpu_peak_power_w", 0.0),
-        }
-        records.append(record)
-        if rc != 0:
-            any_fail = True
-        write_csv(output_dir / "power_frequency_summary.csv", records, list(record.keys()))
-
-        per_file_path = find_per_file_summary(run_dir)
-        for pf in read_csv_rows(per_file_path):
-            pf_record = {
-                "workload": item["label"],
-                "sample": pf.get("sample", ""),
-                "engine": pf.get("engine", ""),
-                "ratio_pct_median": pf.get("ratio_pct_median", ""),
-                "manual_comp_no_ocl_mbs_mean": pf.get("manual_comp_no_ocl_mbs_mean", ""),
-                "manual_dec_no_ocl_mbs_mean": pf.get("manual_dec_no_ocl_mbs_mean", ""),
-                "elapsed_s": elapsed,
-                "run_dir": run_dir,
-                "cpu_freq_avg_mhz": summary.get("cpu_freq_avg_mhz", 0.0),
-                "gpu_freq_avg_mhz": summary.get("gpu_freq_avg_mhz", 0.0),
-                "cpu_energy_j": summary.get("cpu_energy_j", 0.0),
-                "core_energy_j": summary.get("core_energy_j", 0.0),
-                "dram_energy_j": summary.get("dram_energy_j", 0.0),
-                "gpu_energy_j": summary.get("gpu_energy_j", 0.0),
-                "cpu_pkg_avg_power_w": summary.get("cpu_pkg_avg_power_w", 0.0),
-                "cpu_core_avg_power_w": summary.get("cpu_core_avg_power_w", 0.0),
-                "dram_avg_power_w": summary.get("dram_avg_power_w", 0.0),
-                "gpu_avg_power_w": summary.get("gpu_avg_power_w", 0.0),
-                "cpu_pkg_peak_power_w": summary.get("cpu_pkg_peak_power_w", 0.0),
-                "cpu_core_peak_power_w": summary.get("cpu_core_peak_power_w", 0.0),
-                "dram_peak_power_w": summary.get("dram_peak_power_w", 0.0),
-                "gpu_peak_power_w": summary.get("gpu_peak_power_w", 0.0),
-            }
-            per_file_records.append(pf_record)
-        if per_file_records:
-            write_csv(output_dir / "per_file_power_summary.csv", per_file_records, list(per_file_records[0].keys()))
-
-        print(f"[wrapper] point={idx} rc={rc}")
 
     print(f"[wrapper] summary={output_dir / 'power_frequency_summary.csv'}")
     return 0 if not any_fail else 1

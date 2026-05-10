@@ -752,14 +752,6 @@ def run_all(args):
     run_gpu = "gpu" in engines
     run_hybrid = "hybrid" in engines
 
-    if args.cpu_only or args.gpu_only or args.hybrid_only:
-        run_cpu = not args.gpu_only and not args.hybrid_only
-        run_gpu = not args.cpu_only and not args.hybrid_only
-        run_hybrid = (not args.cpu_only and not args.gpu_only) or args.hybrid_only
-
-    if args.freq_percent is not None or str(args.freq_points).strip() or str(args.hybrid_freq_pairs).strip():
-        print("[FreqControl] bench_lz4 core does not apply frequencies; use tools/bench_lz4_power_wrapper.py")
-
     if args.use_daemon and not IS_WINDOWS:
         print("[bench_lz4] use_daemon=on (check daemon, start if missing, auto-stop if started by this run)")
 
@@ -850,9 +842,6 @@ def parse_args(argv):
     parser.add_argument("--bench-seconds", default=str(DEFAULT_BENCH_SECONDS))
     parser.add_argument("--manual-rounds", type=int, default=DEFAULT_MANUAL_ROUNDS)
     parser.add_argument("--engines", default=",".join(DEFAULT_ENGINES), help="Comma list: gpu,native_cpu,hybrid")
-    parser.add_argument("--cpu-only", action="store_true")
-    parser.add_argument("--gpu-only", action="store_true")
-    parser.add_argument("--hybrid-only", action="store_true")
 
     parser.add_argument("--cpu-threads", default=",".join(str(x) for x in DEFAULT_CPU_THREADS))
     parser.add_argument("--cpu-block-sizes", default=",".join(DEFAULT_CPU_BLOCK_SIZES))
@@ -866,13 +855,6 @@ def parse_args(argv):
     parser.add_argument("--hybrid-local-sizes", default=",".join(str(x) for x in DEFAULT_HYBRID_LOCAL_SIZES))
     parser.add_argument("--hybrid-accels", default=",".join(str(x) for x in DEFAULT_HYBRID_ACCELS))
 
-    parser.add_argument("--freq-percent", type=int, default=None)
-    parser.add_argument("--freq-points", default="")
-    parser.add_argument("--cpu-freq-points", default="")
-    parser.add_argument("--gpu-freq-points", default="")
-    parser.add_argument("--hybrid-freq-pairs", default="")
-    parser.add_argument("--no-freq-scan", action="store_true")
-    parser.add_argument("--no-telemetry", action="store_true")
     parser.add_argument("--use-daemon", action="store_true", help="Linux only: use GPU daemon; check running, start if missing, stop only if started by this run")
 
     parser.add_argument("--cpu-bin", default=str(DEFAULT_CPU_BIN))
@@ -880,10 +862,6 @@ def parse_args(argv):
     parser.add_argument("--hybrid-bin", default=str(DEFAULT_HYBRID_BIN))
 
     args = parser.parse_args(argv)
-
-    only_flags = sum([args.cpu_only, args.gpu_only, args.hybrid_only])
-    if only_flags > 1:
-        raise SystemExit("Cannot combine --cpu-only, --gpu-only, --hybrid-only")
 
     return args
 
