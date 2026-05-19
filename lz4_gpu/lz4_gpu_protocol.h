@@ -6,6 +6,9 @@
 #include "timing.h"
 
 #define SOCKET_PATH "/tmp/lz4_gpu_daemon.sock"
+#define LZ4_DAEMON_REQUEST_MAGIC 0x4c5a3447u
+#define LZ4_DAEMON_REQUEST_VERSION 2u
+#define LZ4_DAEMON_FLAG_RAW_BUFFER 0x1u
 
 extern uint64_t g_ocl_init_us;
 extern uint64_t g_kernel_load_us;
@@ -16,10 +19,14 @@ enum {
 };
 
 typedef struct {
+    uint32_t magic;
+    uint32_t version;
     int mode;
     int acceleration;
     int block_size;
     int local_size;
+    uint32_t flags;
+    size_t input_size;
     char input_path[1024];
     char output_path[1024];
 } request_t;

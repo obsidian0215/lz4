@@ -14,20 +14,28 @@
 #include <fcntl.h>
 #include <time.h>
 #include <limits.h>
+#include <stdint.h>
+#include <sys/syscall.h>
 #include <CL/cl.h>
 #include "lz4_gpu_protocol.h"
 #include "lz4_gpu_core.h"
 #include "lz4_gpu_utils.h"
 
+extern long syscall(long number, ...);
+
 #define MAX_WORKERS_CAP 16
-#define MIN_HASH_LOG 10
-#define MAX_HASH_LOG 16
+#define LZ4_DAEMON_KERNEL_MODES 2
+
+enum {
+    LZ4_DAEMON_MODE_CLEAR16 = 0,
+    LZ4_DAEMON_MODE_EPOCH32 = 1
+};
 
 typedef struct {
     int id;
     cl_command_queue queue;
-    cl_kernel kernel_comp[MAX_HASH_LOG + 1];
-    cl_kernel kernel_decomp;
+    cl_kernel kernel_comp[LZ4_DAEMON_KERNEL_MODES];
+    cl_kernel kernel_decomp[LZ4_DAEMON_KERNEL_MODES];
     lz4_gpu_workspace_t ws;
     pthread_t thread;
     int client_fd;
@@ -40,7 +48,7 @@ struct {
     cl_platform_id platform;
     cl_device_id device;
     cl_context context;
-    cl_program program_comp[MAX_HASH_LOG + 1];
+    cl_program program_comp[LZ4_DAEMON_KERNEL_MODES];
     pthread_mutex_t compile_lock;
     worker_res_t workers[MAX_WORKERS_CAP];
     int active_workers;
@@ -49,10 +57,106 @@ struct {
     int pid_fd;
 } g_state;
 
+static int daemon_kernel_mode_for_block(uint32_t block_size) {
+    return (block_size <= 64U * 1024U) ? LZ4_DAEMON_MODE_CLEAR16 : LZ4_DAEMON_MODE_EPOCH32;
+}
+
 static int clamp_int(int v, int lo, int hi) {
     if (v < lo) return lo;
     if (v > hi) return hi;
     return v;
+}
+
+static int daemon_read_full(int fd, void* buf, size_t len) {
+    unsigned char* p = (unsigned char*)buf;
+    while (len > 0) {
+        ssize_t n = recv(fd, p, len, 0);
+        if (n <= 0) return -1;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int daemon_write_full(int fd, const void* buf, size_t len) {
+    const unsigned char* p = (const unsigned char*)buf;
+    while (len > 0) {
+        ssize_t n = send(fd, p, len, 0);
+        if (n <= 0) return -1;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int daemon_fd_path(int fd, char* out, size_t out_len) {
+    if (!out || out_len == 0 || fd < 0) return -1;
+    if (snprintf(out, out_len, "/proc/self/fd/%d", fd) >= (int)out_len) return -1;
+    return 0;
+}
+
+static int daemon_memfd_create(const char* name) {
+#ifdef SYS_memfd_create
+    return (int)syscall(SYS_memfd_create, name ? name : "lz4_gpu_daemon", 0);
+#else
+    (void)name;
+    return -1;
+#endif
+}
+
+static int daemon_write_fd_full(int fd, const void* buf, size_t len) {
+    const unsigned char* p = (const unsigned char*)buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n <= 0) return -1;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int daemon_send_fd_payload(int sock, int fd) {
+    struct stat st;
+    char* buf = NULL;
+    uint64_t len = 0;
+    int rc = -1;
+    if (fd < 0 || fstat(fd, &st) != 0 || st.st_size < 0) {
+        len = 0;
+        (void)daemon_write_full(sock, &len, sizeof(len));
+        return -1;
+    }
+    len = (uint64_t)st.st_size;
+    if (daemon_write_full(sock, &len, sizeof(len)) != 0) return -1;
+    if (len == 0) return 0;
+    buf = (char*)malloc(1 << 20);
+    if (!buf) return -1;
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        free(buf);
+        return -1;
+    }
+    while (len > 0) {
+        size_t want = (len > (uint64_t)(1 << 20)) ? (size_t)(1 << 20) : (size_t)len;
+        size_t got = read(fd, buf, want);
+        if (got == 0) goto out;
+        if (daemon_write_full(sock, buf, got) != 0) goto out;
+        len -= got;
+    }
+    rc = 0;
+out:
+    free(buf);
+    return rc;
+}
+
+static int daemon_request_valid(const request_t* req, response_t* res) {
+    if (!req || !res) return 0;
+    if (req->magic != LZ4_DAEMON_REQUEST_MAGIC ||
+        req->version != LZ4_DAEMON_REQUEST_VERSION) {
+        res->status = -1;
+        snprintf(res->message, sizeof(res->message),
+                 "daemon protocol mismatch: restart daemon/client");
+        return 0;
+    }
+    return 1;
 }
 
 static int parse_env_int(const char* name, int* out_value) {
@@ -86,65 +190,6 @@ static int choose_daemon_worker_count(cl_device_id device) {
     return clamp_int((cpu_budget < cu_budget) ? cpu_budget : cu_budget, 1, MAX_WORKERS_CAP);
 }
 
-static char* read_file_bin(const char* path, size_t* out_len) {
-    FILE* f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long s = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char* buf = malloc(s);
-    if (!buf) {
-        fclose(f);
-        return NULL;
-    }
-    if (fread(buf, 1, s, f) != (size_t)s) {
-        free(buf);
-        fclose(f);
-        return NULL;
-    }
-    fclose(f);
-    if (out_len) *out_len = (size_t)s;
-    return buf;
-}
-
-static int path_join2(char* out, size_t out_len, const char* a, const char* b) {
-    if (!out || !a || !b || out_len == 0) return -1;
-    if (snprintf(out, out_len, "%s/%s", a, b) >= (int)out_len) return -1;
-    return 0;
-}
-
-static int path_join3(char* out, size_t out_len, const char* a, const char* b, const char* c) {
-    if (!out || !a || !b || !c || out_len == 0) return -1;
-    if (snprintf(out, out_len, "%s/%s/%s", a, b, c) >= (int)out_len) return -1;
-    return 0;
-}
-
-static int get_exe_dir(char* out, size_t out_len) {
-    char exe[PATH_MAX];
-    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-    if (n <= 0) return -1;
-    exe[n] = '\0';
-    char* slash = strrchr(exe, '/');
-    if (!slash) return -1;
-    *slash = '\0';
-    if (strlen(exe) + 1 > out_len) return -1;
-    strcpy(out, exe);
-    return 0;
-}
-
-static int dirname_of_path(const char* path, char* out, size_t out_len) {
-    char* slash;
-    size_t len;
-    if (!path || !out || out_len == 0) return -1;
-    slash = strrchr(path, '/');
-    if (!slash) return -1;
-    len = (size_t)(slash - path);
-    if (len + 1 > out_len) return -1;
-    memcpy(out, path, len);
-    out[len] = '\0';
-    return 0;
-}
-
 static int create_pidfile(void) {
     int fd = open("/tmp/lz4_gpu_daemon.pid", O_RDWR | O_CREAT, 0644);
     if (fd < 0) return -1;
@@ -169,98 +214,63 @@ static void remove_pidfile(void) {
 }
 
 static void signal_handler(int sig) {
+    (void)sig;
     g_state.running = 0;
 }
 
-static int resolve_daemon_file(const char* env_name, const char* filename, char* out, size_t out_len) {
-    char cwd[PATH_MAX];
-    char exe_dir[PATH_MAX];
-    const char* env = getenv(env_name);
-    if (env && *env && access(env, R_OK) == 0) {
-        if (strlen(env) + 1 > out_len) return -1;
-        strcpy(out, env);
-        return 0;
+static void cleanup_resources(void) {
+    g_state.running = 0;
+    if (g_state.server_sock >= 0) {
+        close(g_state.server_sock);
+        g_state.server_sock = -1;
     }
+    unlink(SOCKET_PATH);
 
-    if (getcwd(cwd, sizeof(cwd)) && path_join2(out, out_len, cwd, filename) == 0 && access(out, R_OK) == 0) {
-        return 0;
+    for (int i = 0; i < g_state.active_workers; i++) {
+        pthread_mutex_lock(&g_state.workers[i].lock);
+        pthread_cond_signal(&g_state.workers[i].cond);
+        pthread_mutex_unlock(&g_state.workers[i].lock);
     }
-
-    if (get_exe_dir(exe_dir, sizeof(exe_dir)) == 0) {
-        if (path_join2(out, out_len, exe_dir, filename) == 0 && access(out, R_OK) == 0) {
-            return 0;
-        }
-        if (path_join3(out, out_len, exe_dir, "../lz4_gpu", filename) == 0 && access(out, R_OK) == 0) {
-            return 0;
-        }
-    }
-
-    if (access(filename, R_OK) == 0) {
-        if (strlen(filename) + 1 > out_len) return -1;
-        strcpy(out, filename);
-        return 0;
-    }
-
-    return -1;
-}
-
-cl_program load_program(cl_context context, cl_device_id device) {
-    const int hash_log = 14;
-    uint64_t t1 = get_us();
-    char bin_name[128];
-    char bin_path[PATH_MAX];
-
-    snprintf(bin_name, sizeof(bin_name), "lz4_gpu_%d.clbin", hash_log);
-    if (resolve_daemon_file("LZ4_GPU_DAEMON_CLBIN", bin_name, bin_path, sizeof(bin_path)) == 0) {
-        size_t sz = 0;
-        char* bin = read_file_bin(bin_path, &sz);
-        if (bin) {
-            cl_int status, err;
-            cl_program prog = clCreateProgramWithBinary(context, 1, &device, &sz, (const unsigned char**)&bin, &status, &err);
-            free(bin);
-            if (err == CL_SUCCESS && status == CL_SUCCESS) {
-                if (clBuildProgram(prog, 1, &device, NULL, NULL, NULL) == CL_SUCCESS) {
-                    return prog;
-                }
-                clReleaseProgram(prog);
+    for (int i = 0; i < g_state.active_workers; i++) {
+        pthread_join(g_state.workers[i].thread, NULL);
+        pthread_mutex_lock(&g_state.workers[i].lock);
+        for (int m = 0; m < LZ4_DAEMON_KERNEL_MODES; m++) {
+            if (g_state.workers[i].kernel_comp[m]) {
+                clReleaseKernel(g_state.workers[i].kernel_comp[m]);
+                g_state.workers[i].kernel_comp[m] = NULL;
+            }
+            if (g_state.workers[i].kernel_decomp[m]) {
+                clReleaseKernel(g_state.workers[i].kernel_decomp[m]);
+                g_state.workers[i].kernel_decomp[m] = NULL;
             }
         }
+        if (g_state.workers[i].client_fd >= 0) {
+            close(g_state.workers[i].client_fd);
+            g_state.workers[i].client_fd = -1;
+        }
+        if (g_state.workers[i].queue) {
+            clReleaseCommandQueue(g_state.workers[i].queue);
+            g_state.workers[i].queue = NULL;
+        }
+        lz4_gpu_workspace_free(&g_state.workers[i].ws);
+        pthread_mutex_unlock(&g_state.workers[i].lock);
+        pthread_mutex_destroy(&g_state.workers[i].lock);
+        pthread_cond_destroy(&g_state.workers[i].cond);
     }
 
-    {
-        char src_path[PATH_MAX];
-        char include_dir[PATH_MAX];
-        char flags[PATH_MAX + 64];
-        FILE* f;
-        size_t s_sz;
-        char* src;
-        cl_int err;
-
-        if (resolve_daemon_file("LZ4_GPU_DAEMON_CL", "lz4_gpu.cl", src_path, sizeof(src_path)) != 0) {
-            return NULL;
+    pthread_mutex_lock(&g_state.compile_lock);
+    for (int m = 0; m < LZ4_DAEMON_KERNEL_MODES; m++) {
+        if (g_state.program_comp[m]) {
+            clReleaseProgram(g_state.program_comp[m]);
+            g_state.program_comp[m] = NULL;
         }
+    }
+    pthread_mutex_unlock(&g_state.compile_lock);
+    pthread_mutex_destroy(&g_state.compile_lock);
 
-        if (dirname_of_path(src_path, include_dir, sizeof(include_dir)) != 0) {
-            strcpy(include_dir, ".");
-        }
-
-        snprintf(flags, sizeof(flags), "-I. -I%s -DLZ4_HASHLOG=%d", include_dir, hash_log);
-        f = fopen(src_path, "r");
-        if (!f) return NULL;
-        fseek(f, 0, SEEK_END); s_sz = (size_t)ftell(f); fseek(f, 0, SEEK_SET);
-        src = malloc(s_sz + 1);
-        if (!src) { fclose(f); return NULL; }
-        fread(src, 1, s_sz, f); src[s_sz] = 0; fclose(f);
-
-        cl_program prog = clCreateProgramWithSource(context, 1, (const char**)&src, &s_sz, &err);
-        free(src);
-        if (err != CL_SUCCESS || !prog) return NULL;
-        if (clBuildProgram(prog, 1, &device, flags, NULL, NULL) != CL_SUCCESS) {
-            clReleaseProgram(prog);
-            return NULL;
-        }
-        g_kernel_load_us += (get_us() - t1);
-        return prog;
+    if (g_state.context) {
+        clReleaseContext(g_state.context);
+        g_state.context = NULL;
     }
 }
 
@@ -291,9 +301,11 @@ int init_resources(void) {
 
     pthread_mutex_init(&g_state.compile_lock, NULL);
     g_state.active_workers = choose_daemon_worker_count(g_state.device);
+    g_state.server_sock = -1;
 
     for (int i = 0; i < g_state.active_workers; i++) {
         g_state.workers[i].id = i;
+        g_state.workers[i].client_fd = -1;
         {
             cl_queue_properties props[] = { CL_QUEUE_PROPERTIES, 0, 0 };
             g_state.workers[i].queue = clCreateCommandQueueWithProperties(g_state.context, g_state.device, props, &err);
@@ -314,16 +326,16 @@ void process_request(worker_res_t* w, request_t* req, response_t* res) {
     t.ocl_setup_us = 0;
 
     if (req->mode == mode_compress) {
-        const int h_log = 14;
+        const int kernel_mode = daemon_kernel_mode_for_block((uint32_t)req->block_size);
 
         pthread_mutex_lock(&g_state.compile_lock);
-        if (!g_state.program_comp[h_log]) g_state.program_comp[h_log] = load_program(g_state.context, g_state.device);
-        cl_program prog = g_state.program_comp[h_log];
-        if (!w->kernel_comp[h_log] && prog) {
+        if (!g_state.program_comp[kernel_mode]) g_state.program_comp[kernel_mode] = lz4_load_program(g_state.context, g_state.device, 14, req->block_size);
+        cl_program prog = g_state.program_comp[kernel_mode];
+        if (!w->kernel_comp[kernel_mode] && prog) {
             cl_int err;
-            w->kernel_comp[h_log] = clCreateKernel(prog, "lz4_compress_block", &err);
+            w->kernel_comp[kernel_mode] = clCreateKernel(prog, "lz4_compress_block", &err);
         }
-        cl_kernel kernel = w->kernel_comp[h_log];
+        cl_kernel kernel = w->kernel_comp[kernel_mode];
         pthread_mutex_unlock(&g_state.compile_lock);
 
         if (kernel) {
@@ -331,15 +343,15 @@ void process_request(worker_res_t* w, request_t* req, response_t* res) {
                                   req->block_size, req->acceleration, &w->ws, &t, req->local_size, 0);
         }
     } else {
-        int h_log = 14;
+        const int kernel_mode = daemon_kernel_mode_for_block((uint32_t)req->block_size);
         pthread_mutex_lock(&g_state.compile_lock);
-        if (!g_state.program_comp[h_log]) g_state.program_comp[h_log] = load_program(g_state.context, g_state.device);
-        cl_program prog = g_state.program_comp[h_log];
-        if (!w->kernel_decomp && prog) {
+        if (!g_state.program_comp[kernel_mode]) g_state.program_comp[kernel_mode] = lz4_load_program(g_state.context, g_state.device, 14, req->block_size);
+        cl_program prog = g_state.program_comp[kernel_mode];
+        if (!w->kernel_decomp[kernel_mode] && prog) {
             cl_int err;
-            w->kernel_decomp = clCreateKernel(prog, "lz4_decompress_blocks", &err);
+            w->kernel_decomp[kernel_mode] = clCreateKernel(prog, "lz4_decompress_blocks", &err);
         }
-        cl_kernel kernel = w->kernel_decomp;
+        cl_kernel kernel = w->kernel_decomp[kernel_mode];
         pthread_mutex_unlock(&g_state.compile_lock);
 
         if (kernel) {
@@ -364,10 +376,80 @@ void* worker_thread(void* arg) {
         }
         if (!g_state.running) { pthread_mutex_unlock(&w->lock); break; }
         request_t req;
-        if (read(w->client_fd, &req, sizeof(req)) == sizeof(req)) {
+        int raw_in_fd = -1;
+        int raw_out_fd = -1;
+        char raw_in_path[64] = {0};
+        char raw_out_path[64] = {0};
+        if (daemon_read_full(w->client_fd, &req, sizeof(req)) == 0) {
             response_t res; memset(&res, 0, sizeof(res));
+            if (!daemon_request_valid(&req, &res)) {
+                (void)daemon_write_full(w->client_fd, &res, sizeof(res));
+                close(w->client_fd); w->client_fd = -1; w->has_work = 0;
+                pthread_mutex_unlock(&w->lock);
+                continue;
+            }
+            if (req.flags & LZ4_DAEMON_FLAG_RAW_BUFFER) {
+                uint64_t raw_len = (uint64_t)req.input_size;
+                char* raw_buf = NULL;
+                if (raw_len == 0 || raw_len > (uint64_t)SIZE_MAX) {
+                    response_t res; memset(&res, 0, sizeof(res));
+                    res.status = -1;
+                    snprintf(res.message, sizeof(res.message), "invalid raw input size");
+                    (void)daemon_write_full(w->client_fd, &res, sizeof(res));
+                    close(w->client_fd); w->client_fd = -1; w->has_work = 0;
+                    pthread_mutex_unlock(&w->lock);
+                    continue;
+                }
+                raw_buf = (char*)malloc((size_t)raw_len);
+                if (!raw_buf || daemon_read_full(w->client_fd, raw_buf, (size_t)raw_len) != 0) {
+                    free(raw_buf);
+                    response_t res; memset(&res, 0, sizeof(res));
+                    res.status = -1;
+                    snprintf(res.message, sizeof(res.message), "failed to receive raw payload");
+                    (void)daemon_write_full(w->client_fd, &res, sizeof(res));
+                    close(w->client_fd); w->client_fd = -1; w->has_work = 0;
+                    pthread_mutex_unlock(&w->lock);
+                    continue;
+                }
+                raw_in_fd = daemon_memfd_create("lz4_gpu_raw_in");
+                raw_out_fd = daemon_memfd_create("lz4_gpu_raw_out");
+                if (raw_in_fd < 0 || raw_out_fd < 0 ||
+                    daemon_write_fd_full(raw_in_fd, raw_buf, (size_t)raw_len) != 0 ||
+                    lseek(raw_in_fd, 0, SEEK_SET) < 0 ||
+                    daemon_fd_path(raw_in_fd, raw_in_path, sizeof(raw_in_path)) != 0 ||
+                    daemon_fd_path(raw_out_fd, raw_out_path, sizeof(raw_out_path)) != 0) {
+                    free(raw_buf);
+                    if (raw_in_fd >= 0) close(raw_in_fd);
+                    if (raw_out_fd >= 0) close(raw_out_fd);
+                    response_t res; memset(&res, 0, sizeof(res));
+                    res.status = -1;
+                    snprintf(res.message, sizeof(res.message), "failed to materialize raw payload");
+                    (void)daemon_write_full(w->client_fd, &res, sizeof(res));
+                    close(w->client_fd); w->client_fd = -1; w->has_work = 0;
+                    pthread_mutex_unlock(&w->lock);
+                    continue;
+                }
+                free(raw_buf);
+                memset(req.input_path, 0, sizeof(req.input_path));
+                memset(req.output_path, 0, sizeof(req.output_path));
+                strncpy(req.input_path, raw_in_path, sizeof(req.input_path) - 1);
+                strncpy(req.output_path, raw_out_path, sizeof(req.output_path) - 1);
+            }
             process_request(w, &req, &res);
-            write(w->client_fd, &res, sizeof(res));
+            if (daemon_write_full(w->client_fd, &res, sizeof(res)) != 0) {
+                if (raw_in_fd >= 0) close(raw_in_fd);
+                if (raw_out_fd >= 0) close(raw_out_fd);
+                close(w->client_fd); w->client_fd = -1; w->has_work = 0;
+                pthread_mutex_unlock(&w->lock);
+                continue;
+            }
+            if ((req.flags & LZ4_DAEMON_FLAG_RAW_BUFFER) && res.status == 0) {
+                if (daemon_send_fd_payload(w->client_fd, raw_out_fd) != 0) {
+                    fprintf(stderr, "failed to send raw daemon payload\n");
+                }
+            }
+            if (raw_in_fd >= 0) close(raw_in_fd);
+            if (raw_out_fd >= 0) close(raw_out_fd);
         }
         close(w->client_fd); w->client_fd = -1; w->has_work = 0;
         pthread_mutex_unlock(&w->lock);
@@ -414,6 +496,7 @@ int run_daemon() {
         }
         if (!assigned) close(client);
     }
+    cleanup_resources();
     remove_pidfile();
     return 0;
 }

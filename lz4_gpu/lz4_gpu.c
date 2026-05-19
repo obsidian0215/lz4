@@ -37,14 +37,14 @@ static int run_daemon(void) {
     fprintf(stderr, "Daemon mode is not supported in Windows builds. Use standalone or bench mode.\n");
     return 1;
 }
-static int run_lz4_client(int mode, const char* input_path, const char* output_path, int block_size, int acceleration, int local_size) {
-    (void)mode; (void)input_path; (void)output_path; (void)block_size; (void)acceleration; (void)local_size;
+static int run_lz4_client(int mode, const char* input_path, const char* output_path, int block_size, int acceleration, int local_size, int raw_buffer) {
+    (void)mode; (void)input_path; (void)output_path; (void)block_size; (void)acceleration; (void)local_size; (void)raw_buffer;
     fprintf(stderr, "--use-daemon is not supported in Windows builds. Use standalone mode.\n");
     return 1;
 }
 #else
 int run_daemon(void);
-int run_lz4_client(int mode, const char* input_path, const char* output_path, int block_size, int acceleration, int local_size);
+int run_lz4_client(int mode, const char* input_path, const char* output_path, int block_size, int acceleration, int local_size, int raw_buffer);
 #endif
 
 int g_verbose = 0;
@@ -117,6 +117,7 @@ static void show_help(const char* prog_name) {
     fprintf(stderr, "  1. Standalone:   %s [options] <input_file|->\n", prog_name);
     fprintf(stderr, "  2. Run Daemon:   %s --daemon [options]\n", prog_name);
     fprintf(stderr, "  3. Use Daemon:   %s --use-daemon [options] <input_file>\n", prog_name);
+    fprintf(stderr, "                    add --raw-buffer to stream stdin/stdout through daemon raw-buffer protocol\n");
     fprintf(stderr, "  4. Stop Daemon:  %s --stop-daemon\n", prog_name);
 
     fprintf(stderr, "\nBasic Options:\n");
@@ -321,7 +322,7 @@ static int run_lz4_bench(const char* input_path,
         return 1;
     }
 
-    cl_program prog = lz4_load_program(ctx, dev);
+    cl_program prog = lz4_load_program(ctx, dev, 14, (size_t)block_size);
     if (!prog) {
         fprintf(stderr, "bench error: kernel program load failed\n");
         clReleaseCommandQueue(queue);
@@ -896,7 +897,7 @@ int run_lz4_standalone(int argc, char** argv) {
     g_ocl_init_us = t2 - t1;
 
     t1 = get_us();
-    prog = lz4_load_program(ctx, dev);
+    prog = lz4_load_program(ctx, dev, 14, g_cli_fixed_block_bytes);
     t2 = get_us();
     g_kernel_load_us = t2 - t1;
 
@@ -1008,6 +1009,7 @@ int main(int argc, char** argv) {
             const char* input = NULL;
             char output[512] = {0};
             int output_explicit = 0;
+            int raw_buffer = 0;
             for (int i = 2; i < argc; i++) {
                 if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
                     show_help(argv[0]);
@@ -1016,6 +1018,7 @@ int main(int argc, char** argv) {
                 else if (strcmp(argv[i], "-c") == 0) mode = mode_compress;
                 else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--decompress") == 0) mode = mode_decompress;
                 else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) g_verbose = 1;
+                else if (strcmp(argv[i], "--raw-buffer") == 0) raw_buffer = 1;
                 else if (strcmp(argv[i], "--bench") == 0) {
                     bench_mode = 1;
                     if (i + 1 < argc && argv[i + 1][0] != '-') {
@@ -1045,7 +1048,7 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-            if (!input) {
+            if (!input && !raw_buffer) {
                 fprintf(stderr, "Error: No input file specified\n");
                 return 1;
             }
@@ -1064,6 +1067,9 @@ int main(int argc, char** argv) {
                                     (int)g_cli_local_size,
                                     bench_seconds);
             }
+            if (raw_buffer) {
+                return run_lz4_client(mode, NULL, NULL, (int)g_cli_fixed_block_bytes, g_cli_acceleration, (int)g_cli_local_size, 1);
+            }
             if (!output_explicit) {
                 if (mode == mode_compress) snprintf(output, sizeof(output), "%s.lz4", input);
                 else snprintf(output, sizeof(output), "%s.dec", input);
@@ -1072,7 +1078,7 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "Error: '-' stream I/O is only supported in standalone mode\n");
                 return 1;
             }
-            return run_lz4_client(mode, input, output, (int)g_cli_fixed_block_bytes, g_cli_acceleration, (int)g_cli_local_size);
+            return run_lz4_client(mode, input, output, (int)g_cli_fixed_block_bytes, g_cli_acceleration, (int)g_cli_local_size, 0);
         }
     }
     return run_lz4_standalone(argc, argv);

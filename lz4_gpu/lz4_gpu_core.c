@@ -260,6 +260,23 @@ static size_t choose_comp_worker_count(cl_command_queue queue, size_t num_blocks
     return target;
 }
 
+static int lz4_effective_hash_log(void) {
+    return 14;
+}
+
+static void lz4_effective_dict_mode_for_block(size_t block_size, int* dict_clear, int* dict_entry_bits) {
+    int clear = 0;
+    int entry_bits = 32;
+
+    if (block_size <= 64U * 1024U) {
+        clear = 1;
+        entry_bits = 16;
+    }
+
+    if (dict_clear) *dict_clear = clear;
+    if (dict_entry_bits) *dict_entry_bits = entry_bits;
+}
+
 static size_t choose_comp_dict_pool_budget_bytes(cl_command_queue queue) {
     int env_set = 0;
     size_t env_mb = 0;
@@ -334,15 +351,18 @@ static lz4_comp_plan_t lz4_build_comp_plan(cl_command_queue queue,
                                            size_t block_size,
                                            size_t num_blocks,
                                            size_t local_size) {
-    const int hash_log = 14;
+    const int hash_log = lz4_effective_hash_log();
     lz4_comp_plan_t plan;
-    int table_type = (block_size <= 65536) ? 0 : 1;
+    int dict_clear = 0;
+    int entry_bits = 32;
     size_t dict_pool_budget_bytes;
 
     memset(&plan, 0, sizeof(plan));
+    lz4_effective_dict_mode_for_block(block_size, &dict_clear, &entry_bits);
+    (void)dict_clear;
     dict_pool_budget_bytes = choose_comp_dict_pool_budget_bytes(queue);
-    plan.dict_entries_per_owner = (size_t)1U << (table_type == 0 ? (hash_log + 1) : hash_log);
-    plan.dict_bytes_per_owner = plan.dict_entries_per_owner * sizeof(cl_uint);
+    plan.dict_entries_per_owner = (size_t)1U << hash_log;
+    plan.dict_bytes_per_owner = plan.dict_entries_per_owner * ((entry_bits == 16) ? sizeof(cl_ushort) : sizeof(cl_uint));
     plan.raw_worker_count = choose_comp_worker_count(queue, num_blocks, local_size);
     plan.dict_owner_count = choose_comp_dict_owner_count(plan.raw_worker_count,
                                                          dict_pool_budget_bytes,
@@ -509,14 +529,15 @@ static void lz4_print_comp_host_debug(const char* input_path,
                                       size_t block_size,
                                       size_t l_ws,
                       const lz4_comp_plan_t* plan,
-                                      int tableType,
+                                      int dict_clear,
+                                      int entry_bits,
                                       uint32_t epoch_base,
                                       int use_standard_copy,
                                       int kernel_has_dbg,
                                       int dbg_enabled) {
     double dict_per_input = (file_size > 0 && plan) ? ((double)plan->dict_total_bytes / (double)file_size) : 0.0;
     fprintf(stderr,
-        "[LZ4-DBG][HOST][COMP] input=%s file_size=%zu blocks=%d block_size=%zu local=%zu raw_workers=%zu active_lanes=%zu launched=%zu pad=%zu tableType=%d dict_owners=%zu dict_entries/owner=%zu dict_bytes/owner=%zu dict_total=%zu dict_budget=%zu dict/input=%.3fx blocks/owner<=%u epoch_base=%u copy=%s kernel_debug_args=%s debug_enabled=%s\n",
+        "[LZ4-DBG][HOST][COMP] input=%s file_size=%zu blocks=%d block_size=%zu local=%zu raw_workers=%zu active_lanes=%zu launched=%zu pad=%zu dict_clear=%d entry_bits=%d dict_owners=%zu dict_entries/owner=%zu dict_bytes/owner=%zu dict_total=%zu dict_budget=%zu dict/input=%.3fx blocks/owner<=%u epoch_base=%u copy=%s kernel_debug_args=%s debug_enabled=%s\n",
             input_path ? input_path : "<null>",
             file_size,
             num_blocks,
@@ -526,7 +547,8 @@ static void lz4_print_comp_host_debug(const char* input_path,
         plan ? plan->active_lane_count : 0,
         plan ? plan->launched_wi_count : 0,
         plan ? plan->padding_wi_count : 0,
-            tableType,
+            dict_clear,
+            entry_bits,
         plan ? plan->dict_owner_count : 0,
         plan ? plan->dict_entries_per_owner : 0,
         plan ? plan->dict_bytes_per_owner : 0,
@@ -773,7 +795,7 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
     cl_uint kernel_num_args = 0;
     int kernel_has_dbg = 0;
     if (clGetKernelInfo(kernel, CL_KERNEL_NUM_ARGS, sizeof(kernel_num_args), &kernel_num_args, NULL) == CL_SUCCESS) {
-        kernel_has_dbg = (kernel_num_args >= 15U);
+        kernel_has_dbg = (kernel_num_args >= 14U);
     }
 
     uint32_t* h_block_info = malloc(num_blocks * 2 * sizeof(uint32_t));
@@ -781,11 +803,13 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
     cl_mem dbg_comp_buf = NULL;
     int dbg_comp_requested = dbg_cfg.enabled;
     int dbg_comp_enabled = dbg_comp_requested && kernel_has_dbg;
+    int dict_clear = 0;
+    int dict_entry_bits = 32;
     if (dbg_comp_requested && !kernel_has_dbg) {
         fprintf(stderr, "[LZ4-DBG][COMP] warning: kernel has no debug args, debug counters disabled\n");
     }
     uint32_t single_block_max_out = (uint32_t)(block_size * 1.1 + 64);
-    int tableType = (block_size <= 65536) ? 0 : 1;
+    lz4_effective_dict_mode_for_block(block_size, &dict_clear, &dict_entry_bits);
     for (int i = 0; i < num_blocks; i++) {
         h_block_info[i*2] = i * block_size;
         h_block_info[i*2+1] = (i == num_blocks - 1) ? (file_size - i * block_size) : (uint32_t)block_size;
@@ -903,7 +927,8 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
                                   block_size,
                                   l_ws,
                                   &comp_plan,
-                                  tableType,
+                                  dict_clear,
+                                  dict_entry_bits,
                                   epoch_base,
                                   use_standard_copy,
                                   kernel_has_dbg,
@@ -926,14 +951,13 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
         err |= clSetKernelArg(kernel, 4, sizeof(int), &inputSize);
         err |= clSetKernelArg(kernel, 5, sizeof(int), &block_size);
         err |= clSetKernelArg(kernel, 6, sizeof(uint32_t), &single_block_max_out);
-        err |= clSetKernelArg(kernel, 7, sizeof(int), &tableType);
-        err |= clSetKernelArg(kernel, 8, sizeof(int), &acceleration);
-        err |= clSetKernelArg(kernel, 9, sizeof(int), &globalIndexBase);
-        err |= clSetKernelArg(kernel, 10, sizeof(cl_mem), &ws->dict_buf);
-        err |= clSetKernelArg(kernel, 11, sizeof(uint32_t), &active_lane_count);
+        err |= clSetKernelArg(kernel, 7, sizeof(int), &acceleration);
+        err |= clSetKernelArg(kernel, 8, sizeof(int), &globalIndexBase);
+        err |= clSetKernelArg(kernel, 9, sizeof(cl_mem), &ws->dict_buf);
+        err |= clSetKernelArg(kernel, 10, sizeof(uint32_t), &active_lane_count);
         if (kernel_has_dbg) {
-            err |= clSetKernelArg(kernel, 13, sizeof(cl_mem), &dbg_comp_arg);
-            err |= clSetKernelArg(kernel, 14, sizeof(uint32_t), &dbg_comp_flag);
+            err |= clSetKernelArg(kernel, 12, sizeof(cl_mem), &dbg_comp_arg);
+            err |= clSetKernelArg(kernel, 13, sizeof(uint32_t), &dbg_comp_flag);
         }
         if (err != CL_SUCCESS) {
             fprintf(stderr, "[LZ4] set compress kernel args failed: %d\n", err);
@@ -943,7 +967,7 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
             return -1;
         }
     }
-    err = clSetKernelArg(kernel, 12, sizeof(uint32_t), &epoch_base);
+    err = clSetKernelArg(kernel, 11, sizeof(uint32_t), &epoch_base);
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[LZ4] set epoch_base kernel arg failed: %d\n", err);
         if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
@@ -959,7 +983,7 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
     err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &g_ws, &l_ws, 0, NULL, &ev);
     clWaitForEvents(1, &ev);
     t->kernel_exec_us = (unsigned long)(get_us() - t1);
-    t->algo_config = 14;
+    t->algo_config = (unsigned long)lz4_effective_hash_log();
 
     t1 = get_us();
     uint32_t* h_osizes = (uint32_t*)malloc(num_blocks * sizeof(uint32_t));
@@ -1580,11 +1604,40 @@ static int lz4_find_file_path(const char* name, char* out, size_t outlen) {
     return -1;
 }
 
-cl_program lz4_load_program(cl_context context, cl_device_id device) {
-    const int hash_log = 14;
-    int dbg_enabled = lz4_debug_counters_enabled();
+static void lz4_dirname_from_path(const char* path, char* out, size_t outlen) {
+    const char* slash;
+    const char* backslash;
+    size_t len;
+    if (!out || outlen == 0) return;
+    out[0] = '\0';
+    if (!path || !*path) return;
+    slash = strrchr(path, '/');
+    backslash = strrchr(path, '\\');
+    if (!slash || (backslash && backslash > slash)) slash = backslash;
+    if (!slash) {
+        strncpy(out, ".", outlen - 1);
+        out[outlen - 1] = '\0';
+        return;
+    }
+    len = (size_t)(slash - path);
+    if (len >= outlen) len = outlen - 1;
+    memcpy(out, path, len);
+    out[len] = '\0';
+    for (size_t i = 0; out[i]; ++i) {
+        if (out[i] == '\\') out[i] = '/';
+    }
+}
 
-    if (!dbg_enabled) {
+cl_program lz4_load_program(cl_context context, cl_device_id device, int hash_log, size_t block_size) {
+    int dbg_enabled = lz4_debug_counters_enabled();
+    int use_clbin = lz4_env_flag_value("LZ4_GPU_USE_CLBIN", NULL);
+    int dict_clear = 0;
+    int dict_entry_bits = 32;
+
+    lz4_effective_dict_mode_for_block(block_size, &dict_clear, &dict_entry_bits);
+    if (hash_log != 14) hash_log = lz4_effective_hash_log();
+
+    if (use_clbin && !dbg_enabled && dict_clear == 0 && dict_entry_bits == 32) {
         char bin_name[128];
         char resolved_path[PATH_MAX];
         snprintf(bin_name, sizeof(bin_name), "lz4_gpu_%d.clbin", hash_log);
@@ -1634,11 +1687,13 @@ cl_program lz4_load_program(cl_context context, cl_device_id device) {
             fprintf(stderr, "clCreateProgramWithSource failed: err=%d\n", err);
             return NULL;
         }
-        char flags[224];
+        char include_dir[PATH_MAX];
+        char flags[PATH_MAX + 128];
+        lz4_dirname_from_path(resolved_src, include_dir, sizeof(include_dir));
         if (dbg_enabled) {
-            snprintf(flags, sizeof(flags), "-I. -I./lz4_gpu -I../lz4_gpu -I.. -DLZ4_HASHLOG=%d -DLZ4_GPU_DEBUG_COUNTERS_RUNTIME=1", hash_log);
+            snprintf(flags, sizeof(flags), "-cl-std=CL1.2 -I%s -DLZ4_HASHLOG=%d -DLZ4_GPU_DEBUG_COUNTERS_RUNTIME=1 -DLZ4_GPU_DICT_CLEAR=%d -DLZ4_GPU_DICT_ENTRY_BITS=%d", include_dir, hash_log, dict_clear, dict_entry_bits);
         } else {
-            snprintf(flags, sizeof(flags), "-I. -I./lz4_gpu -I../lz4_gpu -I.. -DLZ4_HASHLOG=%d", hash_log);
+            snprintf(flags, sizeof(flags), "-cl-std=CL1.2 -I%s -DLZ4_HASHLOG=%d -DLZ4_GPU_DICT_CLEAR=%d -DLZ4_GPU_DICT_ENTRY_BITS=%d", include_dir, hash_log, dict_clear, dict_entry_bits);
         }
         err = clBuildProgram(prog, 1, &device, flags, NULL, NULL);
         if (err != CL_SUCCESS) {

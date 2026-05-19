@@ -20,8 +20,24 @@
 #define RUN_BITS (8-ML_BITS)
 #define RUN_MASK ((1U<<RUN_BITS)-1)
 
+#ifndef LZ4_HASHLOG
 #define LZ4_HASHLOG 14
+#endif
 #define LZ4_MEMORY_USAGE LZ4_HASHLOG
+
+#ifndef LZ4_GPU_DICT_CLEAR
+#define LZ4_GPU_DICT_CLEAR 0
+#endif
+
+#ifndef LZ4_GPU_DICT_ENTRY_BITS
+#define LZ4_GPU_DICT_ENTRY_BITS 32
+#endif
+
+#if LZ4_GPU_DICT_ENTRY_BITS == 16
+typedef unsigned short LZ4_DICT_ENTRY;
+#else
+typedef unsigned int LZ4_DICT_ENTRY;
+#endif
 
 // --- Types ---
 typedef unsigned char BYTE;
@@ -266,7 +282,6 @@ inline void LZ4_memcpy(__global BYTE* dst, const __global BYTE* src, int size) {
 }
 
 
-#ifndef LZ4_GPU_DISABLE_VEC_COPY
 inline void LZ4_lit_wildCopy8(__global BYTE* dst, const __global BYTE* src, __global BYTE* dstEnd) {
     if (dstEnd - dst <= 8) {
         LZ4_write64(dst, LZ4_read64(src));
@@ -277,14 +292,6 @@ inline void LZ4_lit_wildCopy8(__global BYTE* dst, const __global BYTE* src, __gl
         LZ4_UA_COPYN(dst, src, (uint)(dstEnd - dst));
     }
 }
-#else
-inline void LZ4_lit_wildCopy8(__global BYTE* dst, const __global BYTE* src, __global BYTE* dstEnd) {
-    while (dst < dstEnd) {
-        LZ4_memcpy(dst, src, 8);
-        dst += 8; src += 8;
-    }
-}
-#endif
 
 // --- Fast Direct Match Copy Helper (M2 backport from v2-r11) ---
 inline void lz4_v1_fast_direct_match_copy_18(__global BYTE* op,
@@ -303,32 +310,43 @@ inline void lz4_v1_fast_direct_match_copy_18(__global BYTE* op,
 }
 
 // --- Hashing ---
-inline U32 LZ4_hash4(U32 sequence, int tableType) __attribute__((always_inline)) {
-    if (tableType == 0) // byU16
-        return ((sequence * 2654435761U) >> ((MINMATCH*8)-(LZ4_HASHLOG+1)));
-    else // byU32
-        return ((sequence * 2654435761U) >> ((MINMATCH*8)-LZ4_HASHLOG));
+inline U32 LZ4_hash4(U32 sequence) __attribute__((always_inline)) {
+    return ((sequence * 2654435761U) >> ((MINMATCH*8)-LZ4_HASHLOG));
 }
 
-inline U32 LZ4_hashPosition(const __global BYTE* p, int tableType, U32* sequence) __attribute__((always_inline)) {
+inline U32 LZ4_hashPosition(const __global BYTE* p, U32* sequence) __attribute__((always_inline)) {
     U32 s = LZ4_read32(p);
-    if (sequence) *sequence = s;
-    return LZ4_hash4(s, tableType);
+    *sequence = s;
+    return LZ4_hash4(s);
 }
 
-inline U32 LZ4_hashMaskForTableType(int tableType) __attribute__((always_inline)) {
-    U32 const hashLog = (tableType == 0) ? (LZ4_HASHLOG + 1) : LZ4_HASHLOG;
-    return (1U << hashLog) - 1U;
+inline U32 LZ4_hashMask(void) __attribute__((always_inline)) {
+    return (1U << LZ4_HASHLOG) - 1U;
 }
 
-inline void LZ4_putIndexOnHashMasked(U32 idx, U32 h, __global U32* tableBase, U32 mask, U32 epoch) __attribute__((always_inline)) {
+inline void LZ4_putIndexOnHashMasked(U32 idx, U32 h, __global LZ4_DICT_ENTRY* tableBase, U32 mask, U32 epoch) __attribute__((always_inline)) {
+#if LZ4_GPU_DICT_CLEAR
+    (void)epoch;
+    tableBase[h & mask] = (LZ4_DICT_ENTRY)(idx + 1U);
+#else
     /* Compact 32-bit entry: [12-bit epoch | 20-bit low position]. */
     U32 packed = ((epoch & 0xFFF) << 20) | (idx & 0xFFFFF);
     tableBase[h & mask] = packed;
+#endif
 }
 
-inline U32 LZ4_getIndexOnHashMasked(U32 h, __global U32* tableBase, U32 mask, int* entry_valid, U32 epoch, U32 current) __attribute__((always_inline)) {
+inline U32 LZ4_getIndexOnHashMasked(U32 h, __global LZ4_DICT_ENTRY* tableBase, U32 mask, int* entry_valid, U32 epoch, U32 current) __attribute__((always_inline)) {
     U32 const packed = tableBase[h & mask];
+#if LZ4_GPU_DICT_CLEAR
+    (void)epoch;
+    (void)current;
+    if (packed == 0) {
+        *entry_valid = 0;
+        return 0;
+    }
+    *entry_valid = 1;
+    return packed - 1U;
+#else
     U32 const tag = (packed >> 20);
     if (tag != (epoch & 0xFFF)) {
         *entry_valid = 0;
@@ -341,15 +359,45 @@ inline U32 LZ4_getIndexOnHashMasked(U32 h, __global U32* tableBase, U32 mask, in
         if (matchIndex > current) matchIndex -= 0x100000U;
         return matchIndex;
     }
+#endif
 }
 
-inline void LZ4_putIndexOnHash(U32 idx, U32 h, __global U32* tableBase, int tableType, U32 epoch) __attribute__((always_inline)) {
-    U32 const mask = LZ4_hashMaskForTableType(tableType);
+inline void LZ4_clearDictEntries(__global LZ4_DICT_ENTRY* dict, uint dict_entries) __attribute__((always_inline)) {
+#if LZ4_GPU_DICT_CLEAR
+#if LZ4_GPU_DICT_ENTRY_BITS == 16
+    __global uint4* dict4 = (__global uint4*)dict;
+    uint vec_count = dict_entries >> 3;
+    uint tail = dict_entries & 7U;
+    for (uint i = 0; i < vec_count; ++i) dict4[i] = (uint4)(0U, 0U, 0U, 0U);
+    if (tail != 0) {
+        __global ushort* dict16 = (__global ushort*)dict;
+        uint base = vec_count << 3;
+        for (uint i = 0; i < tail; ++i) dict16[base + i] = (ushort)0;
+    }
+#else
+    __global uint4* dict4 = (__global uint4*)dict;
+    uint vec_count = dict_entries >> 2;
+    uint tail = dict_entries & 3U;
+    for (uint i = 0; i < vec_count; ++i) dict4[i] = (uint4)(0U, 0U, 0U, 0U);
+    if (tail != 0) {
+        __global uint* dict32 = (__global uint*)dict;
+        uint base = vec_count << 2;
+        for (uint i = 0; i < tail; ++i) dict32[base + i] = 0U;
+    }
+#endif
+#else
+    (void)dict;
+    (void)dict_entries;
+#endif
+}
+
+inline void LZ4_putIndexOnHash(U32 idx, U32 h, __global LZ4_DICT_ENTRY* tableBase, U32 epoch) __attribute__((always_inline)) {
+    U32 const mask = LZ4_hashMask();
     LZ4_putIndexOnHashMasked(idx, h, tableBase, mask, epoch);
 }
 
-inline U32 LZ4_getIndexOnHash(U32 h, __global U32* tableBase, int tableType, int* entry_valid, U32 epoch, U32 current) __attribute__((always_inline)) {
-    U32 const mask = LZ4_hashMaskForTableType(tableType);
+inline U32 LZ4_getIndexOnHash(U32 h, __global LZ4_DICT_ENTRY* tableBase, int* entry_valid, U32 epoch, U32 current) __attribute__((always_inline)) {
+    U32 const mask = LZ4_hashMask();
     return LZ4_getIndexOnHashMasked(h, tableBase, mask, entry_valid, epoch, current);
 }
 
@@ -411,8 +459,7 @@ int lz4_compress_core_accelerated(
     __global BYTE* restrict dst,
     int srcSize,
     int dstCapacity,
-    int tableType,
-    __global U32* restrict hashTable,
+    __global LZ4_DICT_ENTRY* restrict hashTable,
     int acceleration,
     U32 epoch
 #if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
@@ -428,7 +475,7 @@ int lz4_compress_core_accelerated(
     const __global BYTE* anchor = ip;
     const __global BYTE* const mflimitPlusOne = iend - MFLIMIT + 1;
     const __global BYTE* const matchlimit = iend - LASTLITERALS;
-    const U32 hashMask = LZ4_hashMaskForTableType(tableType);
+    const U32 hashMask = LZ4_hashMask();
 
 #if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
     U32 stat_search_iters = 0;
@@ -444,13 +491,13 @@ int lz4_compress_core_accelerated(
     if (srcSize < (MFLIMIT+1)) goto _last_literals_g;
 
     U32 ipValue, forwardIpValue;
-    U32 h_init = LZ4_hashPosition(ip, tableType, &ipValue);
+    U32 h_init = LZ4_hashPosition(ip, &ipValue);
     LZ4_putIndexOnHashMasked(0, h_init, hashTable, hashMask, epoch);
 #if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
     if (dbg_enabled) stat_hash_inserts++;
 #endif
     ip++;
-    U32 forwardH = LZ4_hashPosition(ip, tableType, &forwardIpValue);
+    U32 forwardH = LZ4_hashPosition(ip, &forwardIpValue);
 
     for (;;) {
         const __global BYTE* match;
@@ -475,7 +522,7 @@ int lz4_compress_core_accelerated(
                 forwardIp += step;
                 step = (searchMatchNb++ >> 6);
                 if (forwardIp > mflimitPlusOne) goto _last_literals_g;
-                forwardH = LZ4_hashPosition(forwardIp, tableType, &forwardIpValue);
+                forwardH = LZ4_hashPosition(forwardIp, &forwardIpValue);
                 LZ4_putIndexOnHashMasked(current, h_iter, hashTable, hashMask, epoch);
 #if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
                 if (dbg_enabled) stat_hash_inserts++;
@@ -542,12 +589,12 @@ _next_match_g:
         anchor = ip;
         if (ip >= mflimitPlusOne) break;
         U32 seq2, seq_ip;
-        U32 h2 = LZ4_hashPosition(ip - 2, tableType, &seq2);
+        U32 h2 = LZ4_hashPosition(ip - 2, &seq2);
         LZ4_putIndexOnHashMasked((U32)(ip - 2 - src), h2, hashTable, hashMask, epoch);
     #if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
         if (dbg_enabled) stat_hash_inserts++;
     #endif
-        U32 h_ip = LZ4_hashPosition(ip, tableType, &seq_ip);
+        U32 h_ip = LZ4_hashPosition(ip, &seq_ip);
         U32 current = (U32)(ip - src);
         int entry_valid;
     #if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
@@ -573,7 +620,7 @@ _next_match_g:
             if (dbg_enabled) stat_distance_rejects++;
     #endif
         }
-        forwardH = LZ4_hashPosition(++ip, tableType, &forwardIpValue);
+        forwardH = LZ4_hashPosition(++ip, &forwardIpValue);
     }
 _last_literals_g:
     {
@@ -829,10 +876,9 @@ __kernel void lz4_compress_block(
     int inputSize,
     int blockSize,
     int singleBlockMaxOut,
-    int tableType,
     int acceleration,
     int globalIndexBase,
-    __global U32* globalHashTablePool,
+    __global LZ4_DICT_ENTRY* globalHashTablePool,
     U32 active_lanes,
     U32 epoch_base
 #if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
@@ -842,11 +888,11 @@ __kernel void lz4_compress_block(
 ) {
     const uint wi = get_global_id(0);
     const uint total_wi = active_lanes;
-    const uint dict_entries = (tableType == 0) ? (1U << (LZ4_HASHLOG + 1)) : (1U << LZ4_HASHLOG);
+    const uint dict_entries = (1U << LZ4_HASHLOG);
 
     if (wi >= total_wi) return;
 
-    __global U32* dict = globalHashTablePool + (size_t)wi * dict_entries;
+    __global LZ4_DICT_ENTRY* dict = globalHashTablePool + (size_t)wi * dict_entries;
     U32 epoch = epoch_base + 1U;
 
     for (uint b = wi; b < (uint)totalBlocks; b += total_wi, ++epoch) {
@@ -854,10 +900,13 @@ __kernel void lz4_compress_block(
         int remain = inputSize - start;
         int thisBlockSize = (remain > blockSize) ? blockSize : remain;
         if (start < inputSize && thisBlockSize > 0) {
+#if LZ4_GPU_DICT_CLEAR
+            LZ4_clearDictEntries(dict, dict_entries);
+#endif
             int dstCapacity = singleBlockMaxOut;
             __global BYTE* dst = output + (size_t)b * (size_t)singleBlockMaxOut;
             blockSizes[globalIndexBase + b] = lz4_compress_core_accelerated(
-                input + start, dst, thisBlockSize, dstCapacity, tableType, dict, acceleration, epoch
+                input + start, dst, thisBlockSize, dstCapacity, dict, acceleration, epoch
 #if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
                 , dbg_stats, b, dbg_enabled
 #endif
@@ -877,10 +926,9 @@ __kernel void lz4_compress_blocks_mapped(
     int inputSize,
     int blockSize,
     int singleBlockMaxOut,
-    int tableType,
     int acceleration,
     int globalIndexBase,
-    __global U32* globalHashTablePool,
+    __global LZ4_DICT_ENTRY* globalHashTablePool,
     U32 active_lanes,
     U32 epoch_base
 #if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
@@ -890,11 +938,11 @@ __kernel void lz4_compress_blocks_mapped(
 ) {
     const uint wi = get_global_id(0);
     const uint total_wi = active_lanes;
-    const uint dict_entries = (tableType == 0) ? (1U << (LZ4_HASHLOG + 1)) : (1U << LZ4_HASHLOG);
+    const uint dict_entries = (1U << LZ4_HASHLOG);
 
     if (wi >= total_wi) return;
 
-    __global U32* dict = globalHashTablePool + (size_t)wi * dict_entries;
+    __global LZ4_DICT_ENTRY* dict = globalHashTablePool + (size_t)wi * dict_entries;
     U32 epoch = epoch_base + 1U;
 
     for (uint b = wi; b < (uint)totalBlocks; b += total_wi, ++epoch) {
@@ -903,10 +951,13 @@ __kernel void lz4_compress_blocks_mapped(
         int remain = inputSize - start;
         int thisBlockSize = (remain > blockSize) ? blockSize : remain;
         if (start < inputSize && thisBlockSize > 0) {
+#if LZ4_GPU_DICT_CLEAR
+            LZ4_clearDictEntries(dict, dict_entries);
+#endif
             int dstCapacity = singleBlockMaxOut;
             __global BYTE* dst = output + (size_t)b * (size_t)singleBlockMaxOut;
             blockSizes[globalIndexBase + b] = lz4_compress_core_accelerated(
-                input + start, dst, thisBlockSize, dstCapacity, tableType, dict, acceleration, epoch
+                input + start, dst, thisBlockSize, dstCapacity, dict, acceleration, epoch
 #if LZ4_GPU_DEBUG_COUNTERS_RUNTIME
                 , dbg_stats, b, dbg_enabled
 #endif
