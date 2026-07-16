@@ -7,7 +7,7 @@
 
 #define SOCKET_PATH "/tmp/lz4_gpu_daemon.sock"
 #define LZ4_DAEMON_REQUEST_MAGIC 0x4c5a3447u
-#define LZ4_DAEMON_REQUEST_VERSION 2u
+#define LZ4_DAEMON_REQUEST_VERSION 3u
 #define LZ4_DAEMON_FLAG_RAW_BUFFER 0x1u
 
 extern uint64_t g_ocl_init_us;
@@ -25,6 +25,7 @@ typedef struct {
     int acceleration;
     int block_size;
     int local_size;
+    int hash_log;
     uint32_t flags;
     size_t input_size;
     char input_path[1024];

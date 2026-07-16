@@ -260,8 +260,10 @@ static size_t choose_comp_worker_count(cl_command_queue queue, size_t num_blocks
     return target;
 }
 
-static int lz4_effective_hash_log(void) {
-    return 14;
+static int lz4_sanitize_hash_log(int hash_log) {
+    if (hash_log < 11) return 11;
+    if (hash_log > 15) return 15;
+    return hash_log;
 }
 
 static void lz4_effective_dict_mode_for_block(size_t block_size, int* dict_clear, int* dict_entry_bits) {
@@ -332,26 +334,13 @@ typedef struct {
     uint32_t blocks_per_owner;
 } lz4_comp_plan_t;
 
-static size_t choose_comp_dict_owner_count(size_t raw_worker_count,
-                                           size_t dict_pool_budget_bytes,
-                                           size_t dict_bytes_per_owner) {
-    size_t budget_owners;
-
-    if (raw_worker_count == 0) return 1;
-    if (dict_bytes_per_owner == 0) return raw_worker_count;
-
-    budget_owners = dict_pool_budget_bytes / dict_bytes_per_owner;
-    if (budget_owners == 0) budget_owners = 1;
-    if (budget_owners > raw_worker_count) budget_owners = raw_worker_count;
-    return budget_owners;
-}
-
 static lz4_comp_plan_t lz4_build_comp_plan(cl_command_queue queue,
                                            size_t file_size,
                                            size_t block_size,
                                            size_t num_blocks,
-                                           size_t local_size) {
-    const int hash_log = lz4_effective_hash_log();
+                                           size_t local_size,
+                                           int requested_hash_log) {
+    const int hash_log = lz4_sanitize_hash_log(requested_hash_log);
     lz4_comp_plan_t plan;
     int dict_clear = 0;
     int entry_bits = 32;
@@ -364,10 +353,13 @@ static lz4_comp_plan_t lz4_build_comp_plan(cl_command_queue queue,
     plan.dict_entries_per_owner = (size_t)1U << hash_log;
     plan.dict_bytes_per_owner = plan.dict_entries_per_owner * ((entry_bits == 16) ? sizeof(cl_ushort) : sizeof(cl_uint));
     plan.raw_worker_count = choose_comp_worker_count(queue, num_blocks, local_size);
-    plan.dict_owner_count = choose_comp_dict_owner_count(plan.raw_worker_count,
-                                                         dict_pool_budget_bytes,
-                                                         plan.dict_bytes_per_owner);
-    plan.active_lane_count = plan.dict_owner_count;
+    /*
+     * Keep launch parallelism independent from dictionary budgeting.
+     * Dictionary footprint is controlled by D_BITS / entry width, while
+     * occupancy is still driven by the raw worker count.
+     */
+    plan.dict_owner_count = plan.raw_worker_count;
+    plan.active_lane_count = plan.raw_worker_count;
     if (plan.active_lane_count == 0) plan.active_lane_count = 1;
     plan.launched_wi_count = round_up_size(plan.active_lane_count, local_size);
     if (plan.launched_wi_count == 0) plan.launched_wi_count = local_size ? local_size : 1;
@@ -769,7 +761,7 @@ static int lz4_readback_to_file_chunked(cl_command_queue queue,
 }
 int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kernel,
                     const char* input_path, const char* output_path,
-                    size_t block_size, int acceleration, lz4_gpu_workspace_t* ws,
+                    size_t block_size, int acceleration, int hash_log, lz4_gpu_workspace_t* ws,
                     timing_t* t, int local_size,
                     int skip_input_upload) {
     cl_int err;
@@ -786,11 +778,13 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
     lz4_gpu_debug_config_t dbg_cfg = lz4_gpu_get_debug_config();
 
     size_t l_ws = sanitize_local_size(queue, (local_size > 0) ? (size_t)local_size : 1, (size_t)num_blocks);
+    hash_log = lz4_sanitize_hash_log(hash_log);
     lz4_comp_plan_t comp_plan = lz4_build_comp_plan(queue,
                                                     file_size,
                                                     block_size,
                                                     (size_t)num_blocks,
-                                                    l_ws);
+                                                    l_ws,
+                                                    hash_log);
     size_t g_ws = comp_plan.launched_wi_count;
     cl_uint kernel_num_args = 0;
     int kernel_has_dbg = 0;
@@ -983,7 +977,7 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
     err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &g_ws, &l_ws, 0, NULL, &ev);
     clWaitForEvents(1, &ev);
     t->kernel_exec_us = (unsigned long)(get_us() - t1);
-    t->algo_config = (unsigned long)lz4_effective_hash_log();
+    t->algo_config = (unsigned long)hash_log;
 
     t1 = get_us();
     uint32_t* h_osizes = (uint32_t*)malloc(num_blocks * sizeof(uint32_t));
@@ -1635,7 +1629,7 @@ cl_program lz4_load_program(cl_context context, cl_device_id device, int hash_lo
     int dict_entry_bits = 32;
 
     lz4_effective_dict_mode_for_block(block_size, &dict_clear, &dict_entry_bits);
-    if (hash_log != 14) hash_log = lz4_effective_hash_log();
+    hash_log = lz4_sanitize_hash_log(hash_log);
 
     if (use_clbin && !dbg_enabled && dict_clear == 0 && dict_entry_bits == 32) {
         char bin_name[128];

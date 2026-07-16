@@ -25,6 +25,10 @@ extern long syscall(long number, ...);
 
 #define MAX_WORKERS_CAP 16
 #define LZ4_DAEMON_KERNEL_MODES 2
+#define LZ4_HASHLOG_MIN 11
+#define LZ4_HASHLOG_MAX 15
+#define LZ4_HASHLOG_COUNT (LZ4_HASHLOG_MAX - LZ4_HASHLOG_MIN + 1)
+#define LZ4_DAEMON_PROGRAM_SLOTS (LZ4_DAEMON_KERNEL_MODES * LZ4_HASHLOG_COUNT)
 
 enum {
     LZ4_DAEMON_MODE_CLEAR16 = 0,
@@ -34,8 +38,8 @@ enum {
 typedef struct {
     int id;
     cl_command_queue queue;
-    cl_kernel kernel_comp[LZ4_DAEMON_KERNEL_MODES];
-    cl_kernel kernel_decomp[LZ4_DAEMON_KERNEL_MODES];
+    cl_kernel kernel_comp[LZ4_DAEMON_PROGRAM_SLOTS];
+    cl_kernel kernel_decomp[LZ4_DAEMON_PROGRAM_SLOTS];
     lz4_gpu_workspace_t ws;
     pthread_t thread;
     int client_fd;
@@ -48,7 +52,7 @@ struct {
     cl_platform_id platform;
     cl_device_id device;
     cl_context context;
-    cl_program program_comp[LZ4_DAEMON_KERNEL_MODES];
+    cl_program program_comp[LZ4_DAEMON_PROGRAM_SLOTS];
     pthread_mutex_t compile_lock;
     worker_res_t workers[MAX_WORKERS_CAP];
     int active_workers;
@@ -59,6 +63,20 @@ struct {
 
 static int daemon_kernel_mode_for_block(uint32_t block_size) {
     return (block_size <= 64U * 1024U) ? LZ4_DAEMON_MODE_CLEAR16 : LZ4_DAEMON_MODE_EPOCH32;
+}
+
+static int daemon_hash_log_from_request(const request_t* req) {
+    int hash_log = req && req->hash_log ? req->hash_log : 14;
+    if (hash_log < LZ4_HASHLOG_MIN) hash_log = LZ4_HASHLOG_MIN;
+    if (hash_log > LZ4_HASHLOG_MAX) hash_log = LZ4_HASHLOG_MAX;
+    return hash_log;
+}
+
+static int daemon_program_slot(uint32_t block_size, int hash_log) {
+    int mode = daemon_kernel_mode_for_block(block_size);
+    if (hash_log < LZ4_HASHLOG_MIN) hash_log = LZ4_HASHLOG_MIN;
+    if (hash_log > LZ4_HASHLOG_MAX) hash_log = LZ4_HASHLOG_MAX;
+    return (hash_log - LZ4_HASHLOG_MIN) * LZ4_DAEMON_KERNEL_MODES + mode;
 }
 
 static int clamp_int(int v, int lo, int hi) {
@@ -234,7 +252,7 @@ static void cleanup_resources(void) {
     for (int i = 0; i < g_state.active_workers; i++) {
         pthread_join(g_state.workers[i].thread, NULL);
         pthread_mutex_lock(&g_state.workers[i].lock);
-        for (int m = 0; m < LZ4_DAEMON_KERNEL_MODES; m++) {
+        for (int m = 0; m < LZ4_DAEMON_PROGRAM_SLOTS; m++) {
             if (g_state.workers[i].kernel_comp[m]) {
                 clReleaseKernel(g_state.workers[i].kernel_comp[m]);
                 g_state.workers[i].kernel_comp[m] = NULL;
@@ -259,7 +277,7 @@ static void cleanup_resources(void) {
     }
 
     pthread_mutex_lock(&g_state.compile_lock);
-    for (int m = 0; m < LZ4_DAEMON_KERNEL_MODES; m++) {
+    for (int m = 0; m < LZ4_DAEMON_PROGRAM_SLOTS; m++) {
         if (g_state.program_comp[m]) {
             clReleaseProgram(g_state.program_comp[m]);
             g_state.program_comp[m] = NULL;
@@ -326,10 +344,11 @@ void process_request(worker_res_t* w, request_t* req, response_t* res) {
     t.ocl_setup_us = 0;
 
     if (req->mode == mode_compress) {
-        const int kernel_mode = daemon_kernel_mode_for_block((uint32_t)req->block_size);
+        const int hash_log = daemon_hash_log_from_request(req);
+        const int kernel_mode = daemon_program_slot((uint32_t)req->block_size, hash_log);
 
         pthread_mutex_lock(&g_state.compile_lock);
-        if (!g_state.program_comp[kernel_mode]) g_state.program_comp[kernel_mode] = lz4_load_program(g_state.context, g_state.device, 14, req->block_size);
+        if (!g_state.program_comp[kernel_mode]) g_state.program_comp[kernel_mode] = lz4_load_program(g_state.context, g_state.device, hash_log, req->block_size);
         cl_program prog = g_state.program_comp[kernel_mode];
         if (!w->kernel_comp[kernel_mode] && prog) {
             cl_int err;
@@ -340,12 +359,13 @@ void process_request(worker_res_t* w, request_t* req, response_t* res) {
 
         if (kernel) {
             ret = lz4_compress_core(g_state.context, w->queue, kernel, req->input_path, req->output_path,
-                                  req->block_size, req->acceleration, &w->ws, &t, req->local_size, 0);
+                                  req->block_size, req->acceleration, hash_log, &w->ws, &t, req->local_size, 0);
         }
     } else {
-        const int kernel_mode = daemon_kernel_mode_for_block((uint32_t)req->block_size);
+        const int hash_log = daemon_hash_log_from_request(req);
+        const int kernel_mode = daemon_program_slot((uint32_t)req->block_size, hash_log);
         pthread_mutex_lock(&g_state.compile_lock);
-        if (!g_state.program_comp[kernel_mode]) g_state.program_comp[kernel_mode] = lz4_load_program(g_state.context, g_state.device, 14, req->block_size);
+        if (!g_state.program_comp[kernel_mode]) g_state.program_comp[kernel_mode] = lz4_load_program(g_state.context, g_state.device, hash_log, req->block_size);
         cl_program prog = g_state.program_comp[kernel_mode];
         if (!w->kernel_decomp[kernel_mode] && prog) {
             cl_int err;

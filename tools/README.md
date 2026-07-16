@@ -22,16 +22,16 @@
 python3 tools/bench_lz4.py \
   --platform-id linux_xe \
   --samples /root/samples \
-  --engines gpu,native_cpu \
-  --gpu-block-sizes 64K \
-  --gpu-hashlogs 14 \
+  --engines gpu,native_cpu,hybrid \
+  --cpu-threads 1,2,4 \
+  --gpu-d-bits 13,14,15 \
   --bench-seconds 5 \
   --manual-rounds 6
 ```
 
 输出字段：
 
-- `comp_mbs_*` / `dec_mbs_*`：压缩/解压主吞吐；优先来自真实 manual 阶段的 kernel/span 字段，缺失时回退到 bench 阶段。
+- `comp_mbs_*` / `dec_mbs_*`：压缩/解压内核吞吐；优先来自真实 manual 阶段的 kernel/span 字段，缺失时回退到 bench 阶段。
 - `e2e_comp_mbs_*` / `e2e_dec_mbs_*`：端到端吞吐；真实压缩/解压路径，OpenCL 路径排除 OpenCL init/build。
 - `ratio_pct_*`：压缩率，数值越低表示压缩率越好。
 - `verify_ok` / `verify_all`：解压 hash 校验结果。
@@ -47,11 +47,11 @@ python3 tools/bench_lz4.py \
 ```bash
 python3 tools/bench_lz4_power_wrapper.py \
   --platform-id linux_xe \
-  --cpu-frequencies 2100,3400,NA \
-  --gpu-frequencies 1000,NA \
+  --cpu-frequencies 1200,1800,2400,3000,3600,NA \
+  --gpu-frequencies 400,700,1000,1300,NA \
   --output-dir exp_results/power_freq_runs/linux_xe_scan \
   -- \
-  --engines gpu,native_cpu \
+  --engines gpu,native_cpu,hybrid \
   --samples /root/samples \
   --bench-seconds 5 \
   --manual-rounds 6
@@ -63,3 +63,4 @@ python3 tools/bench_lz4_power_wrapper.py \
 - 数字或 `MHz`：固定绝对 MHz。
 - 百分比：相对设备可读最大频率换算。
 - GPU-only 只扫描 GPU 频率，CPU-only 只扫描 CPU 频率，hybrid mixed 才扫描 CPU×GPU 矩阵。
+- `bench_lz4.py` 默认会同时覆盖 `gpu`、`native_cpu` 和 `hybrid`；如果只想看某一个设备，请显式限制 `--engines`。

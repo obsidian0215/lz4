@@ -16,7 +16,7 @@ int is_daemon_running(void) {
 }
 
 static int do_daemon_op(int mode, const char* input, const char* output, int block_size, int acceleration, int local_size,
-                        uint32_t cpu_share_pct, uint32_t cpu_threads, uint32_t adaptive) {
+                        int hash_log, uint32_t cpu_share_pct, uint32_t cpu_threads, uint32_t adaptive) {
     int sock;
     struct sockaddr_un addr;
     request_t req;
@@ -53,6 +53,7 @@ static int do_daemon_op(int mode, const char* input, const char* output, int blo
     req.block_size = block_size;
     req.acceleration = acceleration;
     req.local_size = local_size;
+    req.hash_log = hash_log;
     req.cpu_share_pct = cpu_share_pct;
     req.cpu_threads = cpu_threads;
     req.adaptive = adaptive;
@@ -85,7 +86,7 @@ static int do_daemon_op(int mode, const char* input, const char* output, int blo
 }
 
 int run_lz4_client(int mode, const char* input_path, const char* output_path, int block_size, int acceleration, int local_size,
-                   uint32_t cpu_share_pct, uint32_t cpu_threads, uint32_t adaptive) {
+                   int hash_log, uint32_t cpu_share_pct, uint32_t cpu_threads, uint32_t adaptive) {
     return do_daemon_op(mode, input_path, output_path, block_size, acceleration, local_size,
-                        cpu_share_pct, cpu_threads, adaptive);
+                        hash_log, cpu_share_pct, cpu_threads, adaptive);
 }

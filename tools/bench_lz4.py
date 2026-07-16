@@ -2,6 +2,7 @@
 import argparse
 import csv
 import hashlib
+import json
 import os
 import platform
 import re
@@ -27,23 +28,21 @@ DEFAULT_GPU_BIN = REPO_ROOT / "lz4_gpu" / f"lz4_gpu{EXEEXT}"
 DEFAULT_HYBRID_BIN = REPO_ROOT / "lz4_hybrid" / f"lz4_hybrid{EXEEXT}"
 
 DEFAULT_BENCH_SECONDS = 5
-DEFAULT_MANUAL_ROUNDS = 6
-# DEFAULT_ENGINES = ["gpu", "native_cpu", "hybrid"]
-DEFAULT_ENGINES = ["gpu", "native_cpu"]
-DEFAULT_CPU_THREADS = [1]
-DEFAULT_CPU_BLOCK_SIZES = ["64K"]
-DEFAULT_GPU_BLOCK_SIZES = ["64K"]
+DEFAULT_MANUAL_ROUNDS = 9
+# Default includes GPU, native CPU, and OpenCL hybrid boundaries.
+DEFAULT_ENGINES = ["gpu", "native_cpu", "hybrid"]
+DEFAULT_CPU_THREADS = [1, 2, 4]
+DEFAULT_CPU_BLOCK_SIZES = ["32K", "48K", "64K"]
+DEFAULT_GPU_BLOCK_SIZES = ["32K", "48K", "64K"]
 DEFAULT_LOCAL_SIZES = [1]
 DEFAULT_GPU_ACCELS = [1]
-DEFAULT_GPU_HASHLOGS = [14]
-DEFAULT_GPU_DICT_POOL_MBS = ["auto"]
-DEFAULT_GPU_DICT_SLOTS = ["auto"]
-DEFAULT_GPU_DICT_SLOT_FACTORS = ["auto"]
-DEFAULT_HYBRID_BLOCK_SIZES = ["64K"]
-DEFAULT_HYBRID_GPU_RATIOS = [0.3, 0.5, 0.7]
-DEFAULT_HYBRID_CPU_THREADS = [1]
+DEFAULT_GPU_D_BITS = [13, 14, 15]
+DEFAULT_HYBRID_BLOCK_SIZES = ["32K", "48K", "64K"]
+DEFAULT_HYBRID_GPU_RATIOS = [0, 0.5, 1]
+DEFAULT_HYBRID_CPU_THREADS = [1, 2, 4]
 DEFAULT_HYBRID_LOCAL_SIZES = [1]
 DEFAULT_HYBRID_ACCELS = [1]
+DEFAULT_HYBRID_D_BITS = [13, 14, 15]
 
 BENCH_COMP_RE = re.compile(
     r"Bench\s+Compress\s*:\s*kernel_tp=([0-9]+(?:\.[0-9]+)?)\s*MB/s.*?ratio=([0-9]+(?:\.[0-9]+)?)%",
@@ -61,19 +60,42 @@ TOTAL_RE = re.compile(r"TOTAL\s+INCLUSIVE\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*ms", re.
 DONE_RE = re.compile(r"Done\s+in\s*([0-9]+(?:\.[0-9]+)?)\s*s", re.IGNORECASE)
 OCI_RE = re.compile(r"OCI\s+Setup\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*ms", re.IGNORECASE)
 GENERIC_TP_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*MB/s", re.IGNORECASE)
+SPLIT_TOTAL_RE = re.compile(
+    r"\[LZ4-SPLIT\]\[(?:C|D)\].*?\bin\s+([0-9]+(?:\.[0-9]+)?)\s*ms.*?"
+    r"\binit_load=([0-9]+(?:\.[0-9]+)?)\s*ms",
+    re.IGNORECASE,
+)
+SPLIT_LINE_RE = re.compile(
+    r"\[LZ4-SPLIT\]\[(C|D)\].*?:\s*(\d+)\s*->\s*(\d+).*?"
+    r"span=([0-9]+(?:\.[0-9]+)?)\s*ms\s+gpu_kernel=([0-9]+(?:\.[0-9]+)?)\s*ms\s+cpu_kernel=([0-9]+(?:\.[0-9]+)?)\s*ms",
+    re.IGNORECASE,
+)
 
 LZ4_DAEMON_SOCKET = Path("/tmp/lz4_gpu_daemon.sock")
 LZ4_DAEMON_PIDFILE = Path("/tmp/lz4_gpu_daemon.pid")
 
 RAW_FIELDS = [
     "sample", "engine", "phase", "round",
-    "block", "local_size", "accel", "hashlog", "gpu_dict_pool_mb", "gpu_dict_slots", "gpu_dict_slot_factor", "gpu_ratio", "cpu_threads",
+    "block", "local_size", "accel", "d_bits", "gpu_ratio", "cpu_threads",
     "input_bytes", "compressed_bytes", "ratio_pct", "verify_ok",
     "bench_comp_kernel_mbs", "bench_dec_kernel_mbs",
     "manual_comp_kernel_mbs", "manual_dec_kernel_mbs",
     "manual_comp_no_ocl_mbs", "manual_dec_no_ocl_mbs",
     "manual_comp_seconds", "manual_dec_seconds",
     "status", "error",
+]
+
+EVIDENCE_RUN_DIR = None
+EVIDENCE_LOG_DIR = None
+COMMANDS_CSV_PATH = None
+COMMAND_COUNTER = 0
+
+PLOT_METRICS = [
+    "ratio_pct",
+    "comp_mbs",
+    "dec_mbs",
+    "e2e_comp_mbs",
+    "e2e_dec_mbs",
 ]
 
 
@@ -106,7 +128,10 @@ def _try_build_lz4_cpu_binary():
 
     for cmd, out_bins in build_plans:
         try:
+            start = time.perf_counter()
             res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            elapsed = time.perf_counter() - start
+            log_command(cmd, None, res.returncode, ((res.stdout or "") + (res.stderr or "")), elapsed)
             if res.returncode == 0:
                 for out_bin in out_bins:
                     if _is_executable_file(out_bin):
@@ -121,6 +146,13 @@ def resolve_lz4_cpu_binary(preferred):
     env_bin = os.environ.get("LZ4_CPU_BIN")
     if env_bin:
         candidates.append(env_bin)
+    candidates.extend([
+        "/usr/bin/lz4",
+        "/bin/lz4",
+    ])
+    system_bin = shutil.which("lz4")
+    if system_bin:
+        candidates.append(system_bin)
     if preferred:
         candidates.append(str(preferred))
     candidates.extend([
@@ -157,6 +189,27 @@ def int_list(value):
 
 def float_list(value):
     return [float(x.strip()) for x in str(value).split(",") if x.strip()]
+
+
+def ratio_list(value):
+    out = []
+    for item in str(value).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item.lower() == "adaptive":
+            out.append("adaptive")
+        else:
+            out.append(str(float(item)))
+    return out
+
+
+def lz4_cli_block_arg(block):
+    text = str(block).strip()
+    m = re.fullmatch(r"(\d+)\s*([Kk][Bb]?)", text)
+    if m:
+        return str(int(m.group(1)) * 1024)
+    return text
 
 
 def mb(byte_count):
@@ -221,6 +274,206 @@ def choose_metric_values(primary_rows, primary_field, fallback_rows, fallback_fi
     return numeric_values([r.get(fallback_field, "") for r in fallback_rows])
 
 
+def write_json(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False, sort_keys=False)
+        handle.write("\n")
+
+
+def setup_evidence_logging(run_dir):
+    global EVIDENCE_RUN_DIR, EVIDENCE_LOG_DIR, COMMANDS_CSV_PATH, COMMAND_COUNTER
+    EVIDENCE_RUN_DIR = Path(run_dir)
+    EVIDENCE_LOG_DIR = EVIDENCE_RUN_DIR / "logs"
+    EVIDENCE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    COMMANDS_CSV_PATH = EVIDENCE_RUN_DIR / "commands.csv"
+    COMMAND_COUNTER = 0
+    write_csv(COMMANDS_CSV_PATH, [], [
+        "cmd_id", "timestamp", "cwd", "returncode", "wall_s", "command", "stdout_log",
+    ])
+
+
+def log_command(cmd, cwd, returncode, output, wall_s):
+    global COMMAND_COUNTER
+    if EVIDENCE_LOG_DIR is None or COMMANDS_CSV_PATH is None:
+        return
+    COMMAND_COUNTER += 1
+    cmd_id = f"cmd_{COMMAND_COUNTER:05d}"
+    log_path = EVIDENCE_LOG_DIR / f"{cmd_id}.log"
+    cmd_text = subprocess.list2cmdline([str(x) for x in cmd])
+    with open(log_path, "w", encoding="utf-8", errors="replace") as handle:
+        handle.write(f"$ {cmd_text}\n")
+        handle.write(f"cwd={str(cwd) if cwd else os.getcwd()}\n")
+        handle.write(f"returncode={returncode}\n")
+        handle.write(f"wall_s={float(wall_s or 0.0):.9f}\n\n")
+        handle.write(output or "")
+    with open(COMMANDS_CSV_PATH, "a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=[
+            "cmd_id", "timestamp", "cwd", "returncode", "wall_s", "command", "stdout_log",
+        ])
+        writer.writerow({
+            "cmd_id": cmd_id,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "cwd": str(cwd) if cwd else os.getcwd(),
+            "returncode": returncode,
+            "wall_s": f"{float(wall_s or 0.0):.9f}",
+            "command": cmd_text,
+            "stdout_log": str(log_path.relative_to(EVIDENCE_RUN_DIR)) if EVIDENCE_RUN_DIR else str(log_path),
+        })
+
+
+def collect_relevant_env(prefixes):
+    selected = {}
+    for key in sorted(os.environ):
+        if any(key.startswith(prefix) for prefix in prefixes):
+            selected[key] = os.environ.get(key, "")
+    return selected
+
+
+def file_fingerprint(path):
+    p = Path(path)
+    if not str(path).strip():
+        return {"path": str(path), "exists": False}
+    try:
+        st = p.stat()
+        return {
+            "path": str(p),
+            "exists": True,
+            "size_bytes": st.st_size,
+            "mtime": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(st.st_mtime)),
+        }
+    except OSError:
+        return {"path": str(p), "exists": False}
+
+
+def git_metadata(root):
+    def _git(args):
+        try:
+            res = subprocess.run(
+                ["git", *args],
+                cwd=str(root),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=5,
+            )
+            return (res.stdout or "").strip() if res.returncode == 0 else ""
+        except Exception:
+            return ""
+    return {
+        "commit": _git(["rev-parse", "HEAD"]),
+        "branch": _git(["rev-parse", "--abbrev-ref", "HEAD"]),
+        "status_short": _git(["status", "--short"]),
+    }
+
+
+def write_samples_manifest(path, samples):
+    rows = []
+    for sample in samples:
+        st = sample.stat()
+        rows.append({
+            "sample": sample.name,
+            "path": str(sample.resolve()),
+            "size_bytes": st.st_size,
+            "mtime": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(st.st_mtime)),
+        })
+    write_csv(path, rows, ["sample", "path", "size_bytes", "mtime"])
+
+
+def build_plot_metrics(per_file, aggregate):
+    rows = []
+    config_fields = ["engine", "block", "local_size", "accel", "d_bits", "gpu_ratio", "cpu_threads"]
+    for row in per_file:
+        out = {
+            "scope": "file",
+            "sample": row.get("sample", ""),
+            **{field: row.get(field, "") for field in config_fields},
+        }
+        for metric in PLOT_METRICS:
+            for suffix in ("n", "mean", "median", "stdev", "cv_pct", "ci95_half"):
+                out[f"{metric}_{suffix}"] = row.get(f"{metric}_{suffix}", "")
+        rows.append(out)
+    for row in aggregate:
+        out = {
+            "scope": "aggregate",
+            "sample": "ALL",
+            **{field: row.get(field, "") for field in config_fields},
+        }
+        for metric in PLOT_METRICS:
+            for suffix in ("n", "mean", "median", "stdev", "cv_pct", "ci95_half"):
+                out[f"{metric}_{suffix}"] = row.get(f"{metric}_{suffix}", "")
+        rows.append(out)
+    return rows
+
+
+def write_run_manifest(run_dir, args, samples, run_cpu, run_gpu, run_hybrid):
+    payload = {
+        "schema_version": 1,
+        "codec": "lz4",
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "platform_id": args.platform_id,
+        "argv": sys.argv,
+        "cwd": os.getcwd(),
+        "repo_root": str(REPO_ROOT),
+        "git": git_metadata(REPO_ROOT),
+        "python": sys.version,
+        "system": {
+            "node": platform.node(),
+            "system": platform.system(),
+            "release": platform.release(),
+            "version": platform.version(),
+            "machine": platform.machine(),
+            "processor": platform.processor(),
+        },
+        "environment": collect_relevant_env(("LZ4_", "FORCE_OPENCL", "OCL_", "OPENCL", "CL_")),
+        "parameters": {
+            "bench_seconds": args.bench_seconds,
+            "manual_rounds": args.manual_rounds,
+            "engines": args.engines,
+            "samples": args.samples,
+            "single_file": args.single_file,
+            "limit": args.limit,
+            "use_daemon": bool(args.use_daemon),
+        },
+        "binaries": {
+            "cpu_bin": file_fingerprint(args.cpu_bin) if run_cpu else None,
+            "gpu_bin": file_fingerprint(args.gpu_bin) if run_gpu else None,
+            "hybrid_bin": file_fingerprint(args.hybrid_bin) if run_hybrid else None,
+        },
+        "samples": [
+            {"sample": s.name, "path": str(s.resolve()), "size_bytes": s.stat().st_size}
+            for s in samples
+        ],
+        "artifacts": [
+            "run_manifest.json",
+            "environment.txt",
+            "commands.csv",
+            "logs/",
+            "samples_manifest.csv",
+            "raw.csv",
+            "per_file_summary.csv",
+            "aggregate.csv",
+            "plot_metrics.csv",
+            "run_meta.txt",
+        ],
+    }
+    write_json(Path(run_dir) / "run_manifest.json", payload)
+
+
+def write_environment_txt(path):
+    lines = [
+        f"timestamp={time.strftime('%Y-%m-%dT%H:%M:%S%z')}",
+        f"platform={platform.platform()}",
+        f"python={sys.version.replace(os.linesep, ' ')}",
+        f"cwd={os.getcwd()}",
+        f"repo_root={REPO_ROOT}",
+    ]
+    for key, value in collect_relevant_env(("LZ4_", "FORCE_OPENCL", "OCL_", "OPENCL", "CL_")).items():
+        lines.append(f"env.{key}={value}")
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def host_id():
     return platform.node() or os.environ.get("COMPUTERNAME") or "unknown"
 
@@ -253,6 +506,7 @@ def run_cmd(cmd, cwd=None, env=None, timeout=None):
         check=False,
     )
     elapsed = time.perf_counter() - start
+    log_command(cmd, cwd, proc.returncode, proc.stdout or "", elapsed)
     return proc.returncode, proc.stdout or "", elapsed
 
 
@@ -360,6 +614,15 @@ def daemon_session(exe_path, enabled):
 
 def parse_total_seconds(text, wall_seconds, subtract_oci=False):
     total = None
+    split = SPLIT_TOTAL_RE.findall(text or "")
+    if split:
+        total_ms, init_ms = split[-1]
+        total = float(total_ms) / 1000.0
+        if subtract_oci:
+            init_s = float(init_ms) / 1000.0
+            if 0.0 < init_s < total:
+                total -= init_s
+        return max(0.0, total)
     m = TOTAL_RE.findall(text or "")
     if m:
         total = float(m[-1]) / 1000.0
@@ -408,6 +671,13 @@ def parse_bench_stable(text):
 
 
 def parse_manual_kernel_tp(text):
+    split_matches = SPLIT_LINE_RE.findall(text or "")
+    if split_matches:
+        mode, in_b, out_b, span_ms, gpu_ms, cpu_ms = split_matches[-1]
+        denom_ms = max(float(gpu_ms), float(cpu_ms), float(span_ms))
+        bytes_used = int(in_b) if mode.upper() == "C" else int(out_b)
+        if denom_ms > 0:
+            return mb(bytes_used) / (denom_ms / 1000.0)
     vals = GENERIC_TP_RE.findall(text or "")
     if not vals:
         return None
@@ -415,11 +685,6 @@ def parse_manual_kernel_tp(text):
         return float(vals[-1])
     except Exception:
         return None
-
-
-def gpu_hashlog_use_cli(exe):
-    name = str(Path(exe)).lower()
-    return "lz4_experimental" in name or "experimental" in name
 
 
 def discover_samples(samples_dir, limit, single_file):
@@ -453,10 +718,7 @@ def base_row(args, sample, engine, phase, round_id, cfg):
         "block": cfg.get("block", ""),
         "local_size": cfg.get("local_size", ""),
         "accel": cfg.get("accel", ""),
-        "hashlog": cfg.get("hashlog", ""),
-        "gpu_dict_pool_mb": cfg.get("gpu_dict_pool_mb", ""),
-        "gpu_dict_slots": cfg.get("gpu_dict_slots", ""),
-        "gpu_dict_slot_factor": cfg.get("gpu_dict_slot_factor", ""),
+        "d_bits": cfg.get("d_bits", ""),
         "gpu_ratio": cfg.get("gpu_ratio", ""),
         "cpu_threads": cfg.get("cpu_threads", ""),
         "input_bytes": sample.stat().st_size,
@@ -480,11 +742,12 @@ def run_cpu_case(args, sample, threads, block, tmp_root):
     exe = Path(args.cpu_bin).resolve()
     cfg = {"block": block, "cpu_threads": threads}
     rows = []
+    cli_block = lz4_cli_block_arg(block)
 
     input_bytes = sample.stat().st_size
     original_hash = sha256(sample)
 
-    bench_cmd = [exe, "-q", f"-B{block}", f"-T{threads}", "-b1", sample]
+    bench_cmd = [exe, "-q", f"-B{cli_block}", "-b1", sample]
     row = base_row(args, sample, "lz4_cpu", "bench", 0, cfg)
     try:
         rc, out, _ = run_cmd(bench_cmd, timeout=args.timeout)
@@ -506,7 +769,7 @@ def run_cpu_case(args, sample, threads, block, tmp_root):
         dec_path = tmp_root / f"{sample.name}.cpu.{round_id}.dec"
         row = base_row(args, sample, "lz4_cpu", "manual", round_id, cfg)
         try:
-            comp_cmd = [exe, "-v", "-z", "-f", f"-B{block}", f"-T{threads}", sample, comp_path]
+            comp_cmd = [exe, "-v", "-z", "-f", f"-B{cli_block}", sample, comp_path]
             rc_c, out_c, wall_c = run_cmd(comp_cmd, timeout=args.timeout)
             if rc_c != 0 or not comp_path.exists():
                 raise RuntimeError(f"cpu compress failed rc={rc_c}: {out_c[-500:]}")
@@ -542,23 +805,19 @@ def run_cpu_case(args, sample, threads, block, tmp_root):
     return rows
 
 
-def run_gpu_case(args, sample, block, local_size, accel, hashlog, dict_pool_mb, dict_slots, dict_slot_factor, tmp_root, use_daemon=False):
+def run_gpu_case(args, sample, block, local_size, accel, d_bits, tmp_root, use_daemon=False):
     exe = Path(args.gpu_bin).resolve()
-    cfg = {"block": block, "local_size": local_size, "accel": accel, "hashlog": hashlog, "gpu_dict_pool_mb": dict_pool_mb, "gpu_dict_slots": dict_slots, "gpu_dict_slot_factor": dict_slot_factor, "gpu_ratio": "1", "cpu_threads": ""}
+    cfg = {
+        "block": block,
+        "local_size": local_size,
+        "accel": accel,
+        "d_bits": d_bits,
+        "gpu_ratio": "1",
+        "cpu_threads": "",
+    }
     rows = []
-    use_hashlog = str(hashlog).strip().lower() not in ("", "default", "none", "na")
-    hashlog_via_cli = use_hashlog and gpu_hashlog_use_cli(exe)
-    env = {}
-    if use_hashlog and not hashlog_via_cli:
-        env["LZ4_GPU_HASHLOG"] = str(hashlog)
-    if str(dict_pool_mb).strip().lower() not in ("", "auto", "default", "none", "na"):
-        env["LZ4_GPU_COMP_DICT_POOL_MB"] = str(dict_pool_mb)
-    if str(dict_slots).strip().lower() not in ("", "auto", "default", "none", "na"):
-        env["LZ4_GPU_COMP_DICT_SLOTS"] = str(dict_slots)
-    if str(dict_slot_factor).strip().lower() not in ("", "auto", "default", "none", "na"):
-        env["LZ4_GPU_COMP_DICT_SLOT_FACTOR"] = str(dict_slot_factor)
-    if not env:
-        env = None
+    use_d_bits = str(d_bits).strip().lower() not in ("", "default", "none", "na")
+    env = None
     sample_arg = sample.resolve()
 
     input_bytes = sample.stat().st_size
@@ -569,8 +828,8 @@ def run_gpu_case(args, sample, block, local_size, accel, hashlog, dict_pool_mb, 
     row = base_row(args, sample, "lz4_gpu", "bench", 0, cfg)
     try:
         bench_cmd = [exe, "--bench", args.bench_seconds, "-B", block, "--local", local_size, "-a", accel]
-        if hashlog_via_cli:
-            bench_cmd += ["--hashlog", hashlog]
+        if use_d_bits:
+            bench_cmd += ["--d-bits", d_bits]
         bench_cmd += [sample_arg]
         rc, out, _ = run_cmd(bench_cmd, cwd=cwd, env=env, timeout=args.timeout)
         parsed = parse_bench_stable(out)
@@ -591,8 +850,8 @@ def run_gpu_case(args, sample, block, local_size, accel, hashlog, dict_pool_mb, 
         row = base_row(args, sample, "lz4_gpu", "manual", round_id, cfg)
         try:
             comp_cmd = [exe, *daemon_prefix, "-v", "-B", block, "--local", local_size, "-a", accel]
-            if hashlog_via_cli:
-                comp_cmd += ["--hashlog", hashlog]
+            if use_d_bits:
+                comp_cmd += ["--d-bits", d_bits]
             comp_cmd += ["-o", comp_path, sample_arg]
             rc_c, out_c, wall_c = run_cmd(comp_cmd, cwd=cwd, env=env, timeout=args.timeout)
             if rc_c != 0 or not comp_path.exists():
@@ -629,12 +888,13 @@ def run_gpu_case(args, sample, block, local_size, accel, hashlog, dict_pool_mb, 
     return rows
 
 
-def run_hybrid_case(args, sample, block, local_size, accel, ratio, cpu_threads, tmp_root, use_daemon=False):
+def run_hybrid_case(args, sample, block, local_size, accel, d_bits, ratio, cpu_threads, tmp_root, use_daemon=False):
     exe = Path(args.hybrid_bin).resolve()
     cfg = {
         "block": block,
         "local_size": local_size,
         "accel": accel,
+        "d_bits": d_bits,
         "gpu_ratio": ratio,
         "cpu_threads": cpu_threads,
     }
@@ -645,23 +905,11 @@ def run_hybrid_case(args, sample, block, local_size, accel, ratio, cpu_threads, 
     cwd = exe.parent
     daemon_prefix = ["--use-daemon"] if use_daemon else []
     sample_arg = sample.resolve()
+    use_d_bits = str(d_bits).strip().lower() not in ("", "default", "none", "na")
 
     row = base_row(args, sample, "lz4_hybrid", "bench", 0, cfg)
-    try:
-        bench_cmd = [exe, "--bench", args.bench_seconds, "-b", block.lower(), "-l", local_size, "-a", accel, "-T", cpu_threads]
-        bench_cmd += ["--gpu-ratio", ratio]
-        bench_cmd += [sample_arg]
-        rc, out, _ = run_cmd(bench_cmd, cwd=cwd, timeout=args.timeout)
-        parsed = parse_bench_stable(out)
-        if rc != 0 or not parsed:
-            raise RuntimeError(f"hybrid bench failed rc={rc}: {out[-500:]}")
-        row["ratio_pct"] = parsed["ratio_pct"]
-        row["verify_ok"] = parsed["verify_ok"]
-        row["bench_comp_kernel_mbs"] = parsed["comp_kernel_mbs"]
-        row["bench_dec_kernel_mbs"] = parsed["dec_kernel_mbs"]
-    except Exception as exc:
-        row["status"] = "error"
-        row["error"] = str(exc)
+    row["status"] = "skipped"
+    row["error"] = "hybrid split bench uses manual real-path rows"
     rows.append(row)
 
     for round_id in range(args.manual_rounds):
@@ -669,23 +917,19 @@ def run_hybrid_case(args, sample, block, local_size, accel, ratio, cpu_threads, 
         dec_path = tmp_root / f"{sample.name}.hybrid.{round_id}.dec"
         row = base_row(args, sample, "lz4_hybrid", "manual", round_id, cfg)
         try:
-            if use_daemon:
-                comp_cmd = [exe, *daemon_prefix, "-v", "-B", block, "--local", local_size, "-a", accel, "--cpu-threads", cpu_threads]
-                comp_cmd += ["--gpu-ratio", ratio]
-            else:
-                comp_cmd = [exe, *daemon_prefix, "-v", "-b", block.lower(), "-l", local_size, "-a", accel, "-T", cpu_threads]
-                comp_cmd += ["--gpu-ratio", ratio]
+            comp_cmd = [exe, *daemon_prefix, "-v", "-B", block, "--local", local_size, "-a", accel, "--cpu-threads", cpu_threads]
+            if use_d_bits:
+                comp_cmd += ["--d-bits", d_bits]
+            comp_cmd += ["--gpu-ratio", ratio]
             comp_cmd += ["-o", comp_path, sample_arg]
             rc_c, out_c, wall_c = run_cmd(comp_cmd, cwd=cwd, timeout=args.timeout)
             if rc_c != 0 or not comp_path.exists():
                 raise RuntimeError(f"hybrid compress failed rc={rc_c}: {out_c[-500:]}")
 
-            if use_daemon:
-                dec_cmd = [exe, *daemon_prefix, "-v", "-d", "--cpu-threads", cpu_threads]
-                dec_cmd += ["--gpu-ratio", ratio]
-            else:
-                dec_cmd = [exe, *daemon_prefix, "-v", "-d", "-T", cpu_threads]
-                dec_cmd += ["--gpu-ratio", ratio]
+            dec_cmd = [exe, *daemon_prefix, "-v", "-d", "--cpu-threads", cpu_threads]
+            if use_d_bits:
+                dec_cmd += ["--d-bits", d_bits]
+            dec_cmd += ["--gpu-ratio", ratio]
             dec_cmd += ["-o", dec_path, comp_path]
             rc_d, out_d, wall_d = run_cmd(dec_cmd, cwd=cwd, timeout=args.timeout)
             if rc_d != 0 or not dec_path.exists():
@@ -721,10 +965,7 @@ def case_key(row):
     return (
         row["sample"], row["engine"],
         row["block"], row["local_size"], row["accel"],
-        row.get("hashlog", ""),
-        row.get("gpu_dict_pool_mb", ""),
-        row.get("gpu_dict_slots", ""),
-        row.get("gpu_dict_slot_factor", ""),
+        row.get("d_bits", ""),
         row["gpu_ratio"], row["cpu_threads"],
     )
 
@@ -746,10 +987,7 @@ def summarize(raw_rows):
             "block": first.get("block", ""),
             "local_size": first.get("local_size", ""),
             "accel": first.get("accel", ""),
-            "hashlog": first.get("hashlog", ""),
-            "gpu_dict_pool_mb": first.get("gpu_dict_pool_mb", ""),
-            "gpu_dict_slots": first.get("gpu_dict_slots", ""),
-            "gpu_dict_slot_factor": first.get("gpu_dict_slot_factor", ""),
+            "d_bits": first.get("d_bits", ""),
             "gpu_ratio": first.get("gpu_ratio", ""),
             "cpu_threads": first.get("cpu_threads", ""),
             "input_bytes": first.get("input_bytes", ""),
@@ -770,10 +1008,7 @@ def summarize(raw_rows):
         key = (
             row["engine"],
             row["block"], row["local_size"], row["accel"],
-            row.get("hashlog", ""),
-            row.get("gpu_dict_pool_mb", ""),
-            row.get("gpu_dict_slots", ""),
-            row.get("gpu_dict_slot_factor", ""),
+            row.get("d_bits", ""),
             row["gpu_ratio"], row["cpu_threads"],
         )
         aggregate_grouped.setdefault(key, []).append(row)
@@ -781,30 +1016,22 @@ def summarize(raw_rows):
     aggregate = []
     for _, rows in sorted(aggregate_grouped.items()):
         first = rows[0]
-        aggregate.append({
+        record = {
             "engine": first["engine"],
             "block": first["block"],
             "local_size": first["local_size"],
             "accel": first["accel"],
-            "hashlog": first.get("hashlog", ""),
-            "gpu_dict_pool_mb": first.get("gpu_dict_pool_mb", ""),
-            "gpu_dict_slots": first.get("gpu_dict_slots", ""),
-            "gpu_dict_slot_factor": first.get("gpu_dict_slot_factor", ""),
+            "d_bits": first.get("d_bits", ""),
             "gpu_ratio": first["gpu_ratio"],
             "cpu_threads": first["cpu_threads"],
             "samples": len(rows),
             "verify_all": all(bool(r["ok"]) for r in rows),
-            "ratio_pct_median_of_files": median([r["ratio_pct_median"] for r in rows]),
-            "ratio_pct_mean_of_files": mean([r["ratio_pct_median"] for r in rows]),
-            "comp_mbs_median_of_files": median([r["comp_mbs_median"] for r in rows]),
-            "comp_mbs_mean_of_files": mean([r["comp_mbs_median"] for r in rows]),
-            "dec_mbs_median_of_files": median([r["dec_mbs_median"] for r in rows]),
-            "dec_mbs_mean_of_files": mean([r["dec_mbs_median"] for r in rows]),
-            "e2e_comp_mbs_median_of_files": median([r["e2e_comp_mbs_median"] for r in rows]),
-            "e2e_comp_mbs_mean_of_files": mean([r["e2e_comp_mbs_median"] for r in rows]),
-            "e2e_dec_mbs_median_of_files": median([r["e2e_dec_mbs_median"] for r in rows]),
-            "e2e_dec_mbs_mean_of_files": mean([r["e2e_dec_mbs_median"] for r in rows]),
-        })
+        }
+        for metric in PLOT_METRICS:
+            add_metric_stats(record, metric, [r.get(f"{metric}_median", "") for r in rows])
+            record[f"{metric}_median_of_files"] = record.get(f"{metric}_median")
+            record[f"{metric}_mean_of_files"] = record.get(f"{metric}_mean")
+        aggregate.append(record)
     return per_file, aggregate
 
 
@@ -833,16 +1060,14 @@ def run_all(args):
     gpu_blocks = str_list(args.gpu_block_sizes)
     local_sizes = [str(x) for x in int_list(args.local_sizes)]
     gpu_accels = [str(x) for x in int_list(args.gpu_accels)]
-    gpu_hashlogs = str_list(args.gpu_hashlogs)
-    gpu_dict_pool_mbs = str_list(args.gpu_dict_pool_mbs)
-    gpu_dict_slots = str_list(args.gpu_dict_slots)
-    gpu_dict_slot_factors = str_list(args.gpu_dict_slot_factors)
+    gpu_d_bits = str_list(args.gpu_d_bits)
 
     hybrid_blocks = str_list(args.hybrid_block_sizes)
-    hybrid_ratios = [str(x) for x in float_list(args.hybrid_gpu_ratios)]
+    hybrid_ratios = ratio_list(args.hybrid_gpu_ratios)
     hybrid_cpu_threads = [str(x) for x in int_list(args.hybrid_cpu_threads)]
     hybrid_local_sizes = [str(x) for x in int_list(args.hybrid_local_sizes)]
     hybrid_accels = [str(x) for x in int_list(args.hybrid_accels)]
+    hybrid_d_bits = str_list(args.hybrid_d_bits)
 
     engines = set(str_list(args.engines)) if str(args.engines).strip() else {"gpu", "native_cpu", "hybrid"}
     run_cpu = "native_cpu" in engines
@@ -858,6 +1083,7 @@ def run_all(args):
         print(f"[bench_lz4] cpu_bin={args.cpu_bin}")
 
     run_dir = make_run_dir(args.results_dir)
+    setup_evidence_logging(run_dir)
     tmp_root = run_dir / "tmp"
     raw_rows = []
 
@@ -877,11 +1103,8 @@ def run_all(args):
                     for block in gpu_blocks:
                         for local_size in local_sizes:
                             for accel in gpu_accels:
-                                for hashlog in gpu_hashlogs:
-                                    for dict_pool_mb in gpu_dict_pool_mbs:
-                                        for dict_slots in gpu_dict_slots:
-                                            for dict_slot_factor in gpu_dict_slot_factors:
-                                                raw_rows.extend(run_gpu_case(args, sample, block, local_size, accel, hashlog, dict_pool_mb, dict_slots, dict_slot_factor, tmp_root, use_daemon=gpu_daemon_active))
+                                for d_bits in gpu_d_bits:
+                                    raw_rows.extend(run_gpu_case(args, sample, block, local_size, accel, d_bits, tmp_root, use_daemon=gpu_daemon_active))
 
             if run_hybrid:
                 with daemon_session(args.hybrid_bin, args.use_daemon) as hybrid_daemon_active:
@@ -890,19 +1113,21 @@ def run_all(args):
                             for cpu_threads_h in hybrid_cpu_threads:
                                 for local_size in hybrid_local_sizes:
                                     for accel in hybrid_accels:
-                                        raw_rows.extend(
-                                            run_hybrid_case(
-                                                args,
-                                                sample,
-                                                block,
-                                                local_size,
-                                                accel,
-                                                ratio,
-                                                cpu_threads_h,
-                                                tmp_root,
-                                                use_daemon=hybrid_daemon_active,
+                                        for d_bits in hybrid_d_bits:
+                                            raw_rows.extend(
+                                                run_hybrid_case(
+                                                    args,
+                                                    sample,
+                                                    block,
+                                                    local_size,
+                                                    accel,
+                                                    d_bits,
+                                                    ratio,
+                                                    cpu_threads_h,
+                                                    tmp_root,
+                                                    use_daemon=hybrid_daemon_active,
+                                                )
                                             )
-                                        )
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
@@ -911,12 +1136,19 @@ def run_all(args):
     raw_path = run_dir / "raw.csv"
     per_file_path = run_dir / "per_file_summary.csv"
     aggregate_path = run_dir / "aggregate.csv"
+    plot_path = run_dir / "plot_metrics.csv"
 
     write_csv(raw_path, raw_rows, RAW_FIELDS)
     if per_file:
         write_csv(per_file_path, per_file, list(per_file[0].keys()))
     if aggregate:
         write_csv(aggregate_path, aggregate, list(aggregate[0].keys()))
+    plot_rows = build_plot_metrics(per_file, aggregate)
+    if plot_rows:
+        write_csv(plot_path, plot_rows, list(plot_rows[0].keys()))
+    write_samples_manifest(run_dir / "samples_manifest.csv", samples)
+    write_environment_txt(run_dir / "environment.txt")
+    write_run_manifest(run_dir, args, samples, run_cpu, run_gpu, run_hybrid)
 
     with open(run_dir / "run_meta.txt", "w", encoding="utf-8") as handle:
         handle.write(f"argv={' '.join(sys.argv)}\n")
@@ -925,10 +1157,18 @@ def run_all(args):
         handle.write(f"manual_rounds={args.manual_rounds}\n")
         handle.write(f"samples={args.samples}\n")
         handle.write(f"run_cpu={run_cpu} run_gpu={run_gpu} run_hybrid={run_hybrid}\n")
+        if run_cpu:
+            handle.write(f"cpu_bin={args.cpu_bin}\n")
+        if run_gpu:
+            handle.write(f"gpu_bin={args.gpu_bin}\n")
+        if run_hybrid:
+            handle.write(f"hybrid_bin={args.hybrid_bin}\n")
 
     print(f"[bench_lz4] raw={raw_path}")
     print(f"[bench_lz4] per_file={per_file_path}")
     print(f"[bench_lz4] aggregate={aggregate_path}")
+    print(f"[bench_lz4] plot_metrics={plot_path}")
+    print(f"[bench_lz4] manifest={run_dir / 'run_manifest.json'}")
     return run_dir
 
 
@@ -949,16 +1189,14 @@ def parse_args(argv):
     parser.add_argument("--gpu-block-sizes", default=",".join(DEFAULT_GPU_BLOCK_SIZES))
     parser.add_argument("--local-sizes", default=",".join(str(x) for x in DEFAULT_LOCAL_SIZES))
     parser.add_argument("--gpu-accels", default=",".join(str(x) for x in DEFAULT_GPU_ACCELS))
-    parser.add_argument("--gpu-hashlogs", default=",".join(str(x) for x in DEFAULT_GPU_HASHLOGS))
-    parser.add_argument("--gpu-dict-pool-mbs", default=",".join(str(x) for x in DEFAULT_GPU_DICT_POOL_MBS), help="Comma list for LZ4_GPU_COMP_DICT_POOL_MB; use auto to leave unset")
-    parser.add_argument("--gpu-dict-slots", default=",".join(str(x) for x in DEFAULT_GPU_DICT_SLOTS), help="Comma list for LZ4_GPU_COMP_DICT_SLOTS; use auto to leave unset")
-    parser.add_argument("--gpu-dict-slot-factors", default=",".join(str(x) for x in DEFAULT_GPU_DICT_SLOT_FACTORS), help="Comma list for LZ4_GPU_COMP_DICT_SLOT_FACTOR; use auto to leave unset")
+    parser.add_argument("--gpu-d-bits", default=",".join(str(x) for x in DEFAULT_GPU_D_BITS))
 
     parser.add_argument("--hybrid-block-sizes", default=",".join(DEFAULT_HYBRID_BLOCK_SIZES))
     parser.add_argument("--hybrid-gpu-ratios", default=",".join(str(x) for x in DEFAULT_HYBRID_GPU_RATIOS))
     parser.add_argument("--hybrid-cpu-threads", default=",".join(str(x) for x in DEFAULT_HYBRID_CPU_THREADS))
     parser.add_argument("--hybrid-local-sizes", default=",".join(str(x) for x in DEFAULT_HYBRID_LOCAL_SIZES))
     parser.add_argument("--hybrid-accels", default=",".join(str(x) for x in DEFAULT_HYBRID_ACCELS))
+    parser.add_argument("--hybrid-d-bits", default=",".join(str(x) for x in DEFAULT_HYBRID_D_BITS))
 
     parser.add_argument("--use-daemon", action="store_true", help="Linux only: use GPU daemon; check running, start if missing, stop only if started by this run")
 

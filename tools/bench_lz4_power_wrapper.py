@@ -23,8 +23,8 @@ CPU_CONTROL = SCRIPT_DIR / "cpu_control.sh"
 GPU_CONTROL = SCRIPT_DIR / "gpu_control.sh"
 BENCH_LZ4 = SCRIPT_DIR / "bench_lz4.py"
 
-DEFAULT_CPU_FREQ_MHZ = "NA" if os.name == "nt" else "1900,3500,NA"
-DEFAULT_GPU_FREQ_MHZ = "NA" if os.name == "nt" else "1000,NA"
+DEFAULT_CPU_FREQ_MHZ = "NA" if os.name == "nt" else "1200,1800,2400,3000,3600,NA"
+DEFAULT_GPU_FREQ_MHZ = "NA" if os.name == "nt" else "400,700,1000,1300,NA"
 MAX_IDLE_SHARE = 0.95
 
 
@@ -152,13 +152,13 @@ def effective_engines(args_list):
     text = bench_arg_value(args_list, "--engines")
     if text:
         return set(split_csv_text(text))
-    return {"gpu", "native_cpu"}
+    return {"gpu", "native_cpu", "hybrid"}
 
 
 def effective_hybrid_ratios(args_list):
     text = bench_arg_value(args_list, "--hybrid-gpu-ratios")
     if not text:
-        return ["0.3", "0.5", "0.7"]
+        return ["0", "0.25", "0.5", "0.75", "1"]
     return split_csv_text(text)
 
 
@@ -413,6 +413,13 @@ def power_main_domain(workload):
     wl = str(workload or "")
     if wl.startswith("cpu"):
         return "cpu"
+    if wl.startswith("hybrid_ratio_"):
+        ratio = wl[len("hybrid_ratio_"):].split("_", 1)[0]
+        if is_cpu_only_ratio(ratio):
+            return "cpu"
+        if is_gpu_only_ratio(ratio):
+            return "gpu"
+        return "mixed"
     return "gpu"
 
 
@@ -574,9 +581,23 @@ def main(argv):
                     "cpu_pkg_peak_power_w": summary.get("cpu_pkg_peak_power_w", 0.0),
                     "cpu_core_peak_power_w": summary.get("cpu_core_peak_power_w", 0.0),
                     "gpu_peak_power_w": summary.get("gpu_peak_power_w", 0.0),
+                    "cpu_pkg_power_stdev_w": summary.get("cpu_pkg_power_stdev_w", 0.0),
+                    "cpu_core_power_stdev_w": summary.get("cpu_core_power_stdev_w", 0.0),
+                    "gpu_power_stdev_w": summary.get("gpu_power_stdev_w", 0.0),
+                    "cpu_pkg_power_cv_pct": summary.get("cpu_pkg_power_cv_pct", 0.0),
+                    "cpu_core_power_cv_pct": summary.get("cpu_core_power_cv_pct", 0.0),
+                    "gpu_power_cv_pct": summary.get("gpu_power_cv_pct", 0.0),
                     "power_main_domain": main_domain,
-                    "power_main_avg_w": (cpu_pkg_net if main_domain == "cpu" else gpu_net),
-                    "power_main_raw_avg_w": (cpu_pkg_avg if main_domain == "cpu" else gpu_avg),
+                    "power_main_avg_w": (
+                        cpu_pkg_net if main_domain == "cpu" else
+                        gpu_net if main_domain == "gpu" else
+                        cpu_pkg_net + gpu_net
+                    ),
+                    "power_main_raw_avg_w": (
+                        cpu_pkg_avg if main_domain == "cpu" else
+                        gpu_avg if main_domain == "gpu" else
+                        cpu_pkg_avg + gpu_avg
+                    ),
                     "rc": rc,
                 }
                 records.append(record)
@@ -593,6 +614,7 @@ def main(argv):
                         "block": pf.get("block", ""),
                         "local_size": pf.get("local_size", ""),
                         "accel": pf.get("accel", ""),
+                        "d_bits": pf.get("d_bits", ""),
                         "gpu_ratio": pf.get("gpu_ratio", ""),
                         "cpu_threads": pf.get("cpu_threads", ""),
                         "ratio_pct_median": pf.get("ratio_pct_median", ""),
@@ -606,6 +628,8 @@ def main(argv):
                         "e2e_dec_mbs_median": pf.get("e2e_dec_mbs_median", pf.get("manual_e2e_dec_mbs_median", "")),
                         "elapsed_s": elapsed,
                         "run_dir": run_dir,
+                        "cpu_freq_avg_mhz": summary.get("cpu_freq_avg_mhz", 0.0),
+                        "gpu_freq_avg_mhz": summary.get("gpu_freq_avg_mhz", 0.0),
                         "cpu_pkg_avg_power_w": cpu_pkg_avg,
                         "cpu_core_avg_power_w": cpu_core_avg,
                         "gpu_avg_power_w": gpu_avg,
@@ -618,9 +642,23 @@ def main(argv):
                         "cpu_pkg_power_increment_w": cpu_pkg_net,
                         "cpu_core_power_increment_w": cpu_core_net,
                         "gpu_power_increment_w": gpu_net,
+                        "cpu_pkg_power_stdev_w": summary.get("cpu_pkg_power_stdev_w", 0.0),
+                        "cpu_core_power_stdev_w": summary.get("cpu_core_power_stdev_w", 0.0),
+                        "gpu_power_stdev_w": summary.get("gpu_power_stdev_w", 0.0),
+                        "cpu_pkg_power_cv_pct": summary.get("cpu_pkg_power_cv_pct", 0.0),
+                        "cpu_core_power_cv_pct": summary.get("cpu_core_power_cv_pct", 0.0),
+                        "gpu_power_cv_pct": summary.get("gpu_power_cv_pct", 0.0),
                         "power_main_domain": main_domain,
-                        "power_main_avg_w": (cpu_pkg_net if main_domain == "cpu" else gpu_net),
-                        "power_main_raw_avg_w": (cpu_pkg_avg if main_domain == "cpu" else gpu_avg),
+                        "power_main_avg_w": (
+                            cpu_pkg_net if main_domain == "cpu" else
+                            gpu_net if main_domain == "gpu" else
+                            cpu_pkg_net + gpu_net
+                        ),
+                        "power_main_raw_avg_w": (
+                            cpu_pkg_avg if main_domain == "cpu" else
+                            gpu_avg if main_domain == "gpu" else
+                            cpu_pkg_avg + gpu_avg
+                        ),
                         "telemetry_note": "file_level_power(net=avg-idle)",
                     }
                     per_file_records.append(pf_record)

@@ -1,6 +1,6 @@
 # LZ4 GPU 当前实现说明
 
-更新时间：2026-05-19
+更新时间：2026-05-21
 
 本文只描述 `lz4_gpu` 当前主线已经启用的实现，不展开被拒绝的历史变体。后续优化记录仍放在 `lz4_experimental`，只有经过全样本真实路径验证且明确采纳的改动才迁移到这里。
 
@@ -18,7 +18,7 @@
 |---|---|---|
 | 压缩字典 | `block_size <= 64KB` 默认 `clear16` | 16-bit block-local offset 足够表示候选位置，字典 entry 减半 |
 | 字典清零 | `uint4` 向量化清表 | 降低 clear16 每 block 清表的写出循环开销 |
-| hash 路径 | 固定 `HASHLOG=14`，删除旧 `HASHLOG+1/tableType` 宽表分支 | 统一 GPU 分块字典口径，避免旧 CPU 单流表宽逻辑污染 |
+| hash 路径 | 默认 `HASHLOG=14`，可用 `--d-bits 11..15` 做显式字典位宽扫描 | 字典规模与 launch 并发解耦，避免把缩字典误做成缩 work-item |
 | hash 输入 | `LZ4_hashPosition()` 固定写回 sequence，不保留 nullable 分支 | 去掉 hot path 上无意义的运行时判断 |
 | literal copy | 删除 `LZ4_GPU_DISABLE_VEC_COPY` scalar fallback | 主线只保留向量化 copy，避免代码路径分裂 |
 | 编译路径 | standalone/bench/daemon 统一调用 `lz4_load_program()` | daemon 与普通路径使用同一套 build flag 和 dict mode |
@@ -47,13 +47,15 @@ host 侧用 `lz4_build_comp_plan()` 生成执行计划：
 
 ```text
 raw_worker_count   = min(num_blocks, max(local_size, CU * 24))
-dict_owner_count   = min(raw_worker_count, dict_pool_budget / dict_bytes_per_owner)
-active_lane_count  = dict_owner_count
+dict_owner_count   = raw_worker_count
+active_lane_count  = raw_worker_count
 launched_wi_count  = round_up(active_lane_count, local_size)
 blocks_per_owner   = ceil(num_blocks / active_lane_count)
 ```
 
-`dict_pool_budget` 默认取 `global_mem / 32`，并限制在 `16MB..512MB`。这个预算只控制字典池规模，不改变输出 block 顺序。
+当前实现不再用字典预算裁剪 `dict_owner_count` 或 `active_lane_count`。字典缩小只通过 `--d-bits` / entry width 改变每个 table 的大小；并发仍由 `raw_worker_count` 控制。`dict_pool_budget` 只保留为 debug/统计字段，不能作为降低并发的依据。不要把缩字典和缩并发混为一个调参维度。
+
+2026-05-21 在 105 上做的 `D11..D15 × 32/64KB` 全样本扫描确认：`--d-bits` 没有联动降低并发。`D15` 不是系统性压缩率异常；整体上它比 `D14` 压缩率略好、压缩 kernel 吞吐略低。仅 `yolo_parent_0_pages_img.tar` 出现 `D15` 比 `D14` 高约 `0.02%` 的压缩率微小反向变化，属于 LZ4 贪心匹配在更大 hash 表下选择不同候选后造成的局部非单调，不是输出损坏或并发变化。
 
 ### 2.2 字典 entry 模式
 
@@ -82,7 +84,7 @@ block_size >  64KB: epoch32，entry=uint，dict_entries=1<<14，约 64KB/table
 当前只保留一个 GPU 分块 hash 口径：
 
 ```c
-LZ4_HASHLOG = 14
+LZ4_HASHLOG = --d-bits 指定值，默认 14
 dict_entries = 1 << LZ4_HASHLOG
 hash = (sequence * 2654435761U) >> (32 - LZ4_HASHLOG)
 ```

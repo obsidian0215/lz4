@@ -71,13 +71,15 @@ flowchart TD
 - `raw_worker_count`：压缩并行第一层上限，来自 `min(num_blocks, max(l_ws, CU*24))`。
 - `lane`：压缩调度里的活动执行通道，代码中对应 `active_lane_count`。
 - `owner`：拥有私有字典切片（dict slice）的 lane。当前实现里 `owner` 与 `active lane` 一一对应。
-- `dict_owner_count`：预算裁剪后的 owner 数，决定实际 hash 池体积。
+- `dict_owner_count`：当前实现中等于 `raw_worker_count` 的 owner 数，决定实际 hash 池体积；预算只作为记录，不再裁剪并发。
 - `launched work-item count`：实际 launch 的 work-item 总数，代码中对应 `launched_wi_count`（即 `g_ws`）。
 - `padding_wi_count`：`launched_wi_count - active_lane_count` 的补齐 work-item 数；这些 work-item 会被 launch 但不会进入有效压缩处理。
 - `blocks_per_owner`：每个 owner 预计处理的块数上界，用于 host 侧推进 `epoch_base`。
+
+> 说明：这里的“缩字典”只影响每 owner 的 table 切片大小，不再自动压低 `active_lane_count` 或 `launched_wi_count`。旧的 owner 裁剪逻辑已经被移除。
 - `epoch`：12-bit 代际标签，用于判定 hash entry 是否属于当前批次。
 - `tableType`：字典宽度选择，`0` 为宽表（32K 桶），`1` 为窄表（16K 桶）。
-- `dict_pool_budget_bytes`：hash 池预算字节数，默认取 `global_mem/32` 并被 `[16MB, 512MB]` 裁剪。
+- `dict_pool_budget_bytes`：hash 池预算字节数（telemetry），默认取 `global_mem/32` 并被 `[16MB, 512MB]` 裁剪；当前不再用于裁剪 owner 数。
 
 ### 0.2 block 数与 local size
 
@@ -99,14 +101,14 @@ $$
 raw\_worker\_count = \min\Big(num\_blocks,\; \max(l\_ws,\; CU\times 24)\Big)
 $$
 
-第二层（dict 预算裁剪）：
+第二层（字典与并发解耦）：
 
 $$
-dict\_owner\_count = \min\Big(raw\_worker\_count,\; \left\lfloor\frac{dict\_pool\_budget\_bytes}{dict\_bytes\_per\_owner}\right\rfloor\Big)
+dict\_owner\_count = raw\_worker\_count
 $$
 
 $$
-active\_lane\_count = dict\_owner\_count
+active\_lane\_count = raw\_worker\_count
 $$
 
 第三层（launch）：
@@ -293,9 +295,9 @@ inline U32 LZ4_hashPosition(const __global BYTE* p, int tableType, U32* sequence
 
 每个 active lane（owner）的 hash table 切片来自 host 端分配的统一全局缓冲区 `globalHashTablePool`（`cl_mem`，`CL_MEM_READ_WRITE`）。
 
-当前实现通过预算函数控制 owner 数：
+当前实现通过预算函数记录字典池预算，但不再用预算裁剪 owner 数：
 
-在 `lz4_gpu_core.c` 中引入 `choose_comp_dict_pool_budget_bytes()` 和 `choose_comp_dict_owner_count()`：
+在 `lz4_gpu_core.c` 中引入 `choose_comp_dict_pool_budget_bytes()`：
 
 ```c
 static size_t choose_comp_dict_pool_budget_bytes(cl_command_queue queue) {
@@ -315,10 +317,9 @@ static size_t choose_comp_dict_pool_budget_bytes(cl_command_queue queue) {
 
 ```
 raw_worker_count = min(num_blocks, max(local_size, cu × 24))
-dict_bytes_per_owner = (tableType==0) ? 128KB : 64KB
+dict_bytes_per_owner = 由 D_BITS + entry width 决定
 budget = clamp(global_mem / 32, 16MB, 512MB)   // 或环境变量 LZ4_GPU_COMP_DICT_POOL_MB
-budget_owners = budget / dict_bytes_per_owner
-dict_owner_count = min(raw_worker_count, max(1, budget_owners))
+dict_owner_count = raw_worker_count
 ```
 
 其中，预算上下限来自代码常量：
@@ -334,11 +335,7 @@ dict\_total\_bytes = dict\_owner\_count \times dict\_bytes\_per\_owner
 $$
 
 $$
-1 \le dict\_owner\_count \le raw\_worker\_count
-$$
-
-$$
-dict\_owner\_count = \min\Big(raw\_worker\_count,\; \max(1, \lfloor budget / dict\_bytes\_per\_owner \rfloor)\Big)
+dict\_owner\_count = raw\_worker\_count
 $$
 
 ### 1.3.3.1 分配示例（64KB 路径，`tableType=0`）
@@ -389,9 +386,9 @@ $$
 - `block_size=64KB`：`num_blocks=4096`
 - `block_size=32KB`：`num_blocks=8192`
 
-在同设备与同预算下，`32KB` 路径更容易把 `raw_worker_count` 顶到设备上限，从而更频繁触发预算裁剪。
+在同设备下，`32KB` 路径更容易把 `raw_worker_count` 顶到设备上限；这会增加字典总量，但不会通过预算回压并发。
 
-关键结论：`dict_owner_count` 由 `raw_worker_count` 与 `budget_owners` 共同裁剪，最终字典体积由 owner 数决定，而不是直接由 launched WI 数决定。
+关键结论：`dict_owner_count` 现在不再由预算裁剪；并发由 `raw_worker_count`/`active_lane_count` 决定，字典体积由 `D_BITS` 与 entry width 决定。当前主线已经把“缩字典”和“缩并发”解耦。
 
 ### 1.4 压缩主循环逻辑
 

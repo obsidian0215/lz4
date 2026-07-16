@@ -19,7 +19,7 @@ int is_daemon_running(void) {
 static int client_read_full(int fd, void* buf, size_t len);
 static int client_write_full(int fd, const void* buf, size_t len);
 
-static int do_daemon_op(int mode, const char* input, const char* output, int block_size, int acceleration, int local_size) {
+static int do_daemon_op(int mode, const char* input, const char* output, int block_size, int acceleration, int local_size, int hash_log) {
     int sock;
     struct sockaddr_un addr;
     request_t req;
@@ -58,6 +58,7 @@ static int do_daemon_op(int mode, const char* input, const char* output, int blo
     req.block_size = block_size;
     req.acceleration = acceleration;
     req.local_size = local_size;
+    req.hash_log = hash_log;
 
     if (client_write_full(sock, &req, sizeof(req)) != 0) {
         perror("send request");
@@ -148,7 +149,7 @@ static int write_stdout_all(const void* data, size_t len)
     return fwrite(data, 1, len, stdout) == len ? 0 : -1;
 }
 
-static int do_daemon_raw_op(int mode, int block_size, int acceleration, int local_size)
+static int do_daemon_raw_op(int mode, int block_size, int acceleration, int local_size, int hash_log)
 {
     int sock;
     struct sockaddr_un addr;
@@ -193,6 +194,7 @@ static int do_daemon_raw_op(int mode, int block_size, int acceleration, int loca
     req.block_size = block_size;
     req.acceleration = acceleration;
     req.local_size = local_size;
+    req.hash_log = hash_log;
     req.flags = LZ4_DAEMON_FLAG_RAW_BUFFER;
     req.input_size = input_len;
 
@@ -223,9 +225,9 @@ out:
     return rc;
 }
 
-int run_lz4_client(int mode, const char* input_path, const char* output_path, int block_size, int acceleration, int local_size, int raw_buffer) {
+int run_lz4_client(int mode, const char* input_path, const char* output_path, int block_size, int acceleration, int local_size, int hash_log, int raw_buffer) {
     if (raw_buffer) {
-        return do_daemon_raw_op(mode, block_size, acceleration, local_size);
+        return do_daemon_raw_op(mode, block_size, acceleration, local_size, hash_log);
     }
-    return do_daemon_op(mode, input_path, output_path, block_size, acceleration, local_size);
+    return do_daemon_op(mode, input_path, output_path, block_size, acceleration, local_size, hash_log);
 }

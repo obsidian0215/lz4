@@ -20,6 +20,7 @@ typedef struct {
     int acceleration;
     int block_size;
     int local_size;
+    int hash_log;
     uint32_t cpu_share_pct;
     uint32_t cpu_threads;
     uint32_t adaptive;

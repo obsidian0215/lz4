@@ -24,20 +24,29 @@ int lz4_daemon_split_file_request(int mode,
                                   int block_size,
                                   int acceleration,
                                   int local_size,
+                                  int hash_log,
                                   uint32_t cpu_share_pct,
                                   uint32_t cpu_threads,
                                   uint32_t adaptive,
                                   unsigned long* elapsed_us);
 
 #define MAX_WORKERS_CAP 16
-#define MIN_HASH_LOG 10
-#define MAX_HASH_LOG 16
+#define MIN_HASH_LOG 11
+#define MAX_HASH_LOG 15
+#define LZ4_DAEMON_KERNEL_MODES 2
+#define HASH_LOG_COUNT (MAX_HASH_LOG - MIN_HASH_LOG + 1)
+#define LZ4_DAEMON_PROGRAM_SLOTS (LZ4_DAEMON_KERNEL_MODES * HASH_LOG_COUNT)
+
+enum {
+    LZ4_DAEMON_MODE_CLEAR16 = 0,
+    LZ4_DAEMON_MODE_EPOCH32 = 1
+};
 
 typedef struct {
     int id;
     cl_command_queue queue;
-    cl_kernel kernel_comp[MAX_HASH_LOG + 1];
-    cl_kernel kernel_decomp;
+    cl_kernel kernel_comp[LZ4_DAEMON_PROGRAM_SLOTS];
+    cl_kernel kernel_decomp[LZ4_DAEMON_PROGRAM_SLOTS];
     lz4_gpu_workspace_t ws;
     pthread_t thread;
     int client_fd;
@@ -50,7 +59,7 @@ struct {
     cl_platform_id platform;
     cl_device_id device;
     cl_context context;
-    cl_program program_comp[MAX_HASH_LOG + 1];
+    cl_program program_comp[LZ4_DAEMON_PROGRAM_SLOTS];
     pthread_mutex_t compile_lock;
     worker_res_t workers[MAX_WORKERS_CAP];
     int active_workers;
@@ -58,6 +67,24 @@ struct {
     volatile int running;
     int pid_fd;
 } g_state;
+
+static int daemon_kernel_mode_for_block(uint32_t block_size) {
+    return (block_size <= 64U * 1024U) ? LZ4_DAEMON_MODE_CLEAR16 : LZ4_DAEMON_MODE_EPOCH32;
+}
+
+static int daemon_hash_log_from_request(const request_t* req) {
+    int hash_log = req && req->hash_log ? req->hash_log : 14;
+    if (hash_log < MIN_HASH_LOG) hash_log = MIN_HASH_LOG;
+    if (hash_log > MAX_HASH_LOG) hash_log = MAX_HASH_LOG;
+    return hash_log;
+}
+
+static int daemon_program_slot(uint32_t block_size, int hash_log) {
+    int mode = daemon_kernel_mode_for_block(block_size);
+    if (hash_log < MIN_HASH_LOG) hash_log = MIN_HASH_LOG;
+    if (hash_log > MAX_HASH_LOG) hash_log = MAX_HASH_LOG;
+    return (hash_log - MIN_HASH_LOG) * LZ4_DAEMON_KERNEL_MODES + mode;
+}
 
 static int create_pidfile(void) {
     int fd = open("/tmp/lz4_gpu_daemon.pid", O_RDWR | O_CREAT, 0644);
@@ -209,8 +236,11 @@ static int resolve_daemon_file(const char* env_name, const char* filename, char*
     return -1;
 }
 
-cl_program load_program(cl_context context, cl_device_id device) {
-    const int hash_log = 14;
+cl_program load_program(cl_context context, cl_device_id device, int hash_log, size_t block_size) {
+    if (hash_log < MIN_HASH_LOG) hash_log = MIN_HASH_LOG;
+    if (hash_log > MAX_HASH_LOG) hash_log = MAX_HASH_LOG;
+    int dict_clear = (block_size <= 64U * 1024U) ? 1 : 0;
+    int dict_entry_bits = dict_clear ? 16 : 32;
     uint64_t t1 = get_us();
     char bin_name[128];
     char bin_path[PATH_MAX];
@@ -249,7 +279,8 @@ cl_program load_program(cl_context context, cl_device_id device) {
             strcpy(include_dir, ".");
         }
 
-        snprintf(flags, sizeof(flags), "-I. -I%s -DLZ4_HASHLOG=%d", include_dir, hash_log);
+        snprintf(flags, sizeof(flags), "-I. -I%s -DLZ4_HASHLOG=%d -DLZ4_GPU_DICT_CLEAR=%d -DLZ4_GPU_DICT_ENTRY_BITS=%d",
+                 include_dir, hash_log, dict_clear, dict_entry_bits);
         f = fopen(src_path, "r");
         if (!f) return NULL;
         fseek(f, 0, SEEK_END); s_sz = (size_t)ftell(f); fseek(f, 0, SEEK_SET);
@@ -313,9 +344,9 @@ void process_request(worker_res_t* w, request_t* req, response_t* res) {
     /* Per user request: in daemon mode, ocl_setup_us is always 0 for all requests */
     t.ocl_setup_us = 0;
 
-    if (req->cpu_share_pct > 0 || req->adaptive) {
+    if (req->cpu_share_pct > 0) {
         unsigned long elapsed_us = 0;
-        uint32_t cpu_share = req->adaptive ? 50U : req->cpu_share_pct;
+        uint32_t cpu_share = req->cpu_share_pct;
         if (cpu_share > 100U) cpu_share = 100U;
         printf("[LZ4-DAEMON][SPLIT] mode=%s cpu_share=%u%% cpu_threads=%u adaptive=%u\n",
                req->mode == mode_decompress ? "decompress" : "compress",
@@ -326,6 +357,7 @@ void process_request(worker_res_t* w, request_t* req, response_t* res) {
                                             req->block_size,
                                             req->acceleration,
                                             req->local_size,
+                                            daemon_hash_log_from_request(req),
                                             cpu_share,
                                             req->cpu_threads,
                                             req->adaptive,
@@ -345,32 +377,34 @@ void process_request(worker_res_t* w, request_t* req, response_t* res) {
     }
 
     if (req->mode == mode_compress) {
-        const int h_log = 14;
+        const int h_log = daemon_hash_log_from_request(req);
+        int kernel_mode = daemon_program_slot((uint32_t)req->block_size, h_log);
 
         pthread_mutex_lock(&g_state.compile_lock);
-        if (!g_state.program_comp[h_log]) g_state.program_comp[h_log] = load_program(g_state.context, g_state.device);
-        cl_program prog = g_state.program_comp[h_log];
-        if (!w->kernel_comp[h_log] && prog) {
+        if (!g_state.program_comp[kernel_mode]) g_state.program_comp[kernel_mode] = load_program(g_state.context, g_state.device, h_log, req->block_size);
+        cl_program prog = g_state.program_comp[kernel_mode];
+        if (!w->kernel_comp[kernel_mode] && prog) {
             cl_int err;
-            w->kernel_comp[h_log] = clCreateKernel(prog, "lz4_compress_block", &err);
+            w->kernel_comp[kernel_mode] = clCreateKernel(prog, "lz4_compress_block", &err);
         }
-        cl_kernel kernel = w->kernel_comp[h_log];
+        cl_kernel kernel = w->kernel_comp[kernel_mode];
         pthread_mutex_unlock(&g_state.compile_lock);
 
         if (kernel) {
             ret = lz4_compress_core(g_state.context, w->queue, kernel, req->input_path, req->output_path,
-                                  req->block_size, req->acceleration, &w->ws, &t, req->local_size, 0);
+                                  req->block_size, req->acceleration, h_log, &w->ws, &t, req->local_size, 0);
         }
     } else {
-        int h_log = 14;
+        int h_log = daemon_hash_log_from_request(req);
+        int kernel_mode = daemon_program_slot((uint32_t)req->block_size, h_log);
         pthread_mutex_lock(&g_state.compile_lock);
-        if (!g_state.program_comp[h_log]) g_state.program_comp[h_log] = load_program(g_state.context, g_state.device);
-        cl_program prog = g_state.program_comp[h_log];
-        if (!w->kernel_decomp && prog) {
+        if (!g_state.program_comp[kernel_mode]) g_state.program_comp[kernel_mode] = load_program(g_state.context, g_state.device, h_log, req->block_size);
+        cl_program prog = g_state.program_comp[kernel_mode];
+        if (!w->kernel_decomp[kernel_mode] && prog) {
             cl_int err;
-            w->kernel_decomp = clCreateKernel(prog, "lz4_decompress_blocks", &err);
+            w->kernel_decomp[kernel_mode] = clCreateKernel(prog, "lz4_decompress_blocks", &err);
         }
-        cl_kernel kernel = w->kernel_decomp;
+        cl_kernel kernel = w->kernel_decomp[kernel_mode];
         pthread_mutex_unlock(&g_state.compile_lock);
 
         if (kernel) {

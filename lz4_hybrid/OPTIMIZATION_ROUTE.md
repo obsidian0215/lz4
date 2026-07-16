@@ -1,36 +1,41 @@
 # lz4_hybrid 优化路线
 
-更新时间：2026-05-03
+更新时间：2026-05-21
 
-## 当前状态
+## 当前定位
 
-`lz4_hybrid` 已从旧 native CPU pthread split 切换为 `lz4_gpu_v2` 的 OpenCL mixed 基础实现。CPU-only、GPU-only、CPU+GPU mixed 都使用同一套 `lz4_gpu.cl` kernel。
+`lz4_hybrid` 是 LZ4 的 OpenCL CPU/GPU mixed 实现承载目录。当前重点不是继续堆复杂 adaptive 规则，而是先把 CPU、GPU 和 mixed 的基础能力、频率敏感性、功耗增量、块大小和字典大小关系测清楚。
 
-当前迁移已解决“实现路线正确”“功能可用”和 daemon 上下文复用：
+## 当前实现
 
 - `--gpu-ratio 1`：纯 OpenCL GPU。
 - `--gpu-ratio 0`：纯 OpenCL CPU。
 - `0 < --gpu-ratio < 1`：CPU/GPU 按 block range 固定比例切分。
-- `--adaptive`：占位，当前等价于默认 `0.5` ratio。
-- Linux daemon：`--use-daemon` 支持上述 ratio/threads/adaptive 参数；mixed 请求复用 OpenCL CPU/GPU context、queue、program、kernel 和主要 device buffer。
+- `--adaptive`：保留实验入口；当前不作为默认策略或性能结论。
+- `--d-bits 11..15`：控制每个 work-item 的 hash table 位宽，不改变 active block 并发。
+- Linux daemon：用于复用 OpenCL context、queue、program、kernel 和主要 buffer；不把 daemon 修复或测试纠错写成性能优化项。
 
-## 已完成验证
+## 现有判断
 
-smoke：
+- GPU-only 仍是当前最可靠基线；mixed 是否有价值必须在相同频率、块大小、字典位宽和真实端到端口径下重新判定。
+- OpenCL CPU-only 是 mixed 框架内的 CPU 设备路径，不等同于 native CPU `lz4`。
+- 自适应建模暂缓。先建立 `native_cpu`、`opencl_cpu`、`gpu`、固定比例 mixed 的速度/功耗/压缩率数据，再决定 adaptive 的目标函数和可用变量。
 
-- 样本：`xml`、`mozilla`、`x-ray`
-- 块大小：Windows standalone 覆盖 `32KB`、`64KB`；225 daemon 覆盖 `64KB`
-- ratio：`1`、`0`、`0.5`、`adaptive`
-- CPU slots：`1`
-- 结果：压缩/解压 roundtrip 全部通过。
-- daemon 复用：225 上首次 CPU-only/mixed 分别触发设备初始化，后续 mixed 请求 `init_load=0.00ms`。
+## 拒绝项
 
-## 仍不能直接下性能结论的原因
+| 项目 | 判定 | 原因 |
+| --- | --- | --- |
+| bench-only gather/compaction | 拒绝 | 只改变 bench 计时或中间统计，不改善真实压缩/解压路径。 |
+| 用 active lanes 缩字典池 | 拒绝 | 把字典预算和并发度绑死，损害吞吐；字典缩小应通过 `D_BITS` 或表项宽度处理。 |
+| 未校准 adaptive 默认混合 | 拒绝作为默认 | 当前证据不足，且固定 mixed 可能被 CPU 慢尾拖累。 |
 
-daemon 已解决重复 init/build 问题，但当前只做 smoke，不是全样本多轮性能扫描。是否默认推荐 mixed 仍必须基于 ratio/threads/block size 的正式统计。
+## 下一步扫描
 
-## 下一步
+1. `native_cpu`：系统 `lz4`，固定单线程/多线程列表，扫描块大小、CPU 频率、压缩率、压缩/解压吞吐、端到端吞吐、CPU package/core 功率增量。
+2. `opencl_cpu`：`lz4_hybrid --gpu-ratio 0`，同样扫描线程数、块大小、字典位宽和 CPU 频率。
+3. `gpu`：`lz4_gpu`/`lz4_hybrid --gpu-ratio 1`，扫描块大小、`D_BITS`、GPU 频率、压缩率、压缩/解压吞吐、端到端吞吐、GPU 功率增量。
+4. `mixed`：只在 CPU/GPU 单设备最优实现确认后，再扫描固定比例矩阵；`adaptive` 只消费这些数据，不先手写复杂规则。
 
-1. **比例扫描**：全样本扫描 `gpu_ratio=0/0.25/0.5/0.75/1` 和 `cpu_threads=1/2/...`，记录 kernel、no-ocl-init、真实端到端吞吐。
-2. **自适应建模**：在比例扫描后，用文件大小、block 数、CPU slots、GPU/CPU kernel 吞吐和 host 开销建立 ratio 决策。
-3. **正式迁移判断**：只有 mixed 在复用上下文口径下有稳定收益，才把它作为默认推荐路径。
+## 建模方向
+
+adaptive 的目标不是简单选择 CPU/GPU/HYBRID，而是在给定文件、块划分、设备频率和功耗状态下决定 `gpu_ratio ∈ [0,1]`。候选变量必须来自低开销、可稳定获取的信息：文件大小、block 数、块大小、字典位宽、CPU threads、GPU/CU 信息、近期实测吞吐和设备功耗增量。数据不足前不做规则固化。

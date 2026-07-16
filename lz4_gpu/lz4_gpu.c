@@ -37,20 +37,21 @@ static int run_daemon(void) {
     fprintf(stderr, "Daemon mode is not supported in Windows builds. Use standalone or bench mode.\n");
     return 1;
 }
-static int run_lz4_client(int mode, const char* input_path, const char* output_path, int block_size, int acceleration, int local_size, int raw_buffer) {
-    (void)mode; (void)input_path; (void)output_path; (void)block_size; (void)acceleration; (void)local_size; (void)raw_buffer;
+static int run_lz4_client(int mode, const char* input_path, const char* output_path, int block_size, int acceleration, int local_size, int hash_log, int raw_buffer) {
+    (void)mode; (void)input_path; (void)output_path; (void)block_size; (void)acceleration; (void)local_size; (void)hash_log; (void)raw_buffer;
     fprintf(stderr, "--use-daemon is not supported in Windows builds. Use standalone mode.\n");
     return 1;
 }
 #else
 int run_daemon(void);
-int run_lz4_client(int mode, const char* input_path, const char* output_path, int block_size, int acceleration, int local_size, int raw_buffer);
+int run_lz4_client(int mode, const char* input_path, const char* output_path, int block_size, int acceleration, int local_size, int hash_log, int raw_buffer);
 #endif
 
 int g_verbose = 0;
 static size_t g_cli_local_size = 1;
 static size_t g_cli_fixed_block_bytes = 64 * 1024;
 static int g_cli_acceleration = 1;
+static int g_cli_hash_log = 14;
 
 static cl_context ctx;
 static cl_command_queue queue;
@@ -126,6 +127,7 @@ static void show_help(const char* prog_name) {
     fprintf(stderr, "  -o, --output FILE    Output file (use '-' for stdout)\n");
     fprintf(stderr, "  -B, --block-size N   Block size in bytes (default: 64KB)\n");
     fprintf(stderr, "  -a, --acceleration N Acceleration factor (default: 1)\n");
+    fprintf(stderr, "  --d-bits N           Hash dictionary bits, 11..15 (default: 14)\n");
     fprintf(stderr, "  --local N            Local work-group size (default: 1)\n");
     fprintf(stderr, "  -v, --verbose        Enable performance statistics\n");
     fprintf(stderr, "  --bench [N]          Stable benchmark (compress+decompress+verify), optional N seconds (default: 3)\n");
@@ -322,7 +324,7 @@ static int run_lz4_bench(const char* input_path,
         return 1;
     }
 
-    cl_program prog = lz4_load_program(ctx, dev, 14, (size_t)block_size);
+    cl_program prog = lz4_load_program(ctx, dev, g_cli_hash_log, (size_t)block_size);
     if (!prog) {
         fprintf(stderr, "bench error: kernel program load failed\n");
         clReleaseCommandQueue(queue);
@@ -428,6 +430,7 @@ static int run_lz4_bench(const char* input_path,
                                    NULL,
                                    (size_t)block_size,
                                    acceleration,
+                                   g_cli_hash_log,
                                    &ws,
                                    &tc,
                                    local_size,
@@ -804,6 +807,9 @@ int run_lz4_standalone(int argc, char** argv) {
         } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--acceleration") == 0) {
             if (i + 1 < argc) g_cli_acceleration = atoi(argv[++i]);
             else { fprintf(stderr, "Error: -a requires an argument\n"); return 1; }
+        } else if (strcmp(argv[i], "--d-bits") == 0) {
+            if (i + 1 < argc) g_cli_hash_log = atoi(argv[++i]);
+            else { fprintf(stderr, "Error: --d-bits requires an argument\n"); return 1; }
         } else if (strcmp(argv[i], "--local") == 0) {
             if (i + 1 < argc) g_cli_local_size = atoi(argv[++i]);
             else { fprintf(stderr, "Error: --local requires an argument\n"); return 1; }
@@ -897,7 +903,7 @@ int run_lz4_standalone(int argc, char** argv) {
     g_ocl_init_us = t2 - t1;
 
     t1 = get_us();
-    prog = lz4_load_program(ctx, dev, 14, g_cli_fixed_block_bytes);
+    prog = lz4_load_program(ctx, dev, g_cli_hash_log, g_cli_fixed_block_bytes);
     t2 = get_us();
     g_kernel_load_us = t2 - t1;
 
@@ -929,6 +935,7 @@ int run_lz4_standalone(int argc, char** argv) {
                                 effective_output_path,
                                 (int)g_cli_fixed_block_bytes,
                                 g_cli_acceleration,
+                                g_cli_hash_log,
                                 &ws,
                                 &t_out,
                                 (int)g_cli_local_size,
@@ -1032,6 +1039,8 @@ int main(int argc, char** argv) {
                     g_cli_fixed_block_bytes = parse_size_bytes(argv[++i]);
                 } else if ((strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--acceleration") == 0) && i + 1 < argc) {
                     g_cli_acceleration = atoi(argv[++i]);
+                } else if (strcmp(argv[i], "--d-bits") == 0 && i + 1 < argc) {
+                    g_cli_hash_log = atoi(argv[++i]);
                 } else if ((strcmp(argv[i], "--local") == 0) && i + 1 < argc) {
                     g_cli_local_size = atoi(argv[++i]);
                 } else if (argv[i][0] == '-' && strcmp(argv[i], "-") != 0) {
@@ -1068,7 +1077,7 @@ int main(int argc, char** argv) {
                                     bench_seconds);
             }
             if (raw_buffer) {
-                return run_lz4_client(mode, NULL, NULL, (int)g_cli_fixed_block_bytes, g_cli_acceleration, (int)g_cli_local_size, 1);
+                return run_lz4_client(mode, NULL, NULL, (int)g_cli_fixed_block_bytes, g_cli_acceleration, (int)g_cli_local_size, g_cli_hash_log, 1);
             }
             if (!output_explicit) {
                 if (mode == mode_compress) snprintf(output, sizeof(output), "%s.lz4", input);
@@ -1078,7 +1087,7 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "Error: '-' stream I/O is only supported in standalone mode\n");
                 return 1;
             }
-            return run_lz4_client(mode, input, output, (int)g_cli_fixed_block_bytes, g_cli_acceleration, (int)g_cli_local_size, 0);
+            return run_lz4_client(mode, input, output, (int)g_cli_fixed_block_bytes, g_cli_acceleration, (int)g_cli_local_size, g_cli_hash_log, 0);
         }
     }
     return run_lz4_standalone(argc, argv);

@@ -33,26 +33,30 @@
 #define PATH_MAX 4096
 #endif
 
+#define LZ4_SPLIT_MAGIC_V1 0x184D2204U
+#define LZ4_SPLIT_MAGIC_V2 0x184D2205U
+
 /* Forward declarations */
 #if defined(_WIN32)
 static int run_daemon(void) {
     fprintf(stderr, "Daemon mode is not supported in Windows builds. Use standalone or bench mode.\n");
     return 1;
 }
-static int run_lz4_client(int mode, const char* input_path, const char* output_path, int block_size, int acceleration, int local_size, uint32_t cpu_share_pct, uint32_t cpu_threads, uint32_t adaptive) {
-    (void)mode; (void)input_path; (void)output_path; (void)block_size; (void)acceleration; (void)local_size; (void)cpu_share_pct; (void)cpu_threads; (void)adaptive;
+static int run_lz4_client(int mode, const char* input_path, const char* output_path, int block_size, int acceleration, int local_size, int hash_log, uint32_t cpu_share_pct, uint32_t cpu_threads, uint32_t adaptive) {
+    (void)mode; (void)input_path; (void)output_path; (void)block_size; (void)acceleration; (void)local_size; (void)hash_log; (void)cpu_share_pct; (void)cpu_threads; (void)adaptive;
     fprintf(stderr, "--use-daemon is not supported in Windows builds. Use standalone mode.\n");
     return 1;
 }
 #else
 int run_daemon(void);
-int run_lz4_client(int mode, const char* input_path, const char* output_path, int block_size, int acceleration, int local_size, uint32_t cpu_share_pct, uint32_t cpu_threads, uint32_t adaptive);
+int run_lz4_client(int mode, const char* input_path, const char* output_path, int block_size, int acceleration, int local_size, int hash_log, uint32_t cpu_share_pct, uint32_t cpu_threads, uint32_t adaptive);
 #endif
 
 int g_verbose = 0;
 static size_t g_cli_local_size = 1;
 static size_t g_cli_fixed_block_bytes = 64 * 1024;
 static int g_cli_acceleration = 1;
+static int g_cli_hash_log = 14;
 static int g_cli_gpu_ratio_set = 0;
 static int g_cli_adaptive_enabled = 0;
 static double g_cli_gpu_ratio = 1.0;
@@ -63,6 +67,8 @@ static cl_context ctx;
 static cl_command_queue queue;
 static cl_device_id dev;
 
+static int path_is_dash(const char* path);
+
 typedef struct {
     cl_context ctx;
     cl_command_queue q;
@@ -71,6 +77,8 @@ typedef struct {
     cl_kernel kcomp;
     cl_kernel kdec;
     const char* label;
+    size_t block_size;
+    int hash_log;
     int borrowed_cache;
     struct lz4_split_cache_s* cache_slot;
 } lz4_split_ocl_t;
@@ -79,6 +87,7 @@ typedef struct lz4_split_cache_s {
     int valid;
     cl_device_type dtype;
     const char* label;
+    unsigned long use_tick;
     cl_context ctx;
     cl_command_queue q;
     cl_device_id dev;
@@ -88,31 +97,77 @@ typedef struct lz4_split_cache_s {
     cl_mem buffers[5];
     size_t buffer_caps[5];
     cl_mem_flags buffer_flags[5];
+    size_t block_size;
+    int hash_log;
 } lz4_split_cache_t;
 
 static int g_daemon_split_cache_enabled = 0;
-static lz4_split_cache_t g_daemon_split_cache[2];
+static lz4_split_cache_t g_daemon_split_cache[8];
+static unsigned long g_daemon_split_cache_tick = 1;
 #if !defined(_WIN32)
 static pthread_mutex_t g_daemon_split_call_lock = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
+#if !defined(_WIN32)
 static void lz4_split_set_daemon_cache_enabled(int enabled) {
     g_daemon_split_cache_enabled = enabled ? 1 : 0;
 }
+#endif
 
-static lz4_split_cache_t* lz4_split_find_cache(cl_device_type dtype) {
+static int lz4_sanitize_hash_log_cli(int hash_log) {
+    if (hash_log < 11) return 11;
+    if (hash_log > 15) return 15;
+    return hash_log;
+}
+
+static lz4_split_cache_t* lz4_split_find_cache(cl_device_type dtype, size_t block_size, int hash_log) {
     for (size_t i = 0; i < sizeof(g_daemon_split_cache) / sizeof(g_daemon_split_cache[0]); ++i) {
-        if (g_daemon_split_cache[i].valid && g_daemon_split_cache[i].dtype == dtype) return &g_daemon_split_cache[i];
+        if (g_daemon_split_cache[i].valid &&
+            g_daemon_split_cache[i].dtype == dtype &&
+            g_daemon_split_cache[i].block_size == block_size &&
+            g_daemon_split_cache[i].hash_log == hash_log) {
+            g_daemon_split_cache[i].use_tick = g_daemon_split_cache_tick++;
+            return &g_daemon_split_cache[i];
+        }
     }
     return NULL;
 }
 
-static lz4_split_cache_t* lz4_split_alloc_cache(cl_device_type dtype) {
+static void lz4_split_release_cache_slot(lz4_split_cache_t* cache) {
+    if (!cache || !cache->valid) return;
+    for (size_t i = 0; i < sizeof(cache->buffers) / sizeof(cache->buffers[0]); ++i) {
+        if (cache->buffers[i]) {
+            clReleaseMemObject(cache->buffers[i]);
+            cache->buffers[i] = NULL;
+        }
+        cache->buffer_caps[i] = 0;
+        cache->buffer_flags[i] = 0;
+    }
+    if (cache->kdec) clReleaseKernel(cache->kdec);
+    if (cache->kcomp) clReleaseKernel(cache->kcomp);
+    if (cache->prog) clReleaseProgram(cache->prog);
+    if (cache->q) clReleaseCommandQueue(cache->q);
+    if (cache->ctx) clReleaseContext(cache->ctx);
+    memset(cache, 0, sizeof(*cache));
+}
+
+static lz4_split_cache_t* lz4_split_alloc_cache(cl_device_type dtype, size_t block_size, int hash_log) {
     lz4_split_cache_t* fallback = &g_daemon_split_cache[0];
+    unsigned long oldest_tick = ULONG_MAX;
     for (size_t i = 0; i < sizeof(g_daemon_split_cache) / sizeof(g_daemon_split_cache[0]); ++i) {
         if (!g_daemon_split_cache[i].valid) return &g_daemon_split_cache[i];
-        if (g_daemon_split_cache[i].dtype == dtype) return &g_daemon_split_cache[i];
+        if (g_daemon_split_cache[i].dtype == dtype &&
+            g_daemon_split_cache[i].block_size == block_size &&
+            g_daemon_split_cache[i].hash_log == hash_log) {
+            g_daemon_split_cache[i].use_tick = g_daemon_split_cache_tick++;
+            return &g_daemon_split_cache[i];
+        }
+        if (g_daemon_split_cache[i].use_tick <= oldest_tick) {
+            oldest_tick = g_daemon_split_cache[i].use_tick;
+            fallback = &g_daemon_split_cache[i];
+        }
     }
+    lz4_split_release_cache_slot(fallback);
     return fallback;
 }
 
@@ -190,13 +245,67 @@ static void lz4_cli_set_cpu_threads(long threads) {
 
 static void lz4_cli_enable_adaptive(void) {
     g_cli_adaptive_enabled = 1;
-    if (!g_cli_gpu_ratio_set) {
-        lz4_cli_set_gpu_ratio(0.5);
-    }
 }
 
 static int lz4_split_enabled(void) {
-    return g_cli_adaptive_enabled || g_cli_gpu_ratio_set || g_cli_cpu_threads_set;
+    if (g_cli_adaptive_enabled) return 1;
+    if (g_cli_gpu_ratio_set) return g_cli_gpu_ratio < 1.0;
+    return 0;
+}
+
+static int lz4_file_has_split_magic(const char* path) {
+    FILE* f;
+    uint32_t magic = 0;
+    if (!path || path_is_dash(path)) return 0;
+    f = fopen(path, "rb");
+    if (!f) return 0;
+    if (fread(&magic, 1, sizeof(magic), f) != sizeof(magic)) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    return magic == LZ4_SPLIT_MAGIC_V2;
+}
+
+static double lz4_split_choose_adaptive_gpu_ratio(size_t file_size, size_t block_size, size_t cpu_threads) {
+    size_t blocks = block_size ? (file_size + block_size - 1) / block_size : 1;
+    (void)file_size;
+    (void)cpu_threads;
+
+    /*
+     * 105 daemon scans show that OpenCL CPU split is slower than GPU-only for
+     * the current kernel/host path. Adaptive therefore must be allowed to pick
+     * GPU-only; mixed is reserved for very low block counts where GPU launch
+     * under-utilization can dominate.
+     */
+    if (blocks < 8) return 0.0;
+    return 1.0;
+}
+
+static void lz4_split_choose_adaptive_device_blocks(size_t file_size,
+                                                    size_t cpu_threads,
+                                                    size_t* gpu_block_size,
+                                                    size_t* cpu_block_size) {
+    size_t gpu_bs = 64U * 1024U;
+    size_t cpu_bs = 64U * 1024U;
+    if (cpu_threads == 0) cpu_threads = 1;
+    if (file_size < 16U * 1024U * 1024U) {
+        gpu_bs = 64U * 1024U;
+        cpu_bs = 64U * 1024U;
+    } else if (file_size >= 128U * 1024U * 1024U) {
+        gpu_bs = 32U * 1024U;
+        cpu_bs = 64U * 1024U;
+    } else if (cpu_threads <= 1) {
+        cpu_bs = 64U * 1024U;
+    }
+    if (gpu_block_size) *gpu_block_size = gpu_bs;
+    if (cpu_block_size) *cpu_block_size = cpu_bs;
+}
+
+static size_t lz4_split_blocks_for_bytes(size_t bytes, size_t block_size) {
+    if (bytes == 0) return 0;
+    if (block_size == 0) block_size = 64U * 1024U;
+    return (bytes + block_size - 1) / block_size;
 }
 
 static size_t round_up_local_size(size_t value, size_t local) {
@@ -217,7 +326,7 @@ static size_t lz4_split_cpu_slots(cl_device_id cpu_dev, size_t block_count) {
     return slots;
 }
 
-static int lz4_split_init_device(lz4_split_ocl_t* h, cl_device_type dtype, const char* label) {
+static int lz4_split_init_device(lz4_split_ocl_t* h, cl_device_type dtype, const char* label, size_t block_size, int hash_log) {
     cl_int err;
     cl_uint num_platforms = 0;
     cl_platform_id* platforms = NULL;
@@ -226,8 +335,10 @@ static int lz4_split_init_device(lz4_split_ocl_t* h, cl_device_type dtype, const
 
     memset(h, 0, sizeof(*h));
     h->label = label;
+    h->block_size = block_size;
+    h->hash_log = lz4_sanitize_hash_log_cli(hash_log);
     if (g_daemon_split_cache_enabled) {
-        lz4_split_cache_t* cache = lz4_split_find_cache(dtype);
+        lz4_split_cache_t* cache = lz4_split_find_cache(dtype, block_size, h->hash_log);
         if (cache) {
             h->ctx = cache->ctx;
             h->q = cache->q;
@@ -236,6 +347,8 @@ static int lz4_split_init_device(lz4_split_ocl_t* h, cl_device_type dtype, const
             h->kcomp = cache->kcomp;
             h->kdec = cache->kdec;
             h->label = cache->label;
+            h->block_size = cache->block_size;
+            h->hash_log = cache->hash_log;
             h->borrowed_cache = 1;
             h->cache_slot = cache;
             return 0;
@@ -261,24 +374,27 @@ static int lz4_split_init_device(lz4_split_ocl_t* h, cl_device_type dtype, const
     h->q = clCreateCommandQueue(h->ctx, h->dev, CL_QUEUE_PROFILING_ENABLE, &err);
 #endif
     if (err != CL_SUCCESS || !h->q) return -1;
-    h->prog = lz4_load_program(h->ctx, h->dev);
+    h->prog = lz4_load_program(h->ctx, h->dev, h->hash_log, block_size);
     if (!h->prog) return -1;
     h->kcomp = clCreateKernel(h->prog, "lz4_compress_block", &err);
     if (err != CL_SUCCESS || !h->kcomp) return -1;
     h->kdec = clCreateKernel(h->prog, "lz4_decompress_blocks", &err);
     if (err != CL_SUCCESS || !h->kdec) return -1;
     if (g_daemon_split_cache_enabled) {
-        lz4_split_cache_t* cache = lz4_split_alloc_cache(dtype);
+        lz4_split_cache_t* cache = lz4_split_alloc_cache(dtype, block_size, h->hash_log);
         memset(cache, 0, sizeof(*cache));
         cache->valid = 1;
         cache->dtype = dtype;
         cache->label = label;
+        cache->use_tick = g_daemon_split_cache_tick++;
         cache->ctx = h->ctx;
         cache->q = h->q;
         cache->dev = h->dev;
         cache->prog = h->prog;
         cache->kcomp = h->kcomp;
         cache->kdec = h->kdec;
+        cache->block_size = block_size;
+        cache->hash_log = h->hash_log;
         h->borrowed_cache = 1;
         h->cache_slot = cache;
     }
@@ -417,10 +533,11 @@ static void show_help(const char* prog_name) {
     fprintf(stderr, "  -o, --output FILE    Output file (use '-' for stdout)\n");
     fprintf(stderr, "  -B, --block-size N   Block size in bytes (default: 64KB)\n");
     fprintf(stderr, "  -a, --acceleration N Acceleration factor (default: 1)\n");
+    fprintf(stderr, "  --d-bits N           Hash dictionary bits, 11..15 (default: 14)\n");
     fprintf(stderr, "  --local N            Local work-group size (default: 1)\n");
     fprintf(stderr, "  --cpu-threads N      OpenCL CPU worker slots for split mode\n");
     fprintf(stderr, "  --gpu-ratio R        Split ratio: 1=GPU only, 0=OpenCL CPU only, 0..1=mixed\n");
-    fprintf(stderr, "  --adaptive           Placeholder for future adaptive split; currently uses 0.5 ratio\n");
+    fprintf(stderr, "  --adaptive           Auto-select split ratio and compression block size\n");
     fprintf(stderr, "  -v, --verbose        Enable performance statistics\n");
     fprintf(stderr, "  --bench [N]          Stable benchmark (compress+decompress+verify), optional N seconds (default: 3)\n");
     fprintf(stderr, "\n");
@@ -606,6 +723,24 @@ static int lz4_write_split_payload(FILE* fout,
     return 0;
 }
 
+typedef struct {
+    uint32_t magic;
+    uint32_t total_blocks;
+    uint32_t default_block_size;
+    uint32_t gpu_blocks;
+    uint32_t cpu_blocks;
+    uint32_t gpu_block_size;
+    uint32_t cpu_block_size;
+    uint32_t flags;
+} lz4_split_header_v2_t;
+
+typedef struct {
+    uint32_t block_size;
+    uint32_t block_count;
+    uint32_t offset_bytes;
+    uint32_t payload_bytes;
+} lz4_split_segment_desc_t;
+
 static int lz4_split_set_comp_args(cl_kernel kernel,
                                    cl_mem in_buf,
                                    cl_mem out_buf,
@@ -614,7 +749,6 @@ static int lz4_split_set_comp_args(cl_kernel kernel,
                                    int input_size,
                                    int block_size,
                                    int single_block_max_out,
-                                   int table_type,
                                    int acceleration,
                                    int global_index_base,
                                    cl_mem dict_buf,
@@ -628,12 +762,11 @@ static int lz4_split_set_comp_args(cl_kernel kernel,
     err |= clSetKernelArg(kernel, 4, sizeof(int), &input_size);
     err |= clSetKernelArg(kernel, 5, sizeof(int), &block_size);
     err |= clSetKernelArg(kernel, 6, sizeof(int), &single_block_max_out);
-    err |= clSetKernelArg(kernel, 7, sizeof(int), &table_type);
-    err |= clSetKernelArg(kernel, 8, sizeof(int), &acceleration);
-    err |= clSetKernelArg(kernel, 9, sizeof(int), &global_index_base);
-    err |= clSetKernelArg(kernel, 10, sizeof(cl_mem), &dict_buf);
-    err |= clSetKernelArg(kernel, 11, sizeof(uint32_t), &active_lanes);
-    err |= clSetKernelArg(kernel, 12, sizeof(uint32_t), &epoch_base);
+    err |= clSetKernelArg(kernel, 7, sizeof(int), &acceleration);
+    err |= clSetKernelArg(kernel, 8, sizeof(int), &global_index_base);
+    err |= clSetKernelArg(kernel, 9, sizeof(cl_mem), &dict_buf);
+    err |= clSetKernelArg(kernel, 10, sizeof(uint32_t), &active_lanes);
+    err |= clSetKernelArg(kernel, 11, sizeof(uint32_t), &epoch_base);
     return lz4_checked(err, "set compress args");
 }
 
@@ -675,34 +808,58 @@ static int do_split_compress_mode(const char* input_path,
     uint64_t t0 = get_us(), t_read0, t_init0, t_kernel0, t_download0, t_write0;
     uint64_t t_read1 = 0, t_init1 = 0, t_kernel1 = 0, t_download1 = 0, t_write1 = 0;
     size_t file_size, nblk, gpu_blocks, cpu_blocks, gpu_input_size, cpu_input_offset, cpu_input_size;
-    size_t single_block_max_out, gpu_global = 1, cpu_global = 1, gpu_local, cpu_local = 1;
-    size_t dict_entries, total_compressed = 0;
-    int table_type;
-    uint32_t magic = 0x184D2204;
-    uint32_t nblk32, bsize32;
+    size_t gpu_block_size, cpu_block_size, gpu_single_block_max_out, cpu_single_block_max_out;
+    size_t gpu_global = 1, cpu_global = 1, gpu_local, cpu_local = 1;
+    size_t dict_entries, dict_entry_size, total_compressed = 0;
+    lz4_split_header_v2_t header;
     int rc = 1;
 
     memset(&gpu, 0, sizeof(gpu));
     memset(&cpu, 0, sizeof(cpu));
     if (!input_path || !output_path || stat(input_path, &st_buf) != 0 || st_buf.st_size <= 0) return -1;
     file_size = (size_t)st_buf.st_size;
-    nblk = (file_size + block_size - 1) / block_size;
-    if (nblk == 0 || nblk > UINT32_MAX || file_size > INT_MAX || block_size > INT_MAX) return -1;
-    cpu_blocks = (size_t)((double)nblk * (1.0 - g_cli_gpu_ratio) + 0.5);
-    if (g_cli_gpu_ratio <= 0.0) cpu_blocks = nblk;
-    if (g_cli_gpu_ratio >= 1.0) cpu_blocks = 0;
-    if (cpu_blocks > nblk) cpu_blocks = nblk;
-    gpu_blocks = nblk - cpu_blocks;
-    if (g_cli_gpu_ratio > 0.0 && gpu_blocks == 0 && nblk > 0) { gpu_blocks = 1; cpu_blocks = nblk - 1; }
-    if (g_cli_gpu_ratio < 1.0 && cpu_blocks == 0 && nblk > 1) { cpu_blocks = 1; gpu_blocks = nblk - 1; }
+    gpu_block_size = block_size;
+    cpu_block_size = block_size;
+    if (g_cli_adaptive_enabled) {
+        size_t adaptive_threads = (g_cli_cpu_threads_set && g_cli_cpu_threads > 0) ? g_cli_cpu_threads : 1;
+        lz4_split_choose_adaptive_device_blocks(file_size, adaptive_threads, &gpu_block_size, &cpu_block_size);
+        block_size = gpu_block_size;
+        g_cli_fixed_block_bytes = gpu_block_size;
+        g_cli_gpu_ratio = lz4_split_choose_adaptive_gpu_ratio(file_size, gpu_block_size, adaptive_threads);
+        g_cli_gpu_ratio_set = 1;
+        if (!g_cli_cpu_threads_set) {
+            g_cli_cpu_threads = adaptive_threads;
+            g_cli_cpu_threads_set = 1;
+        }
+    }
+    if (gpu_block_size == 0 || cpu_block_size == 0 ||
+        gpu_block_size > INT_MAX || cpu_block_size > INT_MAX || file_size > INT_MAX) return -1;
+    if (g_cli_gpu_ratio <= 0.0) {
+        gpu_input_size = 0;
+    } else if (g_cli_gpu_ratio >= 1.0) {
+        gpu_input_size = file_size;
+    } else {
+        size_t target_gpu = (size_t)((double)file_size * g_cli_gpu_ratio + 0.5);
+        size_t target_gpu_blocks = lz4_split_blocks_for_bytes(target_gpu, gpu_block_size);
+        gpu_input_size = target_gpu_blocks * gpu_block_size;
+        if (gpu_input_size > file_size) gpu_input_size = file_size;
+        if (gpu_input_size > 0 && gpu_input_size < gpu_block_size) gpu_input_size = (file_size >= gpu_block_size) ? gpu_block_size : file_size;
+        if (gpu_input_size < file_size && file_size - gpu_input_size < cpu_block_size) {
+            gpu_input_size = (file_size > cpu_block_size) ? file_size - cpu_block_size : 0;
+        }
+    }
+    cpu_input_offset = gpu_input_size;
+    cpu_input_size = file_size - gpu_input_size;
+    gpu_blocks = lz4_split_blocks_for_bytes(gpu_input_size, gpu_block_size);
+    cpu_blocks = lz4_split_blocks_for_bytes(cpu_input_size, cpu_block_size);
+    nblk = gpu_blocks + cpu_blocks;
+    if (nblk == 0 || nblk > UINT32_MAX) return -1;
 
-    single_block_max_out = (size_t)(block_size * 1.1 + 64);
-    table_type = (block_size <= 65536) ? 0 : 1;
-    dict_entries = (table_type == 0) ? (1ULL << 15) : (1ULL << 14);
-    gpu_input_size = gpu_blocks * block_size;
-    if (gpu_input_size > file_size) gpu_input_size = file_size;
-    cpu_input_offset = gpu_blocks * block_size;
-    cpu_input_size = (cpu_input_offset < file_size) ? file_size - cpu_input_offset : 0;
+    gpu_single_block_max_out = (size_t)(gpu_block_size * 1.1 + 64);
+    cpu_single_block_max_out = (size_t)(cpu_block_size * 1.1 + 64);
+    g_cli_hash_log = lz4_sanitize_hash_log_cli(g_cli_hash_log);
+    dict_entries = (1ULL << g_cli_hash_log);
+    dict_entry_size = ((gpu_block_size <= 64U * 1024U) && (cpu_block_size <= 64U * 1024U)) ? sizeof(uint16_t) : sizeof(uint32_t);
     gpu_local = (local_size > 0) ? (size_t)local_size : 1;
 
     t_read0 = get_us();
@@ -718,8 +875,8 @@ static int do_split_compress_mode(const char* input_path,
     t_read1 = get_us();
 
     t_init0 = get_us();
-    if ((gpu_blocks > 0 && lz4_split_init_device(&gpu, CL_DEVICE_TYPE_GPU, "GPU") != 0) ||
-        (cpu_blocks > 0 && lz4_split_init_device(&cpu, CL_DEVICE_TYPE_CPU, "CPU") != 0)) {
+    if ((gpu_blocks > 0 && lz4_split_init_device(&gpu, CL_DEVICE_TYPE_GPU, "GPU", gpu_block_size, g_cli_hash_log) != 0) ||
+        (cpu_blocks > 0 && lz4_split_init_device(&cpu, CL_DEVICE_TYPE_CPU, "CPU", cpu_block_size, g_cli_hash_log) != 0)) {
         fprintf(stderr, "[LZ4-SPLIT] failed to initialize required OpenCL devices\n");
         goto cleanup;
     }
@@ -728,25 +885,25 @@ static int do_split_compress_mode(const char* input_path,
     if (gpu_blocks > 0) {
         gpu_global = round_up_local_size(gpu_blocks, gpu_local);
         gpu_in = lz4_split_get_buffer(&gpu, 0, CL_MEM_READ_ONLY, gpu_input_size ? gpu_input_size : 1, &err); if (err != CL_SUCCESS) goto cleanup;
-        gpu_out = lz4_split_get_buffer(&gpu, 1, CL_MEM_WRITE_ONLY, gpu_blocks * single_block_max_out, &err); if (err != CL_SUCCESS) goto cleanup;
+        gpu_out = lz4_split_get_buffer(&gpu, 1, CL_MEM_WRITE_ONLY, gpu_blocks * gpu_single_block_max_out, &err); if (err != CL_SUCCESS) goto cleanup;
         gpu_sizes = lz4_split_get_buffer(&gpu, 2, CL_MEM_READ_WRITE, gpu_blocks * sizeof(uint32_t), &err); if (err != CL_SUCCESS) goto cleanup;
-        gpu_dict = lz4_split_get_buffer(&gpu, 3, CL_MEM_READ_WRITE, gpu_global * dict_entries * sizeof(uint32_t), &err); if (err != CL_SUCCESS) goto cleanup;
+        gpu_dict = lz4_split_get_buffer(&gpu, 3, CL_MEM_READ_WRITE, gpu_global * dict_entries * dict_entry_size, &err); if (err != CL_SUCCESS) goto cleanup;
         if (lz4_checked(clEnqueueWriteBuffer(gpu.q, gpu_in, CL_TRUE, 0, gpu_input_size, input, 0, NULL, NULL), "gpu input upload") != 0) goto cleanup;
-        if (lz4_checked(clEnqueueFillBuffer(gpu.q, gpu_dict, &(uint32_t){0}, sizeof(uint32_t), 0, gpu_global * dict_entries * sizeof(uint32_t), 0, NULL, NULL), "gpu dict clear") != 0) goto cleanup;
+        if (lz4_checked(clEnqueueFillBuffer(gpu.q, gpu_dict, &(uint32_t){0}, sizeof(uint32_t), 0, gpu_global * dict_entries * dict_entry_size, 0, NULL, NULL), "gpu dict clear") != 0) goto cleanup;
         if (lz4_split_set_comp_args(gpu.kcomp, gpu_in, gpu_out, gpu_sizes, (int)gpu_blocks, (int)gpu_input_size,
-                                    (int)block_size, (int)single_block_max_out, table_type, acceleration, 0,
+                                    (int)gpu_block_size, (int)gpu_single_block_max_out, acceleration, 0,
                                     gpu_dict, (uint32_t)gpu_blocks, 1U) != 0) goto cleanup;
     }
     if (cpu_blocks > 0) {
         cpu_global = lz4_split_cpu_slots(cpu.dev, cpu_blocks);
         cpu_in = lz4_split_get_buffer(&cpu, 0, CL_MEM_READ_ONLY, cpu_input_size ? cpu_input_size : 1, &err); if (err != CL_SUCCESS) goto cleanup;
-        cpu_out = lz4_split_get_buffer(&cpu, 1, CL_MEM_WRITE_ONLY, cpu_blocks * single_block_max_out, &err); if (err != CL_SUCCESS) goto cleanup;
+        cpu_out = lz4_split_get_buffer(&cpu, 1, CL_MEM_WRITE_ONLY, cpu_blocks * cpu_single_block_max_out, &err); if (err != CL_SUCCESS) goto cleanup;
         cpu_sizes = lz4_split_get_buffer(&cpu, 2, CL_MEM_READ_WRITE, cpu_blocks * sizeof(uint32_t), &err); if (err != CL_SUCCESS) goto cleanup;
-        cpu_dict = lz4_split_get_buffer(&cpu, 3, CL_MEM_READ_WRITE, cpu_global * dict_entries * sizeof(uint32_t), &err); if (err != CL_SUCCESS) goto cleanup;
+        cpu_dict = lz4_split_get_buffer(&cpu, 3, CL_MEM_READ_WRITE, cpu_global * dict_entries * dict_entry_size, &err); if (err != CL_SUCCESS) goto cleanup;
         if (lz4_checked(clEnqueueWriteBuffer(cpu.q, cpu_in, CL_TRUE, 0, cpu_input_size, input + cpu_input_offset, 0, NULL, NULL), "cpu input upload") != 0) goto cleanup;
-        if (lz4_checked(clEnqueueFillBuffer(cpu.q, cpu_dict, &(uint32_t){0}, sizeof(uint32_t), 0, cpu_global * dict_entries * sizeof(uint32_t), 0, NULL, NULL), "cpu dict clear") != 0) goto cleanup;
+        if (lz4_checked(clEnqueueFillBuffer(cpu.q, cpu_dict, &(uint32_t){0}, sizeof(uint32_t), 0, cpu_global * dict_entries * dict_entry_size, 0, NULL, NULL), "cpu dict clear") != 0) goto cleanup;
         if (lz4_split_set_comp_args(cpu.kcomp, cpu_in, cpu_out, cpu_sizes, (int)cpu_blocks, (int)cpu_input_size,
-                                    (int)block_size, (int)single_block_max_out, table_type, acceleration, 0,
+                                    (int)cpu_block_size, (int)cpu_single_block_max_out, acceleration, 0,
                                     cpu_dict, (uint32_t)cpu_global, 1U) != 0) goto cleanup;
     }
 
@@ -759,16 +916,16 @@ static int do_split_compress_mode(const char* input_path,
 
     t_download0 = get_us();
     if (gpu_blocks > 0) {
-        gpu_sparse = (unsigned char*)malloc(gpu_blocks * single_block_max_out);
+        gpu_sparse = (unsigned char*)malloc(gpu_blocks * gpu_single_block_max_out);
         if (!gpu_sparse) goto cleanup;
         if (lz4_checked(clEnqueueReadBuffer(gpu.q, gpu_sizes, CL_TRUE, 0, gpu_blocks * sizeof(uint32_t), sizes, 0, NULL, NULL), "gpu sizes read") != 0) goto cleanup;
-        if (lz4_checked(clEnqueueReadBuffer(gpu.q, gpu_out, CL_TRUE, 0, gpu_blocks * single_block_max_out, gpu_sparse, 0, NULL, NULL), "gpu payload read") != 0) goto cleanup;
+        if (lz4_checked(clEnqueueReadBuffer(gpu.q, gpu_out, CL_TRUE, 0, gpu_blocks * gpu_single_block_max_out, gpu_sparse, 0, NULL, NULL), "gpu payload read") != 0) goto cleanup;
     }
     if (cpu_blocks > 0) {
-        cpu_sparse = (unsigned char*)malloc(cpu_blocks * single_block_max_out);
+        cpu_sparse = (unsigned char*)malloc(cpu_blocks * cpu_single_block_max_out);
         if (!cpu_sparse) goto cleanup;
         if (lz4_checked(clEnqueueReadBuffer(cpu.q, cpu_sizes, CL_TRUE, 0, cpu_blocks * sizeof(uint32_t), sizes + gpu_blocks, 0, NULL, NULL), "cpu sizes read") != 0) goto cleanup;
-        if (lz4_checked(clEnqueueReadBuffer(cpu.q, cpu_out, CL_TRUE, 0, cpu_blocks * single_block_max_out, cpu_sparse, 0, NULL, NULL), "cpu payload read") != 0) goto cleanup;
+        if (lz4_checked(clEnqueueReadBuffer(cpu.q, cpu_out, CL_TRUE, 0, cpu_blocks * cpu_single_block_max_out, cpu_sparse, 0, NULL, NULL), "cpu payload read") != 0) goto cleanup;
     }
     for (size_t i = 0; i < nblk; ++i) total_compressed += sizes[i];
     t_download1 = get_us();
@@ -776,14 +933,19 @@ static int do_split_compress_mode(const char* input_path,
     t_write0 = get_us();
     fout = fopen(output_path, "wb");
     if (!fout) goto cleanup;
-    nblk32 = (uint32_t)nblk;
-    bsize32 = (uint32_t)block_size;
-    if (fwrite(&magic, 1, 4, fout) != 4 ||
-        fwrite(&nblk32, 1, 4, fout) != 4 ||
-        fwrite(&bsize32, 1, 4, fout) != 4 ||
+    memset(&header, 0, sizeof(header));
+    header.magic = LZ4_SPLIT_MAGIC_V2;
+    header.total_blocks = (uint32_t)nblk;
+    header.default_block_size = (uint32_t)gpu_block_size;
+    header.gpu_blocks = (uint32_t)gpu_blocks;
+    header.cpu_blocks = (uint32_t)cpu_blocks;
+    header.gpu_block_size = (uint32_t)gpu_block_size;
+    header.cpu_block_size = (uint32_t)cpu_block_size;
+    header.flags = (uint32_t)(g_cli_cpu_threads & 0xFFFFU);
+    if (fwrite(&header, 1, sizeof(header), fout) != sizeof(header) ||
         fwrite(sizes, sizeof(uint32_t), nblk, fout) != nblk) goto cleanup;
-    if (gpu_blocks > 0 && lz4_write_split_payload(fout, gpu_sparse, gpu_blocks, single_block_max_out, sizes) != 0) goto cleanup;
-    if (cpu_blocks > 0 && lz4_write_split_payload(fout, cpu_sparse, cpu_blocks, single_block_max_out, sizes + gpu_blocks) != 0) goto cleanup;
+    if (gpu_blocks > 0 && lz4_write_split_payload(fout, gpu_sparse, gpu_blocks, gpu_single_block_max_out, sizes) != 0) goto cleanup;
+    if (cpu_blocks > 0 && lz4_write_split_payload(fout, cpu_sparse, cpu_blocks, cpu_single_block_max_out, sizes + gpu_blocks) != 0) goto cleanup;
     fclose(fout);
     fout = NULL;
     t_write1 = get_us();
@@ -792,10 +954,10 @@ static int do_split_compress_mode(const char* input_path,
         double gpu_us = event_elapsed_us(ev_gpu);
         double cpu_us = event_elapsed_us(ev_cpu);
         unsigned long total_us = (unsigned long)(get_us() - t0);
-        printf("[LZ4-SPLIT][C] %s : %zu -> %zu (%.2f:1) in %.2f ms blocks=%zu gpu=%zu cpu=%zu cpu_threads=%zu gpu_ratio=%.3f span=%.2f ms gpu_kernel=%.2f ms cpu_kernel=%.2f ms read=%.2f ms init_load=%.2f ms download=%.2f ms write=%.2f ms\n",
+        printf("[LZ4-SPLIT][C] %s : %zu -> %zu (%.2f:1) in %.2f ms gpu_block=%zu cpu_block=%zu d_bits=%d blocks=%zu gpu=%zu cpu=%zu cpu_threads=%zu gpu_ratio=%.3f span=%.2f ms gpu_kernel=%.2f ms cpu_kernel=%.2f ms read=%.2f ms init_load=%.2f ms download=%.2f ms write=%.2f ms\n",
                input_path, file_size, total_compressed,
                (double)file_size / (double)(total_compressed ? total_compressed : 1),
-               total_us / 1000.0, nblk, gpu_blocks, cpu_blocks, g_cli_cpu_threads, g_cli_gpu_ratio,
+               total_us / 1000.0, gpu_block_size, cpu_block_size, g_cli_hash_log, nblk, gpu_blocks, cpu_blocks, g_cli_cpu_threads, g_cli_gpu_ratio,
                (t_kernel1 - t_kernel0) / 1000.0, gpu_us / 1000.0, cpu_us / 1000.0,
                (t_read1 - t_read0) / 1000.0, (t_init1 - t_init0) / 1000.0,
                (t_download1 - t_download0) / 1000.0, (t_write1 - t_write0) / 1000.0);
@@ -828,7 +990,8 @@ static int do_split_decompress_mode(const char* input_path,
     lz4_split_ocl_t gpu, cpu;
     FILE* fin = NULL;
     FILE* fout = NULL;
-    uint32_t magic = 0, nblk32 = 0, block_size = 0;
+    uint32_t magic = 0, nblk32 = 0, default_block_size = 0, gpu_block_size = 0, cpu_block_size = 0;
+    lz4_split_header_v2_t header;
     uint32_t* sizes = NULL;
     uint32_t* gpu_offsets = NULL;
     uint32_t* cpu_offsets = NULL;
@@ -844,6 +1007,7 @@ static int do_split_decompress_mode(const char* input_path,
     uint64_t t0 = get_us(), t_read0, t_init0, t_kernel0, t_download0, t_write0;
     uint64_t t_read1 = 0, t_init1 = 0, t_kernel1 = 0, t_download1 = 0, t_write1 = 0;
     size_t nblk, gpu_blocks, cpu_blocks, comp_size = 0, gpu_comp_size = 0, cpu_comp_size = 0;
+    size_t total_decompressed = 0;
     size_t gpu_out_size, cpu_out_size, gpu_global = 1, cpu_global = 1, gpu_local, cpu_local = 1;
     long payload_pos, payload_end;
     int rc = 1;
@@ -853,9 +1017,30 @@ static int do_split_decompress_mode(const char* input_path,
     fin = fopen(input_path, "rb");
     if (!fin) return -1;
     t_read0 = get_us();
-    if (fread(&magic, 1, 4, fin) != 4 || magic != 0x184D2204) goto cleanup;
-    if (fread(&nblk32, 1, 4, fin) != 4 || nblk32 == 0) goto cleanup;
-    if (fread(&block_size, 1, 4, fin) != 4 || block_size == 0) goto cleanup;
+    if (fread(&magic, 1, 4, fin) != 4) goto cleanup;
+    if (magic == LZ4_SPLIT_MAGIC_V2) {
+        memset(&header, 0, sizeof(header));
+        header.magic = magic;
+        if (fread(((unsigned char*)&header) + 4, 1, sizeof(header) - 4, fin) != sizeof(header) - 4) goto cleanup;
+        nblk32 = header.total_blocks;
+        default_block_size = header.default_block_size;
+        gpu_block_size = header.gpu_block_size ? header.gpu_block_size : default_block_size;
+        cpu_block_size = header.cpu_block_size ? header.cpu_block_size : default_block_size;
+    } else if (magic == LZ4_SPLIT_MAGIC_V1) {
+        if (fread(&nblk32, 1, 4, fin) != 4 || nblk32 == 0) goto cleanup;
+        if (fread(&default_block_size, 1, 4, fin) != 4 || default_block_size == 0) goto cleanup;
+        memset(&header, 0, sizeof(header));
+        header.magic = magic;
+        header.total_blocks = nblk32;
+        header.default_block_size = default_block_size;
+        header.gpu_block_size = default_block_size;
+        header.cpu_block_size = default_block_size;
+        gpu_block_size = default_block_size;
+        cpu_block_size = default_block_size;
+    } else {
+        goto cleanup;
+    }
+    if (nblk32 == 0 || default_block_size == 0) goto cleanup;
     nblk = nblk32;
     sizes = (uint32_t*)malloc(nblk * sizeof(uint32_t));
     if (!sizes) goto cleanup;
@@ -873,13 +1058,24 @@ static int do_split_decompress_mode(const char* input_path,
     fin = NULL;
     t_read1 = get_us();
 
-    cpu_blocks = (size_t)((double)nblk * (1.0 - g_cli_gpu_ratio) + 0.5);
-    if (g_cli_gpu_ratio <= 0.0) cpu_blocks = nblk;
-    if (g_cli_gpu_ratio >= 1.0) cpu_blocks = 0;
-    if (cpu_blocks > nblk) cpu_blocks = nblk;
-    gpu_blocks = nblk - cpu_blocks;
-    if (g_cli_gpu_ratio > 0.0 && gpu_blocks == 0 && nblk > 0) { gpu_blocks = 1; cpu_blocks = nblk - 1; }
-    if (g_cli_gpu_ratio < 1.0 && cpu_blocks == 0 && nblk > 1) { cpu_blocks = 1; gpu_blocks = nblk - 1; }
+    if (header.magic == LZ4_SPLIT_MAGIC_V2 && header.gpu_blocks + header.cpu_blocks == nblk) {
+        gpu_blocks = header.gpu_blocks;
+        cpu_blocks = header.cpu_blocks;
+        if (!g_cli_cpu_threads_set && (header.flags & 0xFFFFU) != 0) {
+            g_cli_cpu_threads = (size_t)(header.flags & 0xFFFFU);
+            g_cli_cpu_threads_set = 1;
+        }
+    } else {
+        cpu_blocks = (size_t)((double)nblk * (1.0 - g_cli_gpu_ratio) + 0.5);
+        if (g_cli_gpu_ratio <= 0.0) cpu_blocks = nblk;
+        if (g_cli_gpu_ratio >= 1.0) cpu_blocks = 0;
+        if (cpu_blocks > nblk) cpu_blocks = nblk;
+        gpu_blocks = nblk - cpu_blocks;
+        if (g_cli_gpu_ratio > 0.0 && gpu_blocks == 0 && nblk > 0) { gpu_blocks = 1; cpu_blocks = nblk - 1; }
+        if (g_cli_gpu_ratio < 1.0 && cpu_blocks == 0 && nblk > 1) { cpu_blocks = 1; gpu_blocks = nblk - 1; }
+    }
+    if (gpu_block_size == 0) gpu_block_size = default_block_size;
+    if (cpu_block_size == 0) cpu_block_size = default_block_size;
 
     if (gpu_blocks > 0) gpu_offsets = (uint32_t*)calloc(gpu_blocks, sizeof(uint32_t));
     if (cpu_blocks > 0) cpu_offsets = (uint32_t*)calloc(cpu_blocks, sizeof(uint32_t));
@@ -892,14 +1088,14 @@ static int do_split_decompress_mode(const char* input_path,
         cpu_offsets[i] = (uint32_t)cpu_comp_size;
         cpu_comp_size += sizes[gpu_blocks + i];
     }
-    gpu_out_size = gpu_blocks * (size_t)block_size;
-    cpu_out_size = cpu_blocks * (size_t)block_size;
+    gpu_out_size = gpu_blocks * (size_t)gpu_block_size;
+    cpu_out_size = cpu_blocks * (size_t)cpu_block_size;
     if ((size_t)gpu_comp_size + (size_t)cpu_comp_size != comp_size) goto cleanup;
     gpu_local = (g_cli_local_size > 0) ? g_cli_local_size : 1;
 
     t_init0 = get_us();
-    if ((gpu_blocks > 0 && lz4_split_init_device(&gpu, CL_DEVICE_TYPE_GPU, "GPU") != 0) ||
-        (cpu_blocks > 0 && lz4_split_init_device(&cpu, CL_DEVICE_TYPE_CPU, "CPU") != 0)) {
+    if ((gpu_blocks > 0 && lz4_split_init_device(&gpu, CL_DEVICE_TYPE_GPU, "GPU", gpu_block_size, g_cli_hash_log) != 0) ||
+        (cpu_blocks > 0 && lz4_split_init_device(&cpu, CL_DEVICE_TYPE_CPU, "CPU", cpu_block_size, g_cli_hash_log) != 0)) {
         fprintf(stderr, "[LZ4-SPLIT] failed to initialize required OpenCL devices\n");
         goto cleanup;
     }
@@ -915,7 +1111,7 @@ static int do_split_decompress_mode(const char* input_path,
         if (lz4_checked(clEnqueueWriteBuffer(gpu.q, gpu_comp, CL_TRUE, 0, gpu_comp_size, comp, 0, NULL, NULL), "gpu comp upload") != 0) goto cleanup;
         if (lz4_checked(clEnqueueWriteBuffer(gpu.q, gpu_off, CL_TRUE, 0, gpu_blocks * sizeof(uint32_t), gpu_offsets, 0, NULL, NULL), "gpu offsets upload") != 0) goto cleanup;
         if (lz4_checked(clEnqueueWriteBuffer(gpu.q, gpu_size, CL_TRUE, 0, gpu_blocks * sizeof(uint32_t), sizes, 0, NULL, NULL), "gpu sizes upload") != 0) goto cleanup;
-        if (lz4_split_set_dec_args(gpu.kdec, gpu_comp, gpu_out, gpu_off, gpu_size, gpu_sizes_out, block_size, (uint32_t)gpu_blocks) != 0) goto cleanup;
+        if (lz4_split_set_dec_args(gpu.kdec, gpu_comp, gpu_out, gpu_off, gpu_size, gpu_sizes_out, (uint32_t)gpu_block_size, (uint32_t)gpu_blocks) != 0) goto cleanup;
     }
     if (cpu_blocks > 0) {
         cpu_global = lz4_split_cpu_slots(cpu.dev, cpu_blocks);
@@ -927,7 +1123,7 @@ static int do_split_decompress_mode(const char* input_path,
         if (lz4_checked(clEnqueueWriteBuffer(cpu.q, cpu_comp, CL_TRUE, 0, cpu_comp_size, comp + gpu_comp_size, 0, NULL, NULL), "cpu comp upload") != 0) goto cleanup;
         if (lz4_checked(clEnqueueWriteBuffer(cpu.q, cpu_off, CL_TRUE, 0, cpu_blocks * sizeof(uint32_t), cpu_offsets, 0, NULL, NULL), "cpu offsets upload") != 0) goto cleanup;
         if (lz4_checked(clEnqueueWriteBuffer(cpu.q, cpu_size, CL_TRUE, 0, cpu_blocks * sizeof(uint32_t), sizes + gpu_blocks, 0, NULL, NULL), "cpu sizes upload") != 0) goto cleanup;
-        if (lz4_split_set_dec_args(cpu.kdec, cpu_comp, cpu_out, cpu_off, cpu_size, cpu_sizes_out, block_size, (uint32_t)cpu_blocks) != 0) goto cleanup;
+        if (lz4_split_set_dec_args(cpu.kdec, cpu_comp, cpu_out, cpu_off, cpu_size, cpu_sizes_out, (uint32_t)cpu_block_size, (uint32_t)cpu_blocks) != 0) goto cleanup;
     }
 
     t_kernel0 = get_us();
@@ -960,15 +1156,17 @@ static int do_split_decompress_mode(const char* input_path,
     if (gpu_blocks > 0) {
         for (size_t i = 0; i < gpu_blocks; ++i) {
             size_t n = gpu_out_sizes[i];
-            if (n > block_size) goto cleanup;
-            if (n > 0 && fwrite(gpu_out_h + i * (size_t)block_size, 1, n, fout) != n) goto cleanup;
+            if (n > gpu_block_size) goto cleanup;
+            if (n > 0 && fwrite(gpu_out_h + i * gpu_block_size, 1, n, fout) != n) goto cleanup;
+            total_decompressed += n;
         }
     }
     if (cpu_blocks > 0) {
         for (size_t i = 0; i < cpu_blocks; ++i) {
             size_t n = cpu_out_sizes[i];
-            if (n > block_size) goto cleanup;
-            if (n > 0 && fwrite(cpu_out_h + i * (size_t)block_size, 1, n, fout) != n) goto cleanup;
+            if (n > cpu_block_size) goto cleanup;
+            if (n > 0 && fwrite(cpu_out_h + i * cpu_block_size, 1, n, fout) != n) goto cleanup;
+            total_decompressed += n;
         }
     }
     fclose(fout);
@@ -979,9 +1177,9 @@ static int do_split_decompress_mode(const char* input_path,
         double gpu_us = event_elapsed_us(ev_gpu);
         double cpu_us = event_elapsed_us(ev_cpu);
         unsigned long total_us = (unsigned long)(get_us() - t0);
-        printf("[LZ4-SPLIT][D] %s : %zu -> %zu in %.2f ms blocks=%zu gpu=%zu cpu=%zu cpu_threads=%zu gpu_ratio=%.3f span=%.2f ms gpu_kernel=%.2f ms cpu_kernel=%.2f ms read=%.2f ms init_load=%.2f ms download=%.2f ms write=%.2f ms\n",
-               input_path, comp_size, nblk * (size_t)block_size,
-               total_us / 1000.0, nblk, gpu_blocks, cpu_blocks, g_cli_cpu_threads, g_cli_gpu_ratio,
+        printf("[LZ4-SPLIT][D] %s : %zu -> %zu in %.2f ms gpu_block=%u cpu_block=%u blocks=%zu gpu=%zu cpu=%zu cpu_threads=%zu gpu_ratio=%.3f span=%.2f ms gpu_kernel=%.2f ms cpu_kernel=%.2f ms read=%.2f ms init_load=%.2f ms download=%.2f ms write=%.2f ms\n",
+               input_path, comp_size, total_decompressed,
+               total_us / 1000.0, gpu_block_size, cpu_block_size, nblk, gpu_blocks, cpu_blocks, g_cli_cpu_threads, g_cli_gpu_ratio,
                (t_kernel1 - t_kernel0) / 1000.0, gpu_us / 1000.0, cpu_us / 1000.0,
                (t_read1 - t_read0) / 1000.0, (t_init1 - t_init0) / 1000.0,
                (t_download1 - t_download0) / 1000.0, (t_write1 - t_write0) / 1000.0);
@@ -1023,6 +1221,7 @@ int lz4_daemon_split_file_request(int mode,
                                   int block_size,
                                   int acceleration,
                                   int local_size,
+                                  int hash_log,
                                   uint32_t cpu_share_pct,
                                   uint32_t cpu_threads,
                                   uint32_t adaptive,
@@ -1034,6 +1233,7 @@ int lz4_daemon_split_file_request(int mode,
     int old_cpu_threads_set = g_cli_cpu_threads_set;
     size_t old_block_bytes = g_cli_fixed_block_bytes;
     int old_acceleration = g_cli_acceleration;
+    int old_hash_log = g_cli_hash_log;
     size_t old_local_size = g_cli_local_size;
     uint64_t t0;
     int ret;
@@ -1042,7 +1242,7 @@ int lz4_daemon_split_file_request(int mode,
 
     pthread_mutex_lock(&g_daemon_split_call_lock);
     lz4_split_set_daemon_cache_enabled(1);
-    g_cli_gpu_ratio = adaptive ? 0.5 : (1.0 - ((double)cpu_share_pct / 100.0));
+    g_cli_gpu_ratio = (1.0 - ((double)cpu_share_pct / 100.0));
     if (g_cli_gpu_ratio < 0.0) g_cli_gpu_ratio = 0.0;
     if (g_cli_gpu_ratio > 1.0) g_cli_gpu_ratio = 1.0;
     g_cli_gpu_ratio_set = 1;
@@ -1051,6 +1251,7 @@ int lz4_daemon_split_file_request(int mode,
     g_cli_cpu_threads_set = cpu_threads > 0 ? 1 : 0;
     g_cli_fixed_block_bytes = block_size > 0 ? (size_t)block_size : 64U * 1024U;
     g_cli_acceleration = acceleration > 0 ? acceleration : 1;
+    g_cli_hash_log = lz4_sanitize_hash_log_cli(hash_log > 0 ? hash_log : 14);
     g_cli_local_size = local_size > 0 ? (size_t)local_size : 1;
 
     t0 = get_us();
@@ -1068,6 +1269,7 @@ int lz4_daemon_split_file_request(int mode,
     g_cli_cpu_threads_set = old_cpu_threads_set;
     g_cli_fixed_block_bytes = old_block_bytes;
     g_cli_acceleration = old_acceleration;
+    g_cli_hash_log = old_hash_log;
     g_cli_local_size = old_local_size;
     pthread_mutex_unlock(&g_daemon_split_call_lock);
     return ret;
@@ -1104,7 +1306,8 @@ static int run_lz4_bench(const char* input_path,
         return 1;
     }
 
-    cl_program prog = lz4_load_program(ctx, dev);
+    g_cli_hash_log = lz4_sanitize_hash_log_cli(g_cli_hash_log);
+    cl_program prog = lz4_load_program(ctx, dev, g_cli_hash_log, g_cli_fixed_block_bytes);
     if (!prog) {
         fprintf(stderr, "bench error: kernel program load failed\n");
         clReleaseCommandQueue(queue);
@@ -1210,6 +1413,7 @@ static int run_lz4_bench(const char* input_path,
                                    NULL,
                                    (size_t)block_size,
                                    acceleration,
+                                   g_cli_hash_log,
                                    &ws,
                                    &tc,
                                    local_size,
@@ -1589,6 +1793,9 @@ int run_lz4_standalone(int argc, char** argv) {
         } else if (strcmp(argv[i], "--local") == 0) {
             if (i + 1 < argc) g_cli_local_size = atoi(argv[++i]);
             else { fprintf(stderr, "Error: --local requires an argument\n"); return 1; }
+        } else if (strcmp(argv[i], "--d-bits") == 0) {
+            if (i + 1 < argc) g_cli_hash_log = lz4_sanitize_hash_log_cli(atoi(argv[++i]));
+            else { fprintf(stderr, "Error: --d-bits requires an argument\n"); return 1; }
         } else if (strcmp(argv[i], "--cpu-threads") == 0) {
             if (i + 1 < argc) lz4_cli_set_cpu_threads(atol(argv[++i]));
             else { fprintf(stderr, "Error: --cpu-threads requires an argument\n"); return 1; }
@@ -1686,7 +1893,7 @@ int run_lz4_standalone(int argc, char** argv) {
     uint64_t t_total_start = get_us();
     uint64_t t1, t2;
 
-    if (lz4_split_enabled()) {
+    if (lz4_split_enabled() || (mode != mode_compress && lz4_file_has_split_magic(effective_input_path))) {
         if (input_from_stdin || output_to_stdout) {
             fprintf(stderr, "Error: split mode does not support stdin/stdout yet\n");
             ret = 1;
@@ -1716,7 +1923,8 @@ int run_lz4_standalone(int argc, char** argv) {
     g_ocl_init_us = t2 - t1;
 
     t1 = get_us();
-    prog = lz4_load_program(ctx, dev);
+    g_cli_hash_log = lz4_sanitize_hash_log_cli(g_cli_hash_log);
+    prog = lz4_load_program(ctx, dev, g_cli_hash_log, g_cli_fixed_block_bytes);
     t2 = get_us();
     g_kernel_load_us = t2 - t1;
 
@@ -1748,6 +1956,7 @@ int run_lz4_standalone(int argc, char** argv) {
                                 effective_output_path,
                                 (int)g_cli_fixed_block_bytes,
                                 g_cli_acceleration,
+                                g_cli_hash_log,
                                 &ws,
                                 &t_out,
                                 (int)g_cli_local_size,
@@ -1828,6 +2037,7 @@ int main(int argc, char** argv) {
             uint32_t daemon_cpu_share_pct = 0;
             uint32_t daemon_cpu_threads = 0;
             uint32_t daemon_adaptive = 0;
+            int daemon_hash_log = 14;
             const char* input = NULL;
             char output[512] = {0};
             int output_explicit = 0;
@@ -1854,6 +2064,8 @@ int main(int argc, char** argv) {
                     g_cli_acceleration = atoi(argv[++i]);
                 } else if ((strcmp(argv[i], "--local") == 0) && i + 1 < argc) {
                     g_cli_local_size = atoi(argv[++i]);
+                } else if (strcmp(argv[i], "--d-bits") == 0 && i + 1 < argc) {
+                    daemon_hash_log = lz4_sanitize_hash_log_cli(atoi(argv[++i]));
                 } else if (strcmp(argv[i], "--cpu-threads") == 0 && i + 1 < argc) {
                     long v = atol(argv[++i]);
                     if (v < 0) v = 0;
@@ -1868,7 +2080,7 @@ int main(int argc, char** argv) {
                     const char* value = argv[++i];
                     if (strcasecmp(value, "adaptive") == 0) {
                         daemon_adaptive = 1;
-                        daemon_cpu_share_pct = 50;
+                        daemon_cpu_share_pct = 0;
                     } else {
                         double ratio = atof(value);
                         if (ratio < 0.0) ratio = 0.0;
@@ -1879,7 +2091,7 @@ int main(int argc, char** argv) {
                     const char* value = argv[i] + 12;
                     if (strcasecmp(value, "adaptive") == 0) {
                         daemon_adaptive = 1;
-                        daemon_cpu_share_pct = 50;
+                        daemon_cpu_share_pct = 0;
                     } else {
                         double ratio = atof(value);
                         if (ratio < 0.0) ratio = 0.0;
@@ -1888,7 +2100,7 @@ int main(int argc, char** argv) {
                     }
                 } else if (strcmp(argv[i], "--adaptive") == 0) {
                     daemon_adaptive = 1;
-                    daemon_cpu_share_pct = 50;
+                    daemon_cpu_share_pct = 0;
                 } else if (argv[i][0] == '-' && strcmp(argv[i], "-") != 0) {
                     fprintf(stderr, "Error: Unknown option %s\n", argv[i]);
                     return 1;
@@ -1931,7 +2143,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             return run_lz4_client(mode, input, output, (int)g_cli_fixed_block_bytes, g_cli_acceleration, (int)g_cli_local_size,
-                                  daemon_cpu_share_pct, daemon_cpu_threads, daemon_adaptive);
+                                  daemon_hash_log, daemon_cpu_share_pct, daemon_cpu_threads, daemon_adaptive);
         }
     }
     return run_lz4_standalone(argc, argv);

@@ -61,12 +61,12 @@ GPU LZ4 库通常采用 batched/chunk 模型，常见 chunk 粒度围绕 `64KB`�
 当前 `lz4_gpu`：
 
 - `LZ4_DISTANCE_MAX = 65535`；
-- `LZ4_HASHLOG = 14`；
+- `D_BITS = 11..15`；
 - 当前 GPU 分块字典按 `1 << 14` 个槽组织；32-bit epoch entry 下约 `64KB/table`，16-bit clear entry 下约 `32KB/table`；
 - 旧的“翻倍 table”口径属于 CPU 单流路径遗留，不再作为 GPU 分块字典预算口径；
 - block size 常用 `32/48/64KB`。
 
-当前核心问题不是 `HASHLOG=14` 本身错误，而是 table owner 与 worker/work-item 绑定后，table 总数随并发放大。
+当前核心问题不是 `D_BITS=14` 本身错误，而是 table owner 与 worker/work-item 绑定后，table 总数随并发放大；第二轮需要把 `D_BITS=11/12/13/14/15` 与 `32/48/64KB` 一起扫完，再判断缩表是否值得。
 
 ---
 
@@ -143,7 +143,7 @@ overhead_ratio ≈ 4 / B
 
 ### 2.5 hash table 缩小导致 collision 增加
 
-如果 `HASHLOG=14` 降到 `13`：
+如果 `D_BITS=14` 降到 `13`：
 
 - entry 数减半；
 - table 从 `64KB` 降到 `32KB`；
@@ -164,7 +164,7 @@ overhead_ratio ≈ 4 / B
 
 - block 独立；
 - hash table per worker/state；
-- `HASHLOG=14`；
+- `D_BITS=14`；
 - mapped host copy 默认化；
 - 压缩 worker 分段选择；
 - lazy-match 已并入，用一次 look-ahead 改善部分压缩率/吞吐折中。
@@ -266,7 +266,7 @@ overhead_ratio ≈ 4 / B
 
 4. **验证**
    - block size：`32/48/64KB`；
-   - `HASHLOG=14` 固定；
+   - `D_BITS=11/12/13/14/15` 扫描；
    - 全样本多轮；
    - 指标：`CompKernel`、no-ocl-init `CompTotal`、压缩率、table bytes、table slots、blocks/slot。
 
@@ -274,7 +274,7 @@ overhead_ratio ≈ 4 / B
 
 当前状态（2026-05-20）：
 
-- `lz4_gpu` 与 `lz4_experimental` 已统一到 `HASHLOG=14` 默认路径；
+- `lz4_gpu` 与 `lz4_experimental` 已统一到 `D_BITS=14` 默认路径；第二轮将放开 `D_BITS=11..15` 扫描；
 - standalone/bench/daemon 已统一调用 `lz4_load_program()`，编译参数由 block size 和字典模式决定；
 - `clear16` 已迁移到 `lz4_gpu` 主线，`block_size <= 64KB` 时 entry 使用 16-bit block-local offset；
 - table slot pool 只保留为诊断/平台适配开关，不作为默认策略；后续不再围绕 slot gate 发散。
@@ -284,21 +284,21 @@ overhead_ratio ≈ 4 / B
 - experimental 二进制必须**优先加载自身目录下的 `lz4_gpu.cl`**，不能误用兄弟目录原始 `../lz4_gpu/lz4_gpu.cl`。
 - 否则会出现 host/kernel ABI 不一致，表现为 `clSetKernelArg(...)= -51` 之类的假失败，结果不能用于 P0 判定。
 
-### 4.2 P1：HASHLOG 与 table slot 联动
+### 4.2 P1：D_BITS 与 table slot 联动
 
-目标：确认是否需要减小单 table。`HASHLOG` 不是单纯的压缩率开关，而是 table footprint、cache 访问、candidate 质量和真实端到端时间之间的权衡。
+目标：确认是否需要减小单 table。`D_BITS` 不是单纯的压缩率开关，而是 table footprint、cache 访问、candidate 质量和真实端到端时间之间的权衡。
 
 步骤：
 
-1. 在 `32/48/64KB` block size 下扫描 `HASHLOG=13/14`，必要时加入 `15` 作为对照；
-2. 固定其他变量，避免把 slot pool、block size、accel 和 hashlog 混成不可解释的三元扫描；
+1. 在 `32/48/64KB` block size 下扫描 `D_BITS=11/12/13/14/15`；
+2. 固定其他变量，避免把 slot pool、block size、accel 和 `D_BITS` 混成不可解释的三元扫描；
 3. 同时统计压缩主吞吐、no-ocl-init 端到端压缩吞吐、压缩率、压缩输出大小、table bytes；
 4. debug 轮次再统计 candidate hit、failed compare、match length，用于解释为什么某些文件吞吐或压缩率变化；
 5. 分文件看文本/XML/内存镜像、日志类、二进制类、难压缩类数据差异。
 
 判定：
 
-- `HASHLOG=13` 允许压缩率有小幅损失；不能因为压缩率数值变大就直接拒绝；
+- `D_BITS=11/12/13` 允许压缩率有小幅损失；不能因为压缩率数值变大就直接拒绝；
 - 是否采纳取决于：table footprint 减半是否带来压缩主吞吐或 no-ocl-init 端到端压缩吞吐的稳定收益，以及该收益能否覆盖输出变大带来的写出/传输代价；
 - 如果压缩率损失集中在少数高度可压缩文件，而吞吐收益在大多数文件稳定存在，可以保留为显式 profile 或后续 adaptive 候选；
 - 如果 kernel 吞吐提升但 no-ocl-init 端到端吞吐没有提升，说明收益被输出变大、host copy 或文件写入抵消，不采纳为默认；
@@ -308,10 +308,10 @@ overhead_ratio ≈ 4 / B
 
 当前状态（2026-05-20）：
 
-- `HASHLOG=13` 曾显示 table/cache 受益，但压缩率与文件差异风险仍在；
-- 第一轮主线迁移不采纳 `HASHLOG=13` 默认化；
-- `HASHLOG=14` 继续作为 `lz4_gpu` 主线默认；
-- 后续若重做 `HASHLOG`，必须同时看 kernel、端到端、输出大小和典型文件，不再只凭子集或单指标判断。
+- `D_BITS=11/12/13` 曾显示 table/cache 受益的可能性，但压缩率与文件差异风险仍在；
+- 第一轮主线迁移不采纳更小 `D_BITS` 默认化；
+- `D_BITS=14` 继续作为 `lz4_gpu` 主线默认；
+- 后续若重做 `D_BITS`，必须同时看 kernel、端到端、输出大小和典型文件，不再只凭子集或单指标判断。
 
 ### 4.2.1 P4：字典 entry、epoch 与清表对照
 
@@ -319,8 +319,8 @@ overhead_ratio ≈ 4 / B
 
 当前实现现状：
 
-- 当前 GPU 分块字典 entry 数为 `1 << HASHLOG`，不是 `1 << (HASHLOG + 1)`；
-- `HASHLOG=14` 时每个 table 有 `16384` 个 entry；
+- 当前 GPU 分块字典 entry 数为 `1 << D_BITS`；
+- `D_BITS=14` 时每个 table 有 `16384` 个 entry；
 - 当前默认 entry 为 32-bit `[12-bit epoch | 20-bit block-local position]`；
 - 对 `block_size <= 64KB`，20-bit position 过宽，16-bit block-local offset 已足够。
 
@@ -329,11 +329,11 @@ overhead_ratio ≈ 4 / B
 - `epoch32`：32-bit epoch entry，作为大于 64KB block 的回退模式；
 - `clear32`：32-bit position-only，每 block 清表，未采纳；
 - `clear16`：16-bit position-only，每 block 清表，已采纳；
-- 105 远端最终测试显示，当前主线相对基线在 64K/HASHLOG=14 下压缩 kernel 中位 `+10.74%`，端到端压缩中位 `+14.35%`，ratio 中位相对变化 `+0.264%`。
+- 105 远端最终测试显示，当前主线相对基线在 `64K/D_BITS=14` 下压缩 kernel 中位 `+10.74%`，端到端压缩中位 `+14.35%`，ratio 中位相对变化 `+0.264%`。
 
 下一步：
 
-- 继续比较 `clear16 × HASHLOG=13/14`，但默认仍保持 `HASHLOG=14`；
+- 继续比较 `clear16 × D_BITS=11/12/13/14/15`，但默认仍保持 `D_BITS=14`；
 - 后续压缩/解压执行流优化必须以 `clear16` 字典结构为新默认基线；
 - 只有在能降低总 load 或清表成本时，才考虑 slot-local epoch / side-table，避免重新引入双 load 热路径。
 
@@ -432,7 +432,7 @@ overhead_ratio ≈ 4 / B
 
 ## 6. 当前最终对比
 
-最终对比结果见 `exp_results/remote105_gpu_compare_full6`。该结果来自 `192.168.2.105` 的 `/root/samples` 全量 26 文件，配置为 `64K block / HASHLOG=14 / accel=1 / local=1`，每文件 `1` 轮 bench + `6` 轮真实压缩/解压。
+最终对比结果见 `exp_results/remote105_gpu_compare_full6`。该结果来自 `192.168.2.105` 的 `/root/samples` 全量 26 文件，配置为 `64K block / D_BITS=14 / accel=1 / local=1`，每文件 `1` 轮 bench + `6` 轮真实压缩/解压。
 
 相对 `lz4_gpu_baseline_`：
 
@@ -442,6 +442,101 @@ overhead_ratio ≈ 4 / B
 - 端到端解压：中位 `-1.08%`，平均 `-1.12%`；
 - ratio 数值：中位相对变化 `+0.264%`，平均 `+0.307%`，压缩率轻微变差。
 
-当前已迁移到 `lz4_gpu` 的有效项：编译路径统一、`clear16` 字典、`uint4` 清表、`LZ4_hashPosition()` 非空路径、删除 vector copy fallback、daemon raw-buffer 协议与 context/program/kernel 复用。未迁移项：`HASHLOG=13` 默认、slot factor 默认化、sig8/hsig8、small-offset fast path、解压 copy 分支收缩、bench-only gather/compaction。
+当前已迁移到 `lz4_gpu` 的有效项：编译路径统一、`clear16` 字典、`uint4` 清表、`LZ4_hashPosition()` 非空路径、删除 vector copy fallback、daemon raw-buffer 协议与 context/program/kernel 复用。未迁移项：`D_BITS=13` 默认、slot factor 默认化、sig8/hsig8、small-offset fast path、解压 copy 分支收缩、bench-only gather/compaction。
 
 提交前重新收集的 105 当前 GPU 基线见 `exp_results/gpu_baseline_105_final`，用于后续改进轮次作为新基线。
+
+---
+
+## 7. 第二轮 `D_BITS × block` 全样本扫描（2026-05-20）
+
+测试平台：`192.168.2.105:/root/lz4`；样本：`/root/samples` 全量 26 文件；配置：`32/48/64KB × D_BITS=11..15 × local=1 × accel=1`；轮次：每文件 `1` 轮 5 秒 bench + `6` 轮真实压缩/解压；有效结果目录：`/root/gpu_round2_lz4_dbits_fixed/lz4/runs/20260520_123524`。顺序执行，未与 LZO 同时占用 GPU；`verify_all=True`。
+
+本轮明确修正了一个测试前提错误：旧 LZ4 D15 结果中，daemon 的 program/kernel 缓存键只按字典模式区分，没有把 `D_BITS` 纳入 key；同一 daemon 进程内扫描多个 `D_BITS` 时，可能复用前一个 `D_BITS=14` program/kernel 来执行后续 `D_BITS=15` 请求，造成 host 统计、kernel 编译参数和结果口径错配，ratio 异常膨胀。修复后 daemon 缓存按 `dict_mode × D_BITS` 分开，D15 压缩率恢复为略优于 D14，但吞吐下降。
+
+### 7.1 汇总结果
+
+| block | D_BITS | ratio% 中位 | 压缩主吞吐 MB/s | 解压主吞吐 MB/s | 端到端压缩 MB/s | 端到端解压 MB/s | 判定 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 32KB | 11 | 36.253 | 1321.3 | 4676.4 | 680.0 | 1089.8 | ratio 风险偏高 |
+| 32KB | 12 | 35.923 | 1339.2 | 4662.5 | 672.0 | 1096.6 | 非默认 profile 候选 |
+| 32KB | 13 | 35.752 | 1344.6 | 4647.1 | 659.2 | 1096.8 | 非默认 profile 候选 |
+| 32KB | 14 | 35.671 | 1300.0 | 4667.7 | 618.0 | 1088.1 | 小块高吞吐候选 |
+| 32KB | 15 | 35.636 | 1193.6 | 4650.9 | 550.9 | 1088.5 | 不默认：资源和吞吐不划算 |
+| 48KB | 11 | 35.938 | 1015.3 | 4061.3 | 595.7 | 1049.8 | ratio 风险偏高 |
+| 48KB | 12 | 35.509 | 1013.4 | 4045.6 | 594.7 | 1057.9 | 非默认 profile 候选 |
+| 48KB | 13 | 35.273 | 1005.0 | 4018.7 | 584.9 | 1054.3 | 非默认 profile 候选 |
+| 48KB | 14 | 35.166 | 995.7 | 3988.9 | 567.7 | 1048.1 | 均衡候选 |
+| 48KB | 15 | 35.117 | 954.0 | 3980.9 | 529.3 | 1046.9 | 不默认：吞吐下降 |
+| 64KB | 11 | 35.785 | 928.1 | 3679.8 | 556.4 | 1026.4 | ratio 风险偏高 |
+| 64KB | 12 | 35.272 | 918.2 | 3663.7 | 552.2 | 1013.7 | 资源预算候选 |
+| 64KB | 13 | 34.975 | 927.4 | 3620.3 | 547.2 | 995.5 | 资源预算候选 |
+| 64KB | 14 | 34.838 | 913.2 | 3550.3 | 532.1 | 998.4 | 默认基准 |
+| 64KB | 15 | 34.775 | 882.8 | 3527.0 | 509.4 | 988.0 | 不默认：压缩率略好但吞吐下降 |
+
+### 7.2 结论
+
+- `D_BITS=15` 修复后表现符合预期：压缩率略好于 D14，但字典翻倍、压缩主吞吐和端到端压缩下降，因此不作为默认。
+- `32KB` block 明显提高压缩/解压主吞吐，原因是 block 数增加后并发更足、单 block 字典冷启动更短，但可压缩文件的边界损失更明显；`osdb/dickens/x-ray/webster` 等文件相对 `64KB/D14` 的 ratio 损失可超过 2.5 个百分点。
+- `48KB/D13-D14` 是更均衡的折中：端到端压缩比 `64KB/D14` 高约 `7%`，ratio 中位损失约 `0.33-0.44` 个百分点；但 `webster/redis-video/nci` 等文件压缩主吞吐会退化，不能无条件替换默认。
+- `64KB/D13` 在 active lanes 不变时把 table 从 `D14` 的 `32KB/owner` 降到 `16KB/owner`（clear16 模式），ratio 中位仅损失 `0.137` 个百分点，压缩主吞吐约 `+1.6%`，端到端压缩约 `+2.8%`。这是纯“缩字典、不缩并发”的有效资源候选。
+- 当前默认保持 `64KB/D14`。可保留的 profile 方向是 `48KB/D13-D14` 或 `32KB/D13-D14`，用于更重视吞吐、允许少量压缩率损失的场景；不做基于文件内容的无证据 gate。
+
+### 7.3 第二轮拒绝表
+
+| 项目 | 判定 | 原因 |
+| --- | --- | --- |
+| LZ4/LZO 并发运行得到的第一轮 full 结果 | 拒绝 | 两个测试同时占用 105 GPU，吞吐被 GPU contention 污染 |
+| 降低压缩/解压并发 cap 作为默认 | 拒绝 | 已验证会损害 occupancy/延迟隐藏，压缩主吞吐退化明显 |
+| 把“缩字典”实现成“缩 active lanes” | 拒绝 | 用户目标是 table footprint 下降但并发不变；降低 active lanes 会混入 occupancy 变化，不能解释 D_BITS 本身 |
+| 旧 LZ4 D15 结果 | 作废 | daemon 缓存键缺少 D_BITS，混扫时可能复用错误 program/kernel，导致 ratio 异常 |
+| `D_BITS=15` 默认化 | 拒绝 | 修复后压缩率略好，但字典翻倍且压缩吞吐下降 |
+| 单纯按文件内容特征 gate | 拒绝 | 当前没有通用、低成本且可解释的特征，不作为默认路径 |
+
+### 7.4 2026-05-20 复核：D15 异常修正与共享字典 decouple 验证
+
+本轮复核只处理两个问题：确认 D15 异常的真实来源，以及验证“缩字典但不缩并发”的 tagged shared 方案。
+
+#### 7.4.1 D15 异常的真实来源
+
+旧异常不是 LZ4 算法在 D15 下本身失效，而是 daemon program/kernel 缓存没有把 `D_BITS` 纳入 key：
+
+- standalone 压缩路径按 `--d-bits` 正确构建 program；
+- daemon 历史上只按 `dict_mode` 缓存 program/kernel；
+- 当扫描 `D14 -> D15` 时，后续请求可能复用 D14 program/kernel，输出 ratio 就不再代表真实 D15；
+- 当前已改为 `dict_mode × D_BITS` 二维缓存，并且 bench/manual 均走单一 `d_bits` 参数口径。
+
+修正后，105 上 smoke 结果恢复正常：`D15` 的压缩率略优于 `D14`，但压缩主吞吐和端到端压缩都下降，因此仍不作为默认。
+
+本轮随后又用 105 上已经验证过的全样本矩阵做了复核，结论与上面的 smoke 一致：`D15` 并没有出现系统性的压缩率异常增大；相反，在 `32KB / 48KB / 64KB` 三种 block 下，`D15` 相对 `D14` 的压缩率中位值分别再下降约 `0.047 / 0.062 / 0.077` 个百分点，只有个别大文件出现极小的反向波动。对应地，压缩主吞吐与端到端压缩吞吐仍然下降。因此，`D15` 不是“ratio 异常”的问题点，真正的代价仍然是字典更大带来的吞吐损失。
+
+这也再次说明：后续要验证的不是“把并发压小来换字典”，而是“在并发保持不变的前提下，怎么缩小字典 footprint、entry 宽度或 block 组织方式”。`dict_owner_count` 继续和 `active_lanes` 绑定没有解决这个目标。
+
+#### 7.4.2 “缩字典但不缩并发”的 tagged shared 变体
+
+为了满足“字典缩小但并发不变”的约束，新增了一个实验性的 shared/tagged 变体：
+
+- `active_lanes` 保持原来的 raw worker 数；
+- `dict_owner_count` 单独按 slot factor 裁剪；
+- 每个 lane 使用自己的 `lane_tag`，在 64KB block 范围内用 16-bit tag + 16-bit offset 共享较小字典。
+
+验证结果一致：
+
+- 压缩率没有改善；
+- 压缩 kernel 吞吐下降；
+- 端到端压缩吞吐也下降；
+- 解压基本不受影响，问题集中在压缩侧 shared dict 竞争和 tag 检查成本。
+
+结论：**该 tagged shared 方案不值得采纳**。它说明“缩字典”本身不会自动带来收益；如果没有更低成本的共享/复用机制，新增 tag 检查和共享写冲突会抵消收益。
+
+#### 7.4.3 本轮补充拒绝表
+
+| 项目 | 判定 | 原因 |
+| --- | --- | --- |
+| 旧 LZ4 D15 结果 | 作废 | daemon program/kernel 缓存键缺少 D_BITS，混扫时可能复用错误内核 |
+| tagged shared dict decouple 变体 | 拒绝 | 压缩率不升，压缩吞吐和端到端都下降 |
+| lock-based shared owner decouple 变体 | 拒绝 | 105 smoke 出现 verify fail；即使部分组合通过，压缩吞吐也明显塌陷 |
+| 继续扩大 shared/tagged/lock dict 扫描 | 拒绝 | 已验证共享写、tag 检查或锁同步会抵消缩字典收益，不能代表可靠优化路径 |
+
+> 备注：本轮还确认了一个旧测试前提错误的修正是应当保留的：`D15` 在 host/daemon/kernel 侧必须统一传递同一 `d_bits`，否则会把字典分配与索引口径弄错，出现异常压缩率。该修复与上面的失败原型无关，不应回滚。
+

@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import time
+import statistics
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -475,6 +476,12 @@ class TelemetryProbe:
                 "cpu_pkg_avg_power_w": 0.0,
                 "cpu_core_avg_power_w": 0.0,
                 "gpu_avg_power_w": 0.0,
+                "cpu_pkg_power_stdev_w": 0.0,
+                "cpu_core_power_stdev_w": 0.0,
+                "gpu_power_stdev_w": 0.0,
+                "cpu_pkg_power_cv_pct": 0.0,
+                "cpu_core_power_cv_pct": 0.0,
+                "gpu_power_cv_pct": 0.0,
             }
 
         cpu_freq_vals = [float(s.get("cpu_freq_mhz") or 0.0) for s in samples]
@@ -498,6 +505,12 @@ class TelemetryProbe:
                 "cpu_pkg_avg_power_w": cpu_p,
                 "cpu_core_avg_power_w": core_p,
                 "gpu_avg_power_w": gpu_p,
+                "cpu_pkg_power_stdev_w": 0.0,
+                "cpu_core_power_stdev_w": 0.0,
+                "gpu_power_stdev_w": 0.0,
+                "cpu_pkg_power_cv_pct": 0.0,
+                "cpu_core_power_cv_pct": 0.0,
+                "gpu_power_cv_pct": 0.0,
             }
 
         cpu_energy = 0.0
@@ -607,6 +620,21 @@ class TelemetryProbe:
             if gpu_power_vals:
                 gpu_avg = float(sum(gpu_power_vals) / len(gpu_power_vals))
 
+        cpu_power_vals = [float(s.get("cpu_power_w") or 0.0) for s in samples if float(s.get("cpu_power_w") or 0.0) > 0.0]
+        core_power_vals = [float(s.get("core_power_w") or 0.0) for s in samples if float(s.get("core_power_w") or 0.0) > 0.0]
+        gpu_power_vals = [float(s.get("gpu_power_w") or 0.0) for s in samples if float(s.get("gpu_power_w") or 0.0) > 0.0]
+
+        def _stdev(vals):
+            return float(statistics.pstdev(vals)) if len(vals) > 1 else 0.0
+
+        def _cv(vals):
+            if len(vals) <= 1:
+                return 0.0
+            avg = float(sum(vals) / len(vals)) if vals else 0.0
+            if avg == 0.0:
+                return 0.0
+            return 100.0 * float(statistics.pstdev(vals)) / avg
+
         return {
             "elapsed_s": float(elapsed_total),
             "cpu_freq_avg_mhz": float(sum(cpu_freq_vals) / len(cpu_freq_vals)) if cpu_freq_vals else 0.0,
@@ -620,6 +648,12 @@ class TelemetryProbe:
             "cpu_pkg_avg_power_w": float(cpu_pkg_avg),
             "cpu_core_avg_power_w": float(cpu_core_avg),
             "gpu_avg_power_w": float(gpu_avg),
+            "cpu_pkg_power_stdev_w": _stdev(cpu_power_vals),
+            "cpu_core_power_stdev_w": _stdev(core_power_vals),
+            "gpu_power_stdev_w": _stdev(gpu_power_vals),
+            "cpu_pkg_power_cv_pct": _cv(cpu_power_vals),
+            "cpu_core_power_cv_pct": _cv(core_power_vals),
+            "gpu_power_cv_pct": _cv(gpu_power_vals),
         }
 
 
