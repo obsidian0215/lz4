@@ -976,6 +976,7 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
     cl_event ev;
     err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &g_ws, &l_ws, 0, NULL, &ev);
     clWaitForEvents(1, &ev);
+    clReleaseEvent(ev);
     t->kernel_exec_us = (unsigned long)(get_us() - t1);
     t->algo_config = (unsigned long)hash_log;
 
@@ -1085,13 +1086,28 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
     if (fread(&num_blocks, 1, 4, fin) != 4) { fclose(fin); return -1; }
     if (fread(&block_size_val, 1, 4, fin) != 4) { fclose(fin); return -1; }
 
-    uint32_t* h_comp_sizes = malloc(num_blocks * sizeof(uint32_t));
-    fread(h_comp_sizes, 1, num_blocks * 4, fin);
-
-    size_t header_size = 12 + num_blocks * 4;
+    /* Validate the header against the actual file before trusting num_blocks
+     * for allocation or handing per-block (offset,length) to the kernel. A
+     * corrupted/truncated frame (payloads cross the network in migration)
+     * must be rejected here so a bogus length cannot defeat the kernel's own
+     * output-bounds guard. */
+    size_t header_size = 12 + (size_t)num_blocks * 4;
     fseek(fin, 0, SEEK_END);
     size_t file_size = ftell(fin);
+    if (block_size_val == 0 || header_size > file_size) { fclose(fin); return -1; }
     size_t data_size = file_size - header_size;
+    fseek(fin, 12, SEEK_SET);
+
+    uint32_t* h_comp_sizes = malloc(num_blocks * sizeof(uint32_t));
+    if (!h_comp_sizes) { fclose(fin); return -1; }
+    if (fread(h_comp_sizes, 4, num_blocks, fin) != num_blocks) { free(h_comp_sizes); fclose(fin); return -1; }
+
+    /* Per-block compressed lengths must exactly tile the payload region. */
+    {
+        uint64_t sum = 0;
+        for (uint32_t i = 0; i < num_blocks; i++) sum += h_comp_sizes[i];
+        if (sum != (uint64_t)data_size) { free(h_comp_sizes); fclose(fin); return -1; }
+    }
     fseek(fin, header_size, SEEK_SET);
     t->in_size = (unsigned long)file_size;
     t->file_read_us = 0;
@@ -1365,6 +1381,7 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
     cl_event ev;
     err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &g_ws, &l_ws, 0, NULL, &ev);
     clWaitForEvents(1, &ev);
+    clReleaseEvent(ev);
     t->kernel_exec_us = (unsigned long)(get_us() - t1);
     t->algo_config = 0; // Not applicable for LZ4 decompress
 
@@ -1380,7 +1397,20 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
     }
 
     size_t total_decomp_sz = 0;
-    for (uint32_t i = 0; i < num_blocks; i++) total_decomp_sz += h_final_sizes[i];
+    for (uint32_t i = 0; i < num_blocks; i++) {
+        /* The kernel writes 0xFFFFFFFF into a block's size on a decode error
+         * (e.g. the new corrupted-input guard). Reject instead of folding the
+         * sentinel into the total, which would corrupt the readback size. */
+        if (h_final_sizes[i] == 0xFFFFFFFFu) {
+            fprintf(stderr, "[LZ4] decode error in block %u (corrupted input)\n", i);
+            free(h_final_sizes);
+            if (dbg_dec_buf) clReleaseMemObject(dbg_dec_buf);
+            free(h_comp_sizes); free(h_comp_offsets); free(h_comp_sizes_32);
+            free(h_out_offsets); free(h_max_out_sizes);
+            return -1;
+        }
+        total_decomp_sz += h_final_sizes[i];
+    }
     t->out_size = total_decomp_sz;
 
     t->download_total_us = (unsigned long)(get_us() - t1);

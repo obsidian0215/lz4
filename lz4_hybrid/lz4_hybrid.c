@@ -1042,6 +1042,20 @@ static int do_split_decompress_mode(const char* input_path,
     }
     if (nblk32 == 0 || default_block_size == 0) goto cleanup;
     nblk = nblk32;
+    /* Bound the descriptor count against the actual file before allocating or
+     * trusting per-block lengths: a corrupted/truncated split container (these
+     * cross the network in migration) must be rejected here, not handed to the
+     * kernel where a bogus length would defeat its output-bounds guard. */
+    {
+        long desc_pos = ftell(fin);
+        fseek(fin, 0, SEEK_END);
+        long file_end_pos = ftell(fin);
+        fseek(fin, desc_pos, SEEK_SET);
+        if (file_end_pos < desc_pos ||
+            (uint64_t)(file_end_pos - desc_pos) < (uint64_t)nblk * sizeof(uint32_t)) {
+            goto cleanup;
+        }
+    }
     sizes = (uint32_t*)malloc(nblk * sizeof(uint32_t));
     if (!sizes) goto cleanup;
     if (fread(sizes, sizeof(uint32_t), nblk, fin) != nblk) goto cleanup;
@@ -1050,6 +1064,12 @@ static int do_split_decompress_mode(const char* input_path,
     payload_end = ftell(fin);
     if (payload_end < payload_pos) goto cleanup;
     comp_size = (size_t)(payload_end - payload_pos);
+    /* Per-block compressed lengths must exactly tile the payload region. */
+    {
+        uint64_t sum = 0;
+        for (size_t i = 0; i < nblk; ++i) sum += sizes[i];
+        if (sum != (uint64_t)comp_size) goto cleanup;
+    }
     fseek(fin, payload_pos, SEEK_SET);
     comp = (unsigned char*)malloc(comp_size ? comp_size : 1);
     if (!comp) goto cleanup;

@@ -841,6 +841,11 @@ _copy_match:
     match = dst + (size_t)match_rel;
 
         cpy = op + length;
+        /* Output upper-bound guard: match length is attacker-controlled via
+         * 255-run extension, so a corrupted/truncated payload can encode a
+         * match that runs past this block's output slot. LZ4_COPY_MATCH writes
+         * exactly `length` bytes, so cpy>oend is the exact overflow condition. */
+        if (cpy > oend) goto _output_error;
         LZ4_COPY_MATCH(op, match, (uint)length);
     op_rel += length;
     }
