@@ -20,8 +20,9 @@ from pathlib import Path, PurePosixPath
 CANON_RESULT_AUDITOR_SHA256 = "f47af8171bb5e18cdef4cfd3bff41fda5ebd9ff22e5ad9f3b7251d013a4dcf36"
 DEFAULT_REMOTE = "root@192.168.2.225"
 DEFAULT_REMOTE_RESULTS_ROOT = "/root/heterolz-formal-results"
+DEFAULT_LOCAL_RESULTS_ROOT = Path(r"C:\Users\obsid\Desktop\博士毕设\heterolz\exp_results\runs")
 RUN_ID_RE = re.compile(r"heterolz-(?:admission|performance)-\d{8}T\d{12}Z")
-REMOTE_RE = re.compile(r"(?:[A-Za-z0-9_.-]+@)?[A-Za-z0-9_.:-]+")
+REMOTE_RE = re.compile(r"(?:[A-Za-z0-9_][A-Za-z0-9_.-]*@)?[A-Za-z0-9_][A-Za-z0-9_.-]*")
 SAFE_POSIX_RE = re.compile(r"/[A-Za-z0-9_./-]+")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 MAX_ARCHIVE_BYTES = 2 * 1024**3
@@ -54,6 +55,26 @@ def validate_remote_root(value: str) -> str:
             or str(path) != value or value == "/"):
         raise ValueError("remote result root must be a normalized absolute POSIX path")
     return value
+
+
+def validate_formal_endpoint(remote: str, remote_root: str) -> tuple[str, str]:
+    remote = validate_remote(remote)
+    remote_root = validate_remote_root(remote_root)
+    if remote != DEFAULT_REMOTE or remote_root != DEFAULT_REMOTE_RESULTS_ROOT:
+        raise ValueError("formal result promotion is locked to the registered 225 result root")
+    return remote, remote_root
+
+
+def validate_local_results_root(path: Path) -> Path:
+    if os.name != "nt":
+        raise RuntimeError("formal result promotion must run from the registered Windows host")
+    resolved = path.resolve()
+    expected = DEFAULT_LOCAL_RESULTS_ROOT.resolve()
+    if resolved != expected:
+        raise ValueError(f"formal result promotion requires the canonical local result root: {expected}")
+    if not resolved.is_dir():
+        raise ValueError(f"canonical local result root is missing: {resolved}")
+    return resolved
 
 
 def parse_sha256sum(output: str) -> str:
@@ -208,7 +229,7 @@ def cleanup_remote_archive(ssh: str, remote: str, archive_path: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("run_id")
-    parser.add_argument("--local-results-root", type=Path, required=True)
+    parser.add_argument("--local-results-root", type=Path, default=DEFAULT_LOCAL_RESULTS_ROOT)
     parser.add_argument("--auditor", type=Path, required=True)
     parser.add_argument("--remote", default=DEFAULT_REMOTE)
     parser.add_argument("--remote-results-root", default=DEFAULT_REMOTE_RESULTS_ROOT)
@@ -219,10 +240,10 @@ def main() -> int:
     remote_archive_exists = False
     try:
         run_id = validate_run_id(args.run_id)
-        remote = validate_remote(args.remote)
-        remote_root = validate_remote_root(args.remote_results_root)
+        remote, remote_root = validate_formal_endpoint(args.remote, args.remote_results_root)
+        local_results_root = validate_local_results_root(args.local_results_root)
         ensure_auditor(args.auditor, CANON_RESULT_AUDITOR_SHA256)
-        final = args.local_results_root.resolve() / run_id
+        final = local_results_root / run_id
         if final.exists():
             raise FileExistsError(f"local formal run already exists: {final}")
         ssh = require_tool("ssh")
@@ -240,7 +261,7 @@ def main() -> int:
         cleanup_remote_archive(ssh, remote, remote_archive)
         remote_archive_exists = False
         promoted, audit = promote_local_archive(
-            local_archive, run_id, args.local_results_root, args.auditor
+            local_archive, run_id, local_results_root, args.auditor
         )
         print(json.dumps({
             "status": "complete",

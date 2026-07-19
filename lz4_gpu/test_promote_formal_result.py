@@ -111,6 +111,12 @@ class PromoteFormalResultTest(unittest.TestCase):
         self.assertEqual(promote.validate_remote("root@192.168.2.225"), "root@192.168.2.225")
         self.assertEqual(promote.validate_remote_root("/root/heterolz-formal-results"),
                          "/root/heterolz-formal-results")
+        self.assertEqual(
+            promote.validate_formal_endpoint(
+                "root@192.168.2.225", "/root/heterolz-formal-results"
+            ),
+            ("root@192.168.2.225", "/root/heterolz-formal-results"),
+        )
         digest = "a" * 64
         self.assertEqual(promote.parse_sha256sum(f"{digest}  /tmp/a.tar.gz\n"), digest)
         for value in ("../run", "heterolz-admission-latest", "x;rm"):
@@ -119,6 +125,12 @@ class PromoteFormalResultTest(unittest.TestCase):
         for value in ("relative/path", "/", "/root/../tmp", "/root/a path"):
             with self.assertRaises(ValueError):
                 promote.validate_remote_root(value)
+        for remote, root in (
+            ("root@192.168.2.105", "/root/heterolz-formal-results"),
+            ("root@192.168.2.225", "/tmp/results"),
+        ):
+            with self.assertRaises(ValueError):
+                promote.validate_formal_endpoint(remote, root)
         with self.assertRaises(RuntimeError):
             promote.parse_sha256sum("not-a-digest")
 
