@@ -77,6 +77,9 @@ verify-linux-early:
 formal-run-help:
 	python3 ./run_formal_acceptance.py --help
 
+test-formal-tools:
+	python3 -m unittest ./test_promote_formal_result.py
+
 precompile: $(PRECOMPILE_HELPER)
 	@echo "Precompiling LZ4 GPU kernels for various hash sizes..."
 	@for bits in 14; do \
@@ -87,4 +90,4 @@ precompile: $(PRECOMPILE_HELPER)
 clean:
 	rm -f lz4_gpu lz4_gpu.exe build_clbin build_clbin.exe build_clbin_host tp_ref_decode tp_ref_decode.exe tp_to_lz4 tp_to_lz4.exe *.o *.clbin
 
-.PHONY: all clean precompile interop-tools verify-twophase verify-daemon-twophase verify-linux-early formal-run-help
+.PHONY: all clean precompile interop-tools verify-twophase verify-daemon-twophase verify-linux-early formal-run-help test-formal-tools

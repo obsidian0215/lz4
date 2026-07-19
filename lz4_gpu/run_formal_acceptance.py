@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -48,7 +49,8 @@ PERFORMANCE_ARTIFACTS = tuple(sorted({
 CANON_SELECTOR_MANIFEST_SHA256 = "3447f8ff3a04eb1f92285f472eb700efccdc1560ee4c5bc58fc050d739697fa1"
 CANON_CALIBRATION_MANIFEST_SHA256 = "c63be7e92c94cab029beed414f58c4034407a5001e95397523dba74bd385aba9"
 CANON_CORRECTNESS_MANIFEST_SHA256 = "56d52716825c68bade8e032237fa9787a05606d177f733bfc2a14334ac837153"
-CANON_RESULT_AUDITOR_SHA256 = "01816605bd3f36c13ea0a5afc35435b0854baae7ee3bac142290b3e26386cc52"
+CANON_RESULT_AUDITOR_SHA256 = "f47af8171bb5e18cdef4cfd3bff41fda5ebd9ff22e5ad9f3b7251d013a4dcf36"
+CANON_RESULTS_ROOT = Path("/root/heterolz-formal-results")
 
 
 def sha256_file(path: Path) -> str:
@@ -134,7 +136,7 @@ def main() -> int:
     parser.add_argument("--calibration-manifest", type=Path, required=True)
     parser.add_argument("--correctness-manifest", type=Path, required=True)
     parser.add_argument("--auditor", type=Path, required=True)
-    parser.add_argument("--results-root", type=Path, required=True)
+    parser.add_argument("--results-root", type=Path, default=CANON_RESULTS_ROOT)
     parser.add_argument("--venue", choices=("GPU", "CPU"), default="GPU")
     parser.add_argument("--repetitions", type=int, default=9)
     parser.add_argument("--performance", action="store_true")
@@ -142,6 +144,7 @@ def main() -> int:
     args = parser.parse_args()
 
     staging: Path | None = None
+    staging_root: Path | None = None
     results_root: Path | None = None
     lz4_gpu: Path | None = None
     lock_handle: object | None = None
@@ -180,6 +183,8 @@ def main() -> int:
         if sample_root != Path("/root/samples"):
             raise ValueError("formal runs require the canonical /root/samples root")
         results_root = args.results_root.resolve()
+        if results_root != CANON_RESULTS_ROOT:
+            raise ValueError(f"formal runs require the canonical {CANON_RESULTS_ROOT} result root")
         if (results_root == sample_root or sample_root in results_root.parents or
                 results_root in sample_root.parents or results_root == repo or
                 repo in results_root.parents or results_root in repo.parents):
@@ -188,9 +193,10 @@ def main() -> int:
         run_kind = "performance" if args.performance else "admission"
         run_id = f"heterolz-{run_kind}-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         final = results_root / run_id
-        staging = results_root / (run_id + ".staging")
-        if final.exists() or staging.exists():
+        if final.exists():
             raise RuntimeError(f"run path already exists: {run_id}")
+        staging_root = Path(tempfile.mkdtemp(prefix=f".{run_id}.staging-", dir=results_root))
+        staging = staging_root / run_id
         staging.mkdir()
 
         compile_log = staging / "compile.log"
@@ -377,6 +383,8 @@ def main() -> int:
             raise RuntimeError("fixed result auditor did not return complete")
         os.replace(staging, final)
         staging = None
+        staging_root.rmdir()
+        staging_root = None
         release_lock(lock_handle, lock_path)
         lock_handle = None
         lock_path = None
@@ -384,9 +392,9 @@ def main() -> int:
         return 0
     except (Exception, KeyboardInterrupt) as exc:
         print(f"formal run failed: {exc}", file=sys.stderr)
-        if staging and staging.exists():
-            if results_root and staging.parent == results_root:
-                shutil.rmtree(staging)
+        if staging_root and staging_root.exists():
+            if results_root and staging_root.parent == results_root:
+                shutil.rmtree(staging_root)
                 print("failed staging directory cleaned", file=sys.stderr)
         if lz4_gpu and lz4_gpu.is_dir():
             subprocess.run(["make", "clean"], cwd=lz4_gpu,

@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""Promote one audited HeteroLZ run from the remote host to the local result root."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import uuid
+from pathlib import Path, PurePosixPath
+
+
+CANON_RESULT_AUDITOR_SHA256 = "f47af8171bb5e18cdef4cfd3bff41fda5ebd9ff22e5ad9f3b7251d013a4dcf36"
+DEFAULT_REMOTE = "root@192.168.2.225"
+DEFAULT_REMOTE_RESULTS_ROOT = "/root/heterolz-formal-results"
+RUN_ID_RE = re.compile(r"heterolz-(?:admission|performance)-\d{8}T\d{12}Z")
+REMOTE_RE = re.compile(r"(?:[A-Za-z0-9_.-]+@)?[A-Za-z0-9_.:-]+")
+SAFE_POSIX_RE = re.compile(r"/[A-Za-z0-9_./-]+")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+MAX_ARCHIVE_BYTES = 2 * 1024**3
+MAX_EXTRACTED_BYTES = 8 * 1024**3
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_run_id(value: str) -> str:
+    if not RUN_ID_RE.fullmatch(value):
+        raise ValueError("run id must match heterolz-admission/performance-<UTC timestamp>")
+    return value
+
+
+def validate_remote(value: str) -> str:
+    if not REMOTE_RE.fullmatch(value):
+        raise ValueError("remote host contains unsupported characters")
+    return value
+
+
+def validate_remote_root(value: str) -> str:
+    path = PurePosixPath(value)
+    if (not path.is_absolute() or ".." in path.parts or not SAFE_POSIX_RE.fullmatch(value)
+            or str(path) != value or value == "/"):
+        raise ValueError("remote result root must be a normalized absolute POSIX path")
+    return value
+
+
+def parse_sha256sum(output: str) -> str:
+    value = output.strip().split(maxsplit=1)[0] if output.strip() else ""
+    if not SHA256_RE.fullmatch(value):
+        raise RuntimeError("remote sha256sum returned an invalid digest")
+    return value
+
+
+def run_checked(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(f"command failed with exit {completed.returncode}: {argv!r}: {detail}")
+    return completed
+
+
+def require_tool(name: str) -> str:
+    path = shutil.which(name)
+    if not path:
+        raise RuntimeError(f"required transfer tool is unavailable: {name}")
+    return path
+
+
+def ensure_auditor(path: Path, expected_sha256: str) -> Path:
+    resolved = path.resolve()
+    if not resolved.is_file():
+        raise ValueError(f"fixed result auditor is missing: {resolved}")
+    actual = sha256_file(resolved)
+    if actual != expected_sha256:
+        raise ValueError(f"fixed result auditor SHA256 mismatch: {actual}")
+    return resolved
+
+
+def validate_archive(archive: tarfile.TarFile, run_id: str) -> list[tarfile.TarInfo]:
+    members = archive.getmembers()
+    if not members:
+        raise ValueError("result archive is empty")
+    seen: set[str] = set()
+    extracted_bytes = 0
+    files = 0
+    for member in members:
+        if "\\" in member.name:
+            raise ValueError(f"archive member uses a non-POSIX separator: {member.name}")
+        path = PurePosixPath(member.name)
+        parts = path.parts
+        if (path.is_absolute() or ".." in parts or not parts or parts[0] != run_id
+                or len(parts) > 2):
+            raise ValueError(f"archive member escapes the formal run directory: {member.name}")
+        normalized = path.as_posix()
+        if normalized in seen:
+            raise ValueError(f"archive contains a duplicate member: {normalized}")
+        seen.add(normalized)
+        if len(parts) == 1:
+            if not member.isdir():
+                raise ValueError("archive run root must be a directory")
+            continue
+        if not member.isfile():
+            raise ValueError(f"archive member must be a regular file: {member.name}")
+        extracted_bytes += member.size
+        files += 1
+        if extracted_bytes > MAX_EXTRACTED_BYTES:
+            raise ValueError("result archive expands beyond the safety limit")
+    if files == 0:
+        raise ValueError("result archive contains no evidence files")
+    return members
+
+
+def extract_archive(archive_path: Path, staging_root: Path, run_id: str) -> Path:
+    if archive_path.stat().st_size > MAX_ARCHIVE_BYTES:
+        raise ValueError("result archive exceeds the transfer safety limit")
+    destination = staging_root / run_id
+    destination.mkdir()
+    with tarfile.open(archive_path, mode="r:*") as archive:
+        members = validate_archive(archive, run_id)
+        for member in members:
+            path = PurePosixPath(member.name)
+            if len(path.parts) == 1:
+                continue
+            source = archive.extractfile(member)
+            if source is None:
+                raise ValueError(f"archive member cannot be read: {member.name}")
+            target = destination / path.name
+            with source, target.open("xb") as handle:
+                shutil.copyfileobj(source, handle, length=1024 * 1024)
+    return destination
+
+
+def audit_result(run_dir: Path, auditor: Path) -> dict[str, object]:
+    completed = subprocess.run(
+        [sys.executable, str(auditor), str(run_dir)],
+        cwd=run_dir,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        result = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("fixed result auditor returned invalid JSON") from exc
+    if completed.returncode != 0 or result.get("status") != "complete":
+        errors = result.get("errors")
+        raise RuntimeError(f"fixed result audit is incomplete: {errors}")
+    return result
+
+
+def promote_local_archive(
+    archive_path: Path,
+    run_id: str,
+    local_results_root: Path,
+    auditor_path: Path,
+    *,
+    expected_auditor_sha256: str = CANON_RESULT_AUDITOR_SHA256,
+) -> tuple[Path, dict[str, object]]:
+    run_id = validate_run_id(run_id)
+    archive_path = archive_path.resolve()
+    if not archive_path.is_file():
+        raise ValueError(f"downloaded result archive is missing: {archive_path}")
+    auditor = ensure_auditor(auditor_path, expected_auditor_sha256)
+    local_results_root = local_results_root.resolve()
+    local_results_root.mkdir(parents=True, exist_ok=True)
+    final = local_results_root / run_id
+    if final.exists():
+        raise FileExistsError(f"local formal run already exists: {final}")
+    with tempfile.TemporaryDirectory(
+        prefix=f".{run_id}.staging-", dir=local_results_root
+    ) as staging_text:
+        staging_root = Path(staging_text)
+        extracted = extract_archive(archive_path, staging_root, run_id)
+        audit = audit_result(extracted, auditor)
+        os.replace(extracted, final)
+    return final, audit
+
+
+def remote_archive_path(run_id: str) -> str:
+    token = uuid.uuid4().hex[:12]
+    return f"/tmp/heterolz-promote-{run_id}-{token}.tar.gz"
+
+
+def create_remote_archive(
+    ssh: str, remote: str, remote_root: str, run_id: str, archive_path: str
+) -> str:
+    run_checked([ssh, remote, "tar", "-C", remote_root, "-czf", archive_path, "--", run_id])
+    checksum = run_checked([ssh, remote, "sha256sum", "--", archive_path])
+    return parse_sha256sum(checksum.stdout)
+
+
+def cleanup_remote_archive(ssh: str, remote: str, archive_path: str) -> None:
+    run_checked([ssh, remote, "rm", "-f", "--", archive_path])
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("run_id")
+    parser.add_argument("--local-results-root", type=Path, required=True)
+    parser.add_argument("--auditor", type=Path, required=True)
+    parser.add_argument("--remote", default=DEFAULT_REMOTE)
+    parser.add_argument("--remote-results-root", default=DEFAULT_REMOTE_RESULTS_ROOT)
+    args = parser.parse_args()
+
+    local_archive: Path | None = None
+    remote_archive: str | None = None
+    remote_archive_exists = False
+    try:
+        run_id = validate_run_id(args.run_id)
+        remote = validate_remote(args.remote)
+        remote_root = validate_remote_root(args.remote_results_root)
+        ensure_auditor(args.auditor, CANON_RESULT_AUDITOR_SHA256)
+        final = args.local_results_root.resolve() / run_id
+        if final.exists():
+            raise FileExistsError(f"local formal run already exists: {final}")
+        ssh = require_tool("ssh")
+        scp = require_tool("scp")
+        fd, local_name = tempfile.mkstemp(prefix=f"{run_id}-", suffix=".tar.gz")
+        os.close(fd)
+        local_archive = Path(local_name)
+        remote_archive = remote_archive_path(run_id)
+        remote_archive_exists = True
+        remote_sha256 = create_remote_archive(ssh, remote, remote_root, run_id, remote_archive)
+        run_checked([scp, f"{remote}:{remote_archive}", str(local_archive)])
+        local_sha256 = sha256_file(local_archive)
+        if local_sha256 != remote_sha256:
+            raise RuntimeError("transferred result archive SHA256 does not match the remote archive")
+        cleanup_remote_archive(ssh, remote, remote_archive)
+        remote_archive_exists = False
+        promoted, audit = promote_local_archive(
+            local_archive, run_id, args.local_results_root, args.auditor
+        )
+        print(json.dumps({
+            "status": "complete",
+            "run_id": run_id,
+            "archive_sha256": local_sha256,
+            "local_run": str(promoted),
+            "audit_status": audit.get("status"),
+        }, ensure_ascii=False, indent=2))
+        return 0
+    except (Exception, KeyboardInterrupt) as exc:
+        print(f"formal result promotion failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if remote_archive_exists and remote_archive:
+            try:
+                cleanup_remote_archive(require_tool("ssh"), validate_remote(args.remote), remote_archive)
+            except Exception as cleanup_exc:
+                print(f"warning: remote archive cleanup failed: {cleanup_exc}", file=sys.stderr)
+        if local_archive:
+            local_archive.unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

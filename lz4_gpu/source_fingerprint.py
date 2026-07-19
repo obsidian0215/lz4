@@ -27,8 +27,10 @@ CONTROLLED_LZ4_GPU_FILES = {
     "lz4_gpu_utils.h",
     "lz4_tp_profile.c",
     "lz4_tp_profile.h",
+    "promote_formal_result.py",
     "run_formal_acceptance.py",
     "source_fingerprint.py",
+    "test_promote_formal_result.py",
     "timing.h",
     "tp_ref_decode.c",
     "tp_to_lz4.c",
@@ -109,13 +111,14 @@ def generate(repo: Path, require_clean: bool) -> dict[str, object]:
         raise RuntimeError("controlled source list is empty")
     validate_contract(paths)
     if require_clean:
+        controlled = set(paths)
         status = git(repo, "status", "--porcelain", "-z").stdout.split("\0")
         dirty_paths: list[str] = []
         for entry in status:
             if not entry:
                 continue
             path = entry[3:] if len(entry) >= 4 else entry
-            if path.startswith("lz4_gpu/") or path in LIB_FILES:
+            if path in controlled:
                 dirty_paths.append(path)
         if dirty_paths:
             raise RuntimeError("formal source tree contains uncommitted project files: " +
