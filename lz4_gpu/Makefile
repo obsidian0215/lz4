@@ -78,7 +78,7 @@ formal-run-help:
 	python3 ./run_formal_acceptance.py --help
 
 test-formal-tools:
-	python3 -m unittest ./test_promote_formal_result.py
+	python3 -m unittest ./test_formal_run_controls.py ./test_promote_formal_result.py
 
 precompile: $(PRECOMPILE_HELPER)
 	@echo "Precompiling LZ4 GPU kernels for various hash sizes..."

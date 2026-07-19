@@ -133,6 +133,11 @@ class PromoteFormalResultTest(unittest.TestCase):
                 promote.validate_formal_endpoint(remote, root)
         with self.assertRaises(RuntimeError):
             promote.parse_sha256sum("not-a-digest")
+        with tempfile.TemporaryDirectory() as temp:
+            other_auditor = Path(temp) / "auditor.py"
+            other_auditor.write_text("print('x')\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                promote.validate_formal_auditor(other_auditor)
 
     def test_result_root_hygiene_allows_only_readme_and_formal_runs(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

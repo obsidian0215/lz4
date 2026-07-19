@@ -179,6 +179,15 @@ def median_row(rows: list[dict[str, object]]) -> dict[str, object]:
     return result
 
 
+def rotated_policy_specs(policy_specs: list[tuple[str, int | None, bool]],
+                         sample_index: int,
+                         repetition: int) -> list[tuple[str, int | None, bool]]:
+    if not policy_specs:
+        return []
+    offset = (sample_index + repetition - 1) % len(policy_specs)
+    return policy_specs[offset:] + policy_specs[:offset]
+
+
 def write_csv(path: Path, fieldnames: tuple[str, ...], rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(path.name + ".tmp")
@@ -386,9 +395,10 @@ def main() -> int:
                     policy_specs = [(f"fixed_n{n}", n, False) for n in n_values]
                     if not args.skip_adaptive:
                         policy_specs.append(("adaptive", None, True))
-                    for policy, fixed_n, adaptive in policy_specs:
-                        reference_ok = False
-                        for repetition in range(1, args.repetitions + 1):
+                    reference_ok_by_policy = {policy: False for policy, _, _ in policy_specs}
+                    for repetition in range(1, args.repetitions + 1):
+                        for policy, fixed_n, adaptive in rotated_policy_specs(
+                                policy_specs, sample_index, repetition):
                             frame = sample_dir / f"{policy}.r{repetition}.lz4tp"
                             restored = sample_dir / f"{policy}.r{repetition}.restored"
                             comp_metric_path = sample_dir / f"{policy}.r{repetition}.compress.json"
@@ -414,7 +424,7 @@ def main() -> int:
                                 raise RuntimeError(f"benchmark roundtrip failed: {relative_path} {policy} rep={repetition}")
                             if repetition == 1:
                                 runner.run([str(reference_decoder), str(frame), str(sample)])
-                                reference_ok = True
+                                reference_ok_by_policy[policy] = True
                             comp_metric = load_metric(comp_metric_path, "compress")
                             dec_metric = load_metric(dec_metric_path, "decompress")
                             if comp_metric["n"] != dec_metric["n"]:
@@ -430,9 +440,11 @@ def main() -> int:
                                     dec_metric["output_bytes"] != sample.stat().st_size):
                                 raise RuntimeError(f"metric byte counts mismatch: {relative_path} {policy}")
                             rows.append(metric_row(relative_path, policy, "compress", repetition,
-                                                   comp_metric, roundtrip_ok, reference_ok))
+                                                   comp_metric, roundtrip_ok,
+                                                   reference_ok_by_policy[policy]))
                             rows.append(metric_row(relative_path, policy, "decompress", repetition,
-                                                   dec_metric, roundtrip_ok, reference_ok))
+                                                   dec_metric, roundtrip_ok,
+                                                   reference_ok_by_policy[policy]))
                             for path in (frame, restored, comp_metric_path, dec_metric_path):
                                 path.unlink(missing_ok=True)
                 finally:

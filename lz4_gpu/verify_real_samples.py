@@ -238,9 +238,11 @@ def main() -> int:
                 record = venue_devices.get(venue)
                 if not isinstance(record, dict) or record.get("schema") != "heterolz.device-info.v1":
                     raise ValueError(f"device-info evidence is invalid for {venue}")
-                for field in ("device_name", "platform_name", "driver_version"):
+                for field in ("device_name", "platform_name", "driver_version", "device_type"):
                     if not isinstance(record.get(field), str) or not record[field]:
                         raise ValueError(f"device-info evidence is missing {venue}.{field}")
+                if record["device_type"] != venue:
+                    raise ValueError(f"device-info evidence has the wrong type for {venue}")
             result["source_identity"] = {
                 "git_commit": git_commit,
                 "source_fingerprint": source_fingerprint,

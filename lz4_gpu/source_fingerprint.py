@@ -31,6 +31,7 @@ CONTROLLED_LZ4_GPU_FILES = {
     "run_formal_acceptance.py",
     "source_fingerprint.py",
     "test_promote_formal_result.py",
+    "test_formal_run_controls.py",
     "timing.h",
     "tp_ref_decode.c",
     "tp_to_lz4.c",

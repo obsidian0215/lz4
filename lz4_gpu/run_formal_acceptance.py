@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -50,8 +51,11 @@ PERFORMANCE_ARTIFACTS = tuple(sorted({
 CANON_SELECTOR_MANIFEST_SHA256 = "3447f8ff3a04eb1f92285f472eb700efccdc1560ee4c5bc58fc050d739697fa1"
 CANON_CALIBRATION_MANIFEST_SHA256 = "c63be7e92c94cab029beed414f58c4034407a5001e95397523dba74bd385aba9"
 CANON_CORRECTNESS_MANIFEST_SHA256 = "56d52716825c68bade8e032237fa9787a05606d177f733bfc2a14334ac837153"
-CANON_RESULT_AUDITOR_SHA256 = "f47af8171bb5e18cdef4cfd3bff41fda5ebd9ff22e5ad9f3b7251d013a4dcf36"
 CANON_RESULTS_ROOT = Path("/root/heterolz-formal-results")
+CANON_REPO_ROOT = Path("/root/heterolz-formal")
+CANON_SOURCE_REGISTRY = Path("/root/heterolz-formal-control/formal_source_fingerprint.json")
+CANON_RESULT_AUDITOR = Path("/root/heterolz-formal-control/heterolz_result_audit.py")
+MAX_FORMAL_LOAD_ONE = 0.5
 RUN_ID_RE = re.compile(r"heterolz-(?:admission|performance)-\d{8}T\d{12}Z")
 
 
@@ -113,9 +117,11 @@ def query_device_info(binary: Path, cwd: Path, venue: str) -> dict[str, object]:
         raise RuntimeError(f"{venue} device identity query returned invalid JSON") from exc
     if data.get("schema") != "heterolz.device-info.v1":
         raise RuntimeError(f"{venue} device identity query returned an invalid schema")
-    for field in ("device_name", "platform_name", "driver_version"):
+    for field in ("device_name", "platform_name", "driver_version", "device_type"):
         if not isinstance(data.get(field), str) or not data[field]:
             raise RuntimeError(f"{venue} device identity is missing {field}")
+    if data["device_type"] != venue:
+        raise RuntimeError(f"{venue} device identity returned device_type={data['device_type']}")
     return data
 
 
@@ -136,6 +142,42 @@ def validate_results_root(root: Path) -> None:
             raise ValueError(f"formal result root contains an unexpected entry: {entry.name}")
 
 
+def validate_formal_repo(path: Path) -> Path:
+    resolved = path.resolve()
+    if resolved != CANON_REPO_ROOT:
+        raise ValueError(f"formal runs require the canonical source worktree: {CANON_REPO_ROOT}")
+    return resolved
+
+
+def validate_registered_source(generated: dict[str, object], registry_path: Path) -> None:
+    registered = json.loads(registry_path.read_text(encoding="utf-8"))
+    if not isinstance(registered, dict) or registered.get("schema") != "heterolz.source-fingerprint.v1":
+        raise ValueError("registered formal source identity has an invalid schema")
+    if generated != registered:
+        raise ValueError("formal source does not match the registered commit and fingerprint")
+
+
+def validate_formal_load(load_one: float | None = None) -> float:
+    current = os.getloadavg()[0] if load_one is None else load_one
+    if (not isinstance(current, (int, float)) or not math.isfinite(float(current)) or
+            current < 0 or current >= MAX_FORMAL_LOAD_ONE):
+        raise RuntimeError(
+            f"formal run requires one-minute load below {MAX_FORMAL_LOAD_ONE:.1f}; current={current}"
+        )
+    return float(current)
+
+
+def validate_admission_directory(path: Path, results_root: Path) -> Path:
+    if path.is_symlink():
+        raise ValueError("formal performance admission directory must not be a symlink")
+    resolved = path.resolve()
+    if (not resolved.is_dir() or resolved.parent != results_root or
+            RUN_ID_RE.fullmatch(resolved.name) is None or
+            not resolved.name.startswith("heterolz-admission-")):
+        raise ValueError("formal performance requires an admission directory in the canonical result root")
+    return resolved
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parent.parent)
@@ -144,6 +186,7 @@ def main() -> int:
     parser.add_argument("--calibration-manifest", type=Path, required=True)
     parser.add_argument("--correctness-manifest", type=Path, required=True)
     parser.add_argument("--auditor", type=Path, required=True)
+    parser.add_argument("--source-registry", type=Path, default=CANON_SOURCE_REGISTRY)
     parser.add_argument("--results-root", type=Path, default=CANON_RESULTS_ROOT)
     parser.add_argument("--venue", choices=("GPU", "CPU"), default="GPU")
     parser.add_argument("--repetitions", type=int, default=9)
@@ -157,6 +200,7 @@ def main() -> int:
     lz4_gpu: Path | None = None
     lock_handle: object | None = None
     lock_path: Path | None = None
+    preflight_load_one: float | None = None
     try:
         if args.performance and args.repetitions < 9:
             raise ValueError("formal performance requires at least nine repetitions")
@@ -164,29 +208,22 @@ def main() -> int:
             raise ValueError("--admission-dir is only valid with --performance")
         if args.performance and not args.admission_dir:
             raise ValueError("formal performance requires an audited admission directory")
-        repo = args.repo.resolve()
+        repo = validate_formal_repo(args.repo)
         lz4_gpu = repo / "lz4_gpu"
         if fcntl is None:
             raise RuntimeError("formal runs require Linux file locking")
-        lock_key = hashlib.sha256(str(repo).encode("utf-8")).hexdigest()[:16]
-        lock_path = Path("/tmp") / f"heterolz-formal-run-{lock_key}.lock"
-        lock_handle = lock_path.open("a+", encoding="utf-8")
-        try:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            lock_handle.close()
-            lock_handle = None
-            lock_path = None
-            raise RuntimeError("another formal run is using this source tree") from exc
         for path in (args.selector_manifest, args.calibration_manifest,
-                     args.correctness_manifest, args.auditor):
+                     args.correctness_manifest, args.auditor, args.source_registry):
             if not path.resolve().is_file():
                 raise ValueError(f"required input is missing: {path}")
         if (sha256_file(args.selector_manifest.resolve()) != CANON_SELECTOR_MANIFEST_SHA256 or
                 sha256_file(args.calibration_manifest.resolve()) != CANON_CALIBRATION_MANIFEST_SHA256 or
-                sha256_file(args.correctness_manifest.resolve()) != CANON_CORRECTNESS_MANIFEST_SHA256 or
-                sha256_file(args.auditor.resolve()) != CANON_RESULT_AUDITOR_SHA256):
-            raise ValueError("formal run requires the registered manifests and fixed result auditor")
+                sha256_file(args.correctness_manifest.resolve()) != CANON_CORRECTNESS_MANIFEST_SHA256):
+            raise ValueError("formal run requires the registered sample manifests")
+        if args.auditor.resolve() != CANON_RESULT_AUDITOR:
+            raise ValueError(f"formal run requires the fixed result auditor: {CANON_RESULT_AUDITOR}")
+        if args.source_registry.resolve() != CANON_SOURCE_REGISTRY:
+            raise ValueError(f"formal run requires the registered source identity: {CANON_SOURCE_REGISTRY}")
         sample_root = args.sample_root.resolve()
         if sample_root != Path("/root/samples"):
             raise ValueError("formal runs require the canonical /root/samples root")
@@ -199,6 +236,17 @@ def main() -> int:
             raise ValueError("formal results must stay outside the sample and source trees")
         results_root.mkdir(parents=True, exist_ok=True)
         validate_results_root(results_root)
+        lock_key = hashlib.sha256(str(results_root).encode("utf-8")).hexdigest()[:16]
+        lock_path = Path("/tmp") / f"heterolz-formal-results-{lock_key}.lock"
+        lock_handle = lock_path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            lock_handle.close()
+            lock_handle = None
+            lock_path = None
+            raise RuntimeError("another formal run is using the canonical result root") from exc
+        preflight_load_one = validate_formal_load()
         run_kind = "performance" if args.performance else "admission"
         run_id = f"heterolz-{run_kind}-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         final = results_root / run_id
@@ -207,6 +255,16 @@ def main() -> int:
         staging_root = Path(tempfile.mkdtemp(prefix=f".{run_id}.staging-", dir=results_root))
         staging = staging_root / run_id
         staging.mkdir()
+
+        fingerprint_path = staging / "fingerprint.json"
+        run(
+            [sys.executable, str(lz4_gpu / "source_fingerprint.py"), "--repo", str(repo),
+             "--output", str(fingerprint_path), "--require-clean"],
+            cwd=repo,
+        )
+        fingerprint = json.loads(fingerprint_path.read_text(encoding="utf-8"))
+        validate_registered_source(fingerprint, args.source_registry.resolve())
+        commit = fingerprint["git_commit"]
 
         compile_log = staging / "compile.log"
         run(["make", "clean"], cwd=lz4_gpu, stdout_path=compile_log)
@@ -225,15 +283,6 @@ def main() -> int:
         bridge = lz4_gpu / "tp_to_lz4"
         binary_sha = sha256_file(binary)
         write_text_atomic(staging / "binary.sha256", f"{binary_sha}  lz4_gpu\n")
-
-        fingerprint_path = staging / "fingerprint.json"
-        run(
-            [sys.executable, str(lz4_gpu / "source_fingerprint.py"), "--repo", str(repo),
-             "--output", str(fingerprint_path), "--require-clean"],
-            cwd=repo,
-        )
-        fingerprint = json.loads(fingerprint_path.read_text(encoding="utf-8"))
-        commit = fingerprint["git_commit"]
 
         venue_devices = {
             venue: query_device_info(binary, lz4_gpu, venue)
@@ -256,7 +305,7 @@ def main() -> int:
         gate_log = staging / "gate.log"
         admission_provenance: dict[str, object] | None = None
         if args.performance:
-            admission_dir = args.admission_dir.resolve()
+            admission_dir = validate_admission_directory(args.admission_dir, results_root)
             admission_auditor = admission_dir / "result_audit.py"
             admission_manifest = admission_dir / "run_manifest.json"
             admission_verification = admission_dir / "verification.json"
@@ -372,8 +421,11 @@ def main() -> int:
             "correctness_inputs": correctness_inputs,
             "admission": admission_provenance,
             "parameters": {"block_size": 65536, "hash_log": 14, "n": [1, 2, 4, 8],
-                           "venue": args.venue},
+                           "venue": args.venue,
+                           "schedule": "deterministic_rotating_policy_order"},
             "timing": {"kernel": True, "no_ocl": True, "total": True},
+            "preflight": {"load_one": preflight_load_one,
+                          "max_load_one": MAX_FORMAL_LOAD_ONE},
             "repetitions": args.repetitions if args.performance else 0,
             "expected_artifacts": list(expected_artifacts),
             "actual_artifacts": list(expected_artifacts),

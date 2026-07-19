@@ -17,10 +17,12 @@ import uuid
 from pathlib import Path, PurePosixPath
 
 
-CANON_RESULT_AUDITOR_SHA256 = "f47af8171bb5e18cdef4cfd3bff41fda5ebd9ff22e5ad9f3b7251d013a4dcf36"
 DEFAULT_REMOTE = "root@192.168.2.225"
 DEFAULT_REMOTE_RESULTS_ROOT = "/root/heterolz-formal-results"
 DEFAULT_LOCAL_RESULTS_ROOT = Path(r"C:\Users\obsid\Desktop\博士毕设\heterolz\exp_results\runs")
+DEFAULT_AUDITOR = Path(
+    r"C:\Users\obsid\Desktop\博士毕设\heterolz\阶段文档\交接工具\heterolz_result_audit.py"
+)
 RUN_ID_RE = re.compile(r"heterolz-(?:admission|performance)-\d{8}T\d{12}Z")
 REMOTE_RE = re.compile(r"(?:[A-Za-z0-9_][A-Za-z0-9_.-]*@)?[A-Za-z0-9_][A-Za-z0-9_.-]*")
 SAFE_POSIX_RE = re.compile(r"/[A-Za-z0-9_./-]+")
@@ -109,14 +111,22 @@ def require_tool(name: str) -> str:
     return path
 
 
-def ensure_auditor(path: Path, expected_sha256: str) -> Path:
+def ensure_auditor(path: Path, expected_sha256: str | None = None) -> Path:
     resolved = path.resolve()
     if not resolved.is_file():
         raise ValueError(f"fixed result auditor is missing: {resolved}")
     actual = sha256_file(resolved)
-    if actual != expected_sha256:
+    if expected_sha256 is not None and actual != expected_sha256:
         raise ValueError(f"fixed result auditor SHA256 mismatch: {actual}")
     return resolved
+
+
+def validate_formal_auditor(path: Path) -> Path:
+    resolved = path.resolve()
+    expected = DEFAULT_AUDITOR.resolve()
+    if resolved != expected:
+        raise ValueError(f"formal result promotion requires the canonical local auditor: {expected}")
+    return ensure_auditor(resolved)
 
 
 def validate_archive(archive: tarfile.TarFile, run_id: str) -> list[tarfile.TarInfo]:
@@ -197,7 +207,7 @@ def promote_local_archive(
     local_results_root: Path,
     auditor_path: Path,
     *,
-    expected_auditor_sha256: str = CANON_RESULT_AUDITOR_SHA256,
+    expected_auditor_sha256: str | None = None,
 ) -> tuple[Path, dict[str, object]]:
     run_id = validate_run_id(run_id)
     archive_path = archive_path.resolve()
@@ -241,7 +251,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("run_id")
     parser.add_argument("--local-results-root", type=Path, default=DEFAULT_LOCAL_RESULTS_ROOT)
-    parser.add_argument("--auditor", type=Path, required=True)
+    parser.add_argument("--auditor", type=Path, default=DEFAULT_AUDITOR)
     parser.add_argument("--remote", default=DEFAULT_REMOTE)
     parser.add_argument("--remote-results-root", default=DEFAULT_REMOTE_RESULTS_ROOT)
     args = parser.parse_args()
@@ -253,7 +263,8 @@ def main() -> int:
         run_id = validate_run_id(args.run_id)
         remote, remote_root = validate_formal_endpoint(args.remote, args.remote_results_root)
         local_results_root = validate_local_results_root(args.local_results_root)
-        ensure_auditor(args.auditor, CANON_RESULT_AUDITOR_SHA256)
+        auditor = validate_formal_auditor(args.auditor)
+        auditor_sha256 = sha256_file(auditor)
         final = local_results_root / run_id
         if final.exists():
             raise FileExistsError(f"local formal run already exists: {final}")
@@ -272,7 +283,8 @@ def main() -> int:
         cleanup_remote_archive(ssh, remote, remote_archive)
         remote_archive_exists = False
         promoted, audit = promote_local_archive(
-            local_archive, run_id, local_results_root, args.auditor
+            local_archive, run_id, local_results_root, auditor,
+            expected_auditor_sha256=auditor_sha256,
         )
         print(json.dumps({
             "status": "complete",
