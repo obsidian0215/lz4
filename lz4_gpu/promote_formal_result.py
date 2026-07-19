@@ -23,7 +23,10 @@ DEFAULT_LOCAL_RESULTS_ROOT = Path(r"C:\Users\obsid\Desktop\博士毕设\heterolz
 DEFAULT_AUDITOR = Path(
     r"C:\Users\obsid\Desktop\博士毕设\heterolz\阶段文档\交接工具\heterolz_result_audit.py"
 )
-CANON_RESULT_AUDITOR_SHA256 = "a5241a1d306cfdaa26f8953a0a077dd39b1410a549bdc89f05009c803b36e0ba"
+DEFAULT_SOURCE_REGISTRY = Path(
+    r"C:\Users\obsid\Desktop\博士毕设\heterolz\阶段文档\交接工具\formal_source_fingerprint.json"
+)
+CANON_RESULT_AUDITOR_SHA256 = "f5ef9cb1568ee79795e4703adba4cc29113105e23e26147919901d09d6c7ed22"
 RUN_ID_RE = re.compile(r"heterolz-(?:admission|performance)-\d{8}T\d{12}Z")
 REMOTE_RE = re.compile(r"(?:[A-Za-z0-9_][A-Za-z0-9_.-]*@)?[A-Za-z0-9_][A-Za-z0-9_.-]*")
 SAFE_POSIX_RE = re.compile(r"/[A-Za-z0-9_./-]+")
@@ -130,6 +133,14 @@ def validate_formal_auditor(path: Path) -> Path:
     return ensure_auditor(resolved, CANON_RESULT_AUDITOR_SHA256)
 
 
+def validate_source_registry(path: Path) -> Path:
+    resolved = path.resolve()
+    expected = DEFAULT_SOURCE_REGISTRY.resolve()
+    if resolved != expected or not resolved.is_file():
+        raise ValueError(f"formal result promotion requires the canonical source registry: {expected}")
+    return resolved
+
+
 def validate_archive(archive: tarfile.TarFile, run_id: str) -> list[tarfile.TarInfo]:
     members = archive.getmembers()
     if not members:
@@ -184,9 +195,10 @@ def extract_archive(archive_path: Path, staging_root: Path, run_id: str) -> Path
     return destination
 
 
-def audit_result(run_dir: Path, auditor: Path) -> dict[str, object]:
+def audit_result(run_dir: Path, auditor: Path, source_registry: Path) -> dict[str, object]:
     completed = subprocess.run(
-        [sys.executable, str(auditor), str(run_dir)],
+        [sys.executable, str(auditor), str(run_dir),
+         "--source-registry", str(source_registry)],
         cwd=run_dir,
         text=True,
         stdout=subprocess.PIPE,
@@ -207,6 +219,7 @@ def promote_local_archive(
     run_id: str,
     local_results_root: Path,
     auditor_path: Path,
+    source_registry_path: Path | None = None,
     *,
     expected_auditor_sha256: str | None = None,
 ) -> tuple[Path, dict[str, object]]:
@@ -215,6 +228,9 @@ def promote_local_archive(
     if not archive_path.is_file():
         raise ValueError(f"downloaded result archive is missing: {archive_path}")
     auditor = ensure_auditor(auditor_path, expected_auditor_sha256)
+    source_registry = validate_source_registry(
+        source_registry_path if source_registry_path is not None else DEFAULT_SOURCE_REGISTRY
+    )
     local_results_root = local_results_root.resolve()
     local_results_root.mkdir(parents=True, exist_ok=True)
     validate_result_root_contents(local_results_root, allow_readme=True)
@@ -226,7 +242,7 @@ def promote_local_archive(
     ) as staging_text:
         staging_root = Path(staging_text)
         extracted = extract_archive(archive_path, staging_root, run_id)
-        audit = audit_result(extracted, auditor)
+        audit = audit_result(extracted, auditor, source_registry)
         os.replace(extracted, final)
     return final, audit
 
@@ -253,6 +269,7 @@ def main() -> int:
     parser.add_argument("run_id")
     parser.add_argument("--local-results-root", type=Path, default=DEFAULT_LOCAL_RESULTS_ROOT)
     parser.add_argument("--auditor", type=Path, default=DEFAULT_AUDITOR)
+    parser.add_argument("--source-registry", type=Path, default=DEFAULT_SOURCE_REGISTRY)
     parser.add_argument("--remote", default=DEFAULT_REMOTE)
     parser.add_argument("--remote-results-root", default=DEFAULT_REMOTE_RESULTS_ROOT)
     args = parser.parse_args()
@@ -265,6 +282,7 @@ def main() -> int:
         remote, remote_root = validate_formal_endpoint(args.remote, args.remote_results_root)
         local_results_root = validate_local_results_root(args.local_results_root)
         auditor = validate_formal_auditor(args.auditor)
+        source_registry = validate_source_registry(args.source_registry)
         auditor_sha256 = sha256_file(auditor)
         final = local_results_root / run_id
         if final.exists():
@@ -284,7 +302,7 @@ def main() -> int:
         cleanup_remote_archive(ssh, remote, remote_archive)
         remote_archive_exists = False
         promoted, audit = promote_local_archive(
-            local_archive, run_id, local_results_root, auditor,
+            local_archive, run_id, local_results_root, auditor, source_registry,
             expected_auditor_sha256=auditor_sha256,
         )
         print(json.dumps({

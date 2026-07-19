@@ -56,7 +56,7 @@ CANON_RESULTS_ROOT = Path("/root/heterolz-formal-results")
 CANON_REPO_ROOT = Path("/root/heterolz-formal")
 CANON_SOURCE_REGISTRY = Path("/root/heterolz-formal-control/formal_source_fingerprint.json")
 CANON_RESULT_AUDITOR = Path("/root/heterolz-formal-control/heterolz_result_audit.py")
-CANON_RESULT_AUDITOR_SHA256 = "a5241a1d306cfdaa26f8953a0a077dd39b1410a549bdc89f05009c803b36e0ba"
+CANON_RESULT_AUDITOR_SHA256 = "f5ef9cb1568ee79795e4703adba4cc29113105e23e26147919901d09d6c7ed22"
 MAX_FORMAL_LOAD_ONE = 0.5
 RUN_ID_RE = re.compile(r"heterolz-(?:admission|performance)-\d{8}T\d{12}Z")
 
@@ -324,7 +324,8 @@ def main() -> int:
             if sha256_file(admission_auditor) != CANON_RESULT_AUDITOR_SHA256:
                 raise ValueError("admission directory does not contain the fixed result auditor")
             admission_audit = subprocess.run(
-                [sys.executable, str(args.auditor.resolve()), str(admission_dir)],
+                [sys.executable, str(args.auditor.resolve()), str(admission_dir),
+                 "--source-registry", str(args.source_registry.resolve())],
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             try:
@@ -440,7 +441,8 @@ def main() -> int:
         }
         write_json_atomic(staging / "run_manifest.json", manifest)
         audit_run = subprocess.run(
-            [sys.executable, str(args.auditor.resolve()), str(staging)], cwd=staging,
+            [sys.executable, str(args.auditor.resolve()), str(staging),
+             "--source-registry", str(args.source_registry.resolve())], cwd=staging,
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         try:
