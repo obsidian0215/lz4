@@ -36,6 +36,7 @@ ADMISSION_ARTIFACTS = (
     "run_manifest.json",
     "run_meta.txt",
     "samples_manifest.json",
+    "source_registry.json",
     "verification.json",
 )
 
@@ -55,6 +56,7 @@ CANON_RESULTS_ROOT = Path("/root/heterolz-formal-results")
 CANON_REPO_ROOT = Path("/root/heterolz-formal")
 CANON_SOURCE_REGISTRY = Path("/root/heterolz-formal-control/formal_source_fingerprint.json")
 CANON_RESULT_AUDITOR = Path("/root/heterolz-formal-control/heterolz_result_audit.py")
+CANON_RESULT_AUDITOR_SHA256 = "a5241a1d306cfdaa26f8953a0a077dd39b1410a549bdc89f05009c803b36e0ba"
 MAX_FORMAL_LOAD_ONE = 0.5
 RUN_ID_RE = re.compile(r"heterolz-(?:admission|performance)-\d{8}T\d{12}Z")
 
@@ -222,6 +224,8 @@ def main() -> int:
             raise ValueError("formal run requires the registered sample manifests")
         if args.auditor.resolve() != CANON_RESULT_AUDITOR:
             raise ValueError(f"formal run requires the fixed result auditor: {CANON_RESULT_AUDITOR}")
+        if sha256_file(args.auditor.resolve()) != CANON_RESULT_AUDITOR_SHA256:
+            raise ValueError("formal run fixed result auditor SHA256 mismatch")
         if args.source_registry.resolve() != CANON_SOURCE_REGISTRY:
             raise ValueError(f"formal run requires the registered source identity: {CANON_SOURCE_REGISTRY}")
         sample_root = args.sample_root.resolve()
@@ -264,6 +268,8 @@ def main() -> int:
         )
         fingerprint = json.loads(fingerprint_path.read_text(encoding="utf-8"))
         validate_registered_source(fingerprint, args.source_registry.resolve())
+        source_registry_copy = staging / "source_registry.json"
+        shutil.copyfile(args.source_registry.resolve(), source_registry_copy)
         commit = fingerprint["git_commit"]
 
         compile_log = staging / "compile.log"
@@ -404,6 +410,7 @@ def main() -> int:
             "topic": "lz4_two_phase_selector_performance" if args.performance else "lz4_two_phase_correctness_admission",
             "git_commit": commit,
             "source_fingerprint": fingerprint["source_fingerprint"],
+            "source_registry_sha256": sha256_file(source_registry_copy),
             "binary_sha256": binary_sha,
             "device_info_sha256": sha256_file(staging / "device_info.json"),
             "auditor_sha256": sha256_file(staging / "result_audit.py"),

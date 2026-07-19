@@ -23,6 +23,7 @@ DEFAULT_LOCAL_RESULTS_ROOT = Path(r"C:\Users\obsid\Desktop\博士毕设\heterolz
 DEFAULT_AUDITOR = Path(
     r"C:\Users\obsid\Desktop\博士毕设\heterolz\阶段文档\交接工具\heterolz_result_audit.py"
 )
+CANON_RESULT_AUDITOR_SHA256 = "a5241a1d306cfdaa26f8953a0a077dd39b1410a549bdc89f05009c803b36e0ba"
 RUN_ID_RE = re.compile(r"heterolz-(?:admission|performance)-\d{8}T\d{12}Z")
 REMOTE_RE = re.compile(r"(?:[A-Za-z0-9_][A-Za-z0-9_.-]*@)?[A-Za-z0-9_][A-Za-z0-9_.-]*")
 SAFE_POSIX_RE = re.compile(r"/[A-Za-z0-9_./-]+")
@@ -126,7 +127,7 @@ def validate_formal_auditor(path: Path) -> Path:
     expected = DEFAULT_AUDITOR.resolve()
     if resolved != expected:
         raise ValueError(f"formal result promotion requires the canonical local auditor: {expected}")
-    return ensure_auditor(resolved)
+    return ensure_auditor(resolved, CANON_RESULT_AUDITOR_SHA256)
 
 
 def validate_archive(archive: tarfile.TarFile, run_id: str) -> list[tarfile.TarInfo]:
