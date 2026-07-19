@@ -74,7 +74,17 @@ def validate_local_results_root(path: Path) -> Path:
         raise ValueError(f"formal result promotion requires the canonical local result root: {expected}")
     if not resolved.is_dir():
         raise ValueError(f"canonical local result root is missing: {resolved}")
+    validate_result_root_contents(resolved, allow_readme=True)
     return resolved
+
+
+def validate_result_root_contents(root: Path, *, allow_readme: bool) -> None:
+    for entry in root.iterdir():
+        if (allow_readme and entry.name == "README.md" and entry.is_file()
+                and not entry.is_symlink()):
+            continue
+        if entry.is_symlink() or not entry.is_dir() or RUN_ID_RE.fullmatch(entry.name) is None:
+            raise ValueError(f"formal result root contains an unexpected entry: {entry.name}")
 
 
 def parse_sha256sum(output: str) -> str:
@@ -196,6 +206,7 @@ def promote_local_archive(
     auditor = ensure_auditor(auditor_path, expected_auditor_sha256)
     local_results_root = local_results_root.resolve()
     local_results_root.mkdir(parents=True, exist_ok=True)
+    validate_result_root_contents(local_results_root, allow_readme=True)
     final = local_results_root / run_id
     if final.exists():
         raise FileExistsError(f"local formal run already exists: {final}")

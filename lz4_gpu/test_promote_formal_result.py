@@ -134,6 +134,17 @@ class PromoteFormalResultTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             promote.parse_sha256sum("not-a-digest")
 
+    def test_result_root_hygiene_allows_only_readme_and_formal_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("contract\n", encoding="utf-8")
+            (root / RUN_ID).mkdir()
+            promote.validate_result_root_contents(root, allow_readme=True)
+            manual = root / "manual.tmp"
+            manual.write_text("leftover\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                promote.validate_result_root_contents(root, allow_readme=True)
+
 
 if __name__ == "__main__":
     unittest.main()

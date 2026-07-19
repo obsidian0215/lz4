@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -51,6 +52,7 @@ CANON_CALIBRATION_MANIFEST_SHA256 = "c63be7e92c94cab029beed414f58c4034407a5001e9
 CANON_CORRECTNESS_MANIFEST_SHA256 = "56d52716825c68bade8e032237fa9787a05606d177f733bfc2a14334ac837153"
 CANON_RESULT_AUDITOR_SHA256 = "f47af8171bb5e18cdef4cfd3bff41fda5ebd9ff22e5ad9f3b7251d013a4dcf36"
 CANON_RESULTS_ROOT = Path("/root/heterolz-formal-results")
+RUN_ID_RE = re.compile(r"heterolz-(?:admission|performance)-\d{8}T\d{12}Z")
 
 
 def sha256_file(path: Path) -> str:
@@ -128,6 +130,12 @@ def release_lock(handle: object | None, path: Path | None) -> None:
         handle.close()
 
 
+def validate_results_root(root: Path) -> None:
+    for entry in root.iterdir():
+        if entry.is_symlink() or not entry.is_dir() or RUN_ID_RE.fullmatch(entry.name) is None:
+            raise ValueError(f"formal result root contains an unexpected entry: {entry.name}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parent.parent)
@@ -190,6 +198,7 @@ def main() -> int:
                 repo in results_root.parents or results_root in repo.parents):
             raise ValueError("formal results must stay outside the sample and source trees")
         results_root.mkdir(parents=True, exist_ok=True)
+        validate_results_root(results_root)
         run_kind = "performance" if args.performance else "admission"
         run_id = f"heterolz-{run_kind}-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         final = results_root / run_id
