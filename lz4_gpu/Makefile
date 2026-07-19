@@ -37,7 +37,7 @@ HOST_OPENCL_LDFLAGS ?=$(LDFLAGS)
 PRECOMPILE_HELPER := build_clbin$(EXEEXT)
 endif
 
-COMMON_SRCS = lz4_gpu.c lz4_gpu_utils.c lz4_gpu_core.c
+COMMON_SRCS = lz4_gpu.c lz4_gpu_utils.c lz4_gpu_core.c lz4_tp_profile.c
 ifeq ($(OS),Windows_NT)
 DAEMON_SRCS =
 else
@@ -57,6 +57,26 @@ build_clbin: build_clbin.c
 build_clbin_host: build_clbin.c
 	$(HOSTCC) -O2 -Wall -DCL_TARGET_OPENCL_VERSION=200 -I. -I../lib -I.. $(HOST_OPENCL_CFLAGS) -o $@$(HOSTEXEEXT) $^ $(HOST_OPENCL_LDFLAGS)
 
+tp_ref_decode: tp_ref_decode.c
+	$(CC) $(CFLAGS) -I../lib -o $@$(EXEEXT) $^ ../lib/lz4.c
+
+tp_to_lz4: tp_to_lz4.c ../lib/xxhash.c
+	$(CC) $(CFLAGS) -I../lib -o $@$(EXEEXT) $^
+
+interop-tools: tp_ref_decode tp_to_lz4
+
+verify-twophase: lz4_gpu interop-tools
+	bash ./verify_twophase.sh ./lz4_gpu
+
+verify-daemon-twophase: lz4_gpu interop-tools
+	bash ./verify_daemon_twophase.sh ./lz4_gpu
+
+verify-linux-early:
+	bash ./verify_linux_early.sh
+
+formal-run-help:
+	python3 ./run_formal_acceptance.py --help
+
 precompile: $(PRECOMPILE_HELPER)
 	@echo "Precompiling LZ4 GPU kernels for various hash sizes..."
 	@for bits in 14; do \
@@ -65,6 +85,6 @@ precompile: $(PRECOMPILE_HELPER)
 	done
 
 clean:
-	rm -f lz4_gpu lz4_gpu.exe build_clbin build_clbin.exe build_clbin_host *.o *.clbin
+	rm -f lz4_gpu lz4_gpu.exe build_clbin build_clbin.exe build_clbin_host tp_ref_decode tp_ref_decode.exe tp_to_lz4 tp_to_lz4.exe *.o *.clbin
 
-.PHONY: all clean precompile
+.PHONY: all clean precompile interop-tools verify-twophase verify-daemon-twophase verify-linux-early formal-run-help

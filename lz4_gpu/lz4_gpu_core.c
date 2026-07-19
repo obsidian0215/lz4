@@ -343,7 +343,6 @@ typedef struct {
 } lz4_comp_plan_t;
 
 static lz4_comp_plan_t lz4_build_comp_plan(cl_command_queue queue,
-                                           size_t file_size,
                                            size_t block_size,
                                            size_t num_blocks,
                                            size_t local_size,
@@ -788,7 +787,6 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
     size_t l_ws = sanitize_local_size(queue, (local_size > 0) ? (size_t)local_size : 1, (size_t)num_blocks);
     hash_log = lz4_sanitize_hash_log(hash_log);
     lz4_comp_plan_t comp_plan = lz4_build_comp_plan(queue,
-                                                    file_size,
                                                     block_size,
                                                     (size_t)num_blocks,
                                                     l_ws,

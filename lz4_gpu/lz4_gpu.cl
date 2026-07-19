@@ -1303,7 +1303,12 @@ __kernel void lz4_tp_scan_seg(
     __global const BYTE* base = input + start;
     int segLen = (L + N - 1) / N;
     int lo = s * segLen, hi = lo + segLen; if (hi > L) hi = L;
-    if (L <= 0 || lo >= L) { sizes[g] = 0; return; }
+    if (L <= 0 || lo >= L) {
+        /* Canonical empty LZ4 block: one zero token, decoding to zero bytes. */
+        out[(size_t)g * segMaxOut] = 0;
+        sizes[g] = 1;
+        return;
+    }
     __global LZ4_DICT_ENTRY* ownTable = ownPool + (size_t)g * dict_entries;
     __global LZ4_DICT_ENTRY* dict = (s > 0) ? prefixPool + (size_t)(b * nk + (s - 1)) * dict_entries : 0;
     sizes[g] = (U32)lz4_compress_core_seg(base, lo, hi, out + (size_t)g * segMaxOut, segMaxOut,

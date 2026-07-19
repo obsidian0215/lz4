@@ -8,7 +8,10 @@
 #if defined(_WIN32)
 #include <direct.h>
 #include <io.h>
+#include <process.h>
+#include <windows.h>
 #define access _access
+#define getpid _getpid
 #define F_OK 0
 #define strcasecmp _stricmp
 #else
@@ -20,17 +23,35 @@
 #include <sys/types.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdint.h>
 #include <time.h>
 #include <math.h>
 #include "lz4_gpu_core.h"
 #include "lz4_gpu_debug.h"
 #include "lz4_gpu_protocol.h"
 #include "lz4_gpu_utils.h"
+#include "lz4_tp_profile.h"
 #include "timing.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
+
+static int lz4_set_env(const char* name, const char* value) {
+#if defined(_WIN32)
+    return _putenv_s(name, value);
+#else
+    return setenv(name, value, 1);
+#endif
+}
+
+static int lz4_unset_env(const char* name) {
+#if defined(_WIN32)
+    return _putenv_s(name, "");
+#else
+    return unsetenv(name);
+#endif
+}
 
 /* Forward declarations */
 #if defined(_WIN32)
@@ -54,19 +75,26 @@ static size_t g_cli_fixed_block_bytes = 64 * 1024;
 static int g_cli_acceleration = 1;
 static int g_cli_tp_n = 4;
 static int g_cli_hash_log = 14;
+static const char* g_cli_metrics_path = NULL;
 
 static cl_context ctx;
 static cl_command_queue queue;
 static cl_device_id dev;
+static cl_platform_id platform;
 
 static void ocl_init() {
     cl_int err;
     cl_platform_id selected_pf = NULL;
     dev = NULL;
+    platform = NULL;
     cl_int r = lz4_select_opencl_platform_device(&selected_pf, &dev);
 
     if (r != CL_SUCCESS || dev == NULL) {
-        fprintf(stderr, "OpenCL init failed: clGetDeviceIDs failed for all type/plat combos\n");
+        if (r == CL_INVALID_VALUE) {
+            fprintf(stderr, "OpenCL init failed: invalid FORCE_OPENCL_DEVICE value\n");
+        } else {
+            fprintf(stderr, "OpenCL init failed: requested device type is unavailable\n");
+        }
         ctx = NULL;
         queue = NULL;
         return;
@@ -93,6 +121,7 @@ static void ocl_init() {
         ctx = NULL;
         return;
     }
+    platform = selected_pf;
 #if defined(CL_VERSION_2_0)
     {
         const cl_queue_properties qprops[] = {
@@ -114,6 +143,68 @@ static void ocl_init() {
     }
 }
 
+static void lz4_print_json_string(FILE* output, const char* value) {
+    fputc('"', output);
+    for (const unsigned char* p = (const unsigned char*)(value ? value : ""); *p; p++) {
+        switch (*p) {
+            case '"': fputs("\\\"", output); break;
+            case '\\': fputs("\\\\", output); break;
+            case '\b': fputs("\\b", output); break;
+            case '\f': fputs("\\f", output); break;
+            case '\n': fputs("\\n", output); break;
+            case '\r': fputs("\\r", output); break;
+            case '\t': fputs("\\t", output); break;
+            default:
+                if (*p < 0x20) fprintf(output, "\\u%04x", (unsigned)*p);
+                else fputc(*p, output);
+        }
+    }
+    fputc('"', output);
+}
+
+static int lz4_print_device_info(void) {
+    ocl_init();
+    if (!ctx || !queue || !dev || !platform) return 1;
+    char platform_name[256] = {0}, platform_vendor[256] = {0}, platform_version[256] = {0};
+    char device_name[256] = {0}, device_vendor[256] = {0}, driver[256] = {0};
+    char device_version[256] = {0}, opencl_c_version[256] = {0};
+    cl_device_type device_type = 0;
+    cl_ulong global_mem = 0, max_alloc = 0;
+    cl_uint compute_units = 0;
+    clGetPlatformInfo(platform, CL_PLATFORM_NAME, sizeof(platform_name), platform_name, NULL);
+    clGetPlatformInfo(platform, CL_PLATFORM_VENDOR, sizeof(platform_vendor), platform_vendor, NULL);
+    clGetPlatformInfo(platform, CL_PLATFORM_VERSION, sizeof(platform_version), platform_version, NULL);
+    clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof(device_name), device_name, NULL);
+    clGetDeviceInfo(dev, CL_DEVICE_VENDOR, sizeof(device_vendor), device_vendor, NULL);
+    clGetDeviceInfo(dev, CL_DRIVER_VERSION, sizeof(driver), driver, NULL);
+    clGetDeviceInfo(dev, CL_DEVICE_VERSION, sizeof(device_version), device_version, NULL);
+    clGetDeviceInfo(dev, CL_DEVICE_OPENCL_C_VERSION, sizeof(opencl_c_version), opencl_c_version, NULL);
+    clGetDeviceInfo(dev, CL_DEVICE_TYPE, sizeof(device_type), &device_type, NULL);
+    clGetDeviceInfo(dev, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(global_mem), &global_mem, NULL);
+    clGetDeviceInfo(dev, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc), &max_alloc, NULL);
+    clGetDeviceInfo(dev, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(compute_units), &compute_units, NULL);
+    const char* type_name = (device_type & CL_DEVICE_TYPE_GPU) ? "GPU" :
+                            (device_type & CL_DEVICE_TYPE_CPU) ? "CPU" :
+                            (device_type & CL_DEVICE_TYPE_ACCELERATOR) ? "ACCELERATOR" :
+                            (device_type & CL_DEVICE_TYPE_DEFAULT) ? "DEFAULT" : "OTHER";
+    fputs("{\n  \"schema\": \"heterolz.device-info.v1\",\n  \"platform_name\": ", stdout);
+    lz4_print_json_string(stdout, platform_name);
+    fputs(",\n  \"platform_vendor\": ", stdout); lz4_print_json_string(stdout, platform_vendor);
+    fputs(",\n  \"platform_version\": ", stdout); lz4_print_json_string(stdout, platform_version);
+    fputs(",\n  \"device_name\": ", stdout); lz4_print_json_string(stdout, device_name);
+    fputs(",\n  \"device_vendor\": ", stdout); lz4_print_json_string(stdout, device_vendor);
+    fputs(",\n  \"device_type\": ", stdout); lz4_print_json_string(stdout, type_name);
+    fputs(",\n  \"driver_version\": ", stdout); lz4_print_json_string(stdout, driver);
+    fputs(",\n  \"device_version\": ", stdout); lz4_print_json_string(stdout, device_version);
+    fputs(",\n  \"opencl_c_version\": ", stdout); lz4_print_json_string(stdout, opencl_c_version);
+    fprintf(stdout, ",\n  \"compute_units\": %u,\n  \"global_mem_bytes\": %llu,\n"
+                    "  \"max_alloc_bytes\": %llu\n}\n",
+            compute_units, (unsigned long long)global_mem, (unsigned long long)max_alloc);
+    clReleaseCommandQueue(queue); queue = NULL;
+    clReleaseContext(ctx); ctx = NULL;
+    return 0;
+}
+
 static void show_help(const char* prog_name) {
     fprintf(stderr, "Unified LZ4 GPU Tool\n");
     fprintf(stderr, "Usage Modes:\n");
@@ -133,6 +224,14 @@ static void show_help(const char* prog_name) {
     fprintf(stderr, "  --local N            Local work-group size (default: 1)\n");
     fprintf(stderr, "  -v, --verbose        Enable performance statistics\n");
     fprintf(stderr, "  --bench [N]          Stable benchmark (compress+decompress+verify), optional N seconds (default: 3)\n");
+    fprintf(stderr, "\nTwo-phase LZ4TP1:\n");
+    fprintf(stderr, "  --twophase           Use the segmented LZ4TP1 container\n");
+    fprintf(stderr, "  -N 1|2|4|8          Segments per block for --twophase compression\n");
+    fprintf(stderr, "  --tp-bench           Two-phase kernel sweep with 2 warmups and 9 measurements\n");
+    fprintf(stderr, "  --calibrate          Calibrate from the input file; -o optionally selects the profile\n");
+    fprintf(stderr, "  --auto               Select N from the stored device calibration profile\n");
+    fprintf(stderr, "  --metrics-json FILE  Write structured timings for one LZ4TP1 operation\n");
+    fprintf(stderr, "  --device-info        Print the selected OpenCL platform/device as JSON\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Streaming:\n");
     fprintf(stderr, "  input '-'            Read input from stdin (standalone mode only)\n");
@@ -145,6 +244,9 @@ static void show_help(const char* prog_name) {
     fprintf(stderr, "  LZ4_GPU_DECOMP_READBACK_KB=N     Chunked readback size (default: 8192)\n");
     fprintf(stderr, "  LZ4_GPU_DEBUG=0|1             Enable host/device debug counters (forces source build)\n");
     fprintf(stderr, "  LZ4_GPU_DEBUG_BLOCK_LIMIT=N   Print first N blocks of debug counters\n");
+    fprintf(stderr, "  LZ4TP_PROFILE=FILE            Device-keyed calibration profile (default: lz4tp.profile)\n");
+    fprintf(stderr, "  LZ4_TP_LEARN=0|1             Daemon live learning; experimental and disabled by default\n");
+    fprintf(stderr, "  FORCE_OPENCL_DEVICE=GPU|CPU|DEFAULT|ALL  Strict device type when explicitly set\n");
 }
 
 static int stop_daemon_cmd() {
@@ -173,15 +275,123 @@ static int stop_daemon_cmd() {
 }
 
 static size_t parse_size_bytes(const char* s) {
-    char* endptr;
-    size_t val = strtoul(s, &endptr, 10);
-    if (*endptr == 'k' || *endptr == 'K') val *= 1024;
-    else if (*endptr == 'm' || *endptr == 'M') val *= 1024 * 1024;
-    return val;
+    if (!s || !*s || *s == '-') return 0;
+    char* endptr = NULL;
+    errno = 0;
+    unsigned long long parsed = strtoull(s, &endptr, 10);
+    if (errno != 0 || endptr == s) return 0;
+    size_t multiplier = 1;
+    if (*endptr != '\0') {
+        if (endptr[1] != '\0') return 0;
+        if (*endptr == 'k' || *endptr == 'K') multiplier = 1024;
+        else if (*endptr == 'm' || *endptr == 'M') multiplier = 1024 * 1024;
+        else return 0;
+    }
+    if (parsed > (unsigned long long)SIZE_MAX / multiplier) return 0;
+    return (size_t)parsed * multiplier;
+}
+
+static int parse_int_arg(const char* s, int* out) {
+    if (!s || !*s || !out) return -1;
+    char* end = NULL;
+    errno = 0;
+    long value = strtol(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || value < INT_MIN || value > INT_MAX) return -1;
+    *out = (int)value;
+    return 0;
+}
+
+static int parse_positive_double_arg(const char* s, double* out) {
+    if (!s || !*s || !out) return -1;
+    char* end = NULL;
+    errno = 0;
+    double value = strtod(s, &end);
+    if (errno != 0 || end == s || *end != '\0' || !isfinite(value) || value <= 0.0) return -1;
+    *out = value;
+    return 0;
+}
+
+static int copy_cli_path(char* destination, size_t capacity, const char* source) {
+    if (!destination || capacity == 0 || !source) return -1;
+    size_t length = strlen(source);
+    if (length >= capacity) return -1;
+    memcpy(destination, source, length + 1);
+    return 0;
+}
+
+static int append_cli_suffix(char* destination, size_t capacity,
+                             const char* source, const char* suffix) {
+    if (!destination || capacity == 0 || !source || !suffix) return -1;
+    size_t source_length = strlen(source);
+    size_t suffix_length = strlen(suffix);
+    if (source_length >= capacity || suffix_length >= capacity - source_length) return -1;
+    memcpy(destination, source, source_length);
+    memcpy(destination + source_length, suffix, suffix_length + 1);
+    return 0;
+}
+
+static int validate_cli_config(int twophase_mode) {
+    if (g_cli_fixed_block_bytes == 0 || g_cli_fixed_block_bytes > INT_MAX) {
+        fprintf(stderr, "Error: block size must be in 1..%d bytes\n", INT_MAX);
+        return -1;
+    }
+    if (g_cli_hash_log < 11 || g_cli_hash_log > 15) {
+        fprintf(stderr, "Error: --d-bits must be in 11..15\n");
+        return -1;
+    }
+    if (g_cli_acceleration < 1) {
+        fprintf(stderr, "Error: acceleration must be positive\n");
+        return -1;
+    }
+    if (g_cli_local_size < 1 || g_cli_local_size > INT_MAX) {
+        fprintf(stderr, "Error: local size must be in 1..%d\n", INT_MAX);
+        return -1;
+    }
+    if (twophase_mode && g_cli_tp_n != 1 && g_cli_tp_n != 2 &&
+        g_cli_tp_n != 4 && g_cli_tp_n != 8) {
+        fprintf(stderr, "Error: two-phase N must be one of 1, 2, 4, or 8\n");
+        return -1;
+    }
+    return 0;
 }
 
 static int path_is_dash(const char* path) {
     return path && strcmp(path, "-") == 0;
+}
+
+static int paths_identify_same_file(const char* left, const char* right) {
+    if (!left || !right) return 0;
+    if (strcmp(left, right) == 0) return 1;
+#if defined(_WIN32)
+    char* left_full = _fullpath(NULL, left, 0);
+    char* right_full = _fullpath(NULL, right, 0);
+    int same = left_full && right_full && _stricmp(left_full, right_full) == 0;
+    free(left_full);
+    free(right_full);
+    if (same) return 1;
+    HANDLE left_handle = CreateFileA(left, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                     NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    HANDLE right_handle = CreateFileA(right, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                      NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (left_handle == INVALID_HANDLE_VALUE || right_handle == INVALID_HANDLE_VALUE) {
+        if (left_handle != INVALID_HANDLE_VALUE) CloseHandle(left_handle);
+        if (right_handle != INVALID_HANDLE_VALUE) CloseHandle(right_handle);
+        return 0;
+    }
+    BY_HANDLE_FILE_INFORMATION left_info, right_info;
+    same = GetFileInformationByHandle(left_handle, &left_info) &&
+           GetFileInformationByHandle(right_handle, &right_info) &&
+           left_info.dwVolumeSerialNumber == right_info.dwVolumeSerialNumber &&
+           left_info.nFileIndexHigh == right_info.nFileIndexHigh &&
+           left_info.nFileIndexLow == right_info.nFileIndexLow;
+    CloseHandle(left_handle);
+    CloseHandle(right_handle);
+    return same;
+#else
+    struct stat left_stat, right_stat;
+    if (stat(left, &left_stat) != 0 || stat(right, &right_stat) != 0) return 0;
+    return left_stat.st_dev == right_stat.st_dev && left_stat.st_ino == right_stat.st_ino;
+#endif
 }
 
 static int create_temp_path(char* path_buf, size_t path_buf_size, const char* templ) {
@@ -768,16 +978,13 @@ static int run_lz4_bench(const char* input_path,
  * it CANNOT silently run on the CPU device. All kernels event-profiled; every
  * two-phase result roundtrip byte-verified before it is reported.
  * ==========================================================================*/
-static size_t tp_roundup64(size_t x) { return ((x + 63) / 64) * 64; }
-
-static int run_lz4_tp_bench(const char* input_path, int block_size, double bench_seconds) {
+static int run_lz4_tp_bench(const char* input_path, int block_size) {
     struct stat st;
     if (!input_path || stat(input_path, &st) != 0 || st.st_size <= 0) {
         fprintf(stderr, "tp-bench error: invalid input file\n");
         return 1;
     }
     if (block_size <= 0) block_size = 64 * 1024;
-    (void)bench_seconds;
 
     size_t in_size = (size_t)st.st_size;
     unsigned char* input_ref = (unsigned char*)malloc(in_size);
@@ -812,7 +1019,7 @@ static int run_lz4_tp_bench(const char* input_path, int block_size, double bench
     /* ---------- BASE: single work-item per 64K block, clear16 (production-best) ---------- */
     double base_comp_mbps = 0.0, base_ratio = 0.0;
     {
-        unsetenv("LZ4_GPU_EPOCH32");
+        lz4_unset_env("LZ4_GPU_EPOCH32");
         cl_program prog = lz4_load_program(ctx, dev, hash_log, (size_t)block_size);
         if (!prog) { fprintf(stderr, "tp-bench: base prog load failed\n"); return 1; }
         cl_kernel k = clCreateKernel(prog, "lz4_compress_block", &err);
@@ -871,7 +1078,7 @@ static int run_lz4_tp_bench(const char* input_path, int block_size, double bench
            base_comp_mbps, base_ratio, nblk);
 
     /* ---------- TWO-PHASE sweep (epoch32) ---------- */
-    setenv("LZ4_GPU_EPOCH32", "1", 1);
+    lz4_set_env("LZ4_GPU_EPOCH32", "1");
     cl_program progtp = lz4_load_program(ctx, dev, hash_log, (size_t)block_size);
     if (!progtp) { fprintf(stderr, "tp-bench: tp prog load failed\n"); return 1; }
     cl_kernel kbuild = clCreateKernel(progtp, "lz4_tp_build_prefix", &err);
@@ -908,9 +1115,12 @@ static int run_lz4_tp_bench(const char* input_path, int block_size, double bench
         cl_mem d_sout   = clCreateBuffer(ctx, CL_MEM_READ_WRITE, nblk * sizeof(cl_uint), NULL, &err);
         if (!d_prefix || !d_own || !d_out || !d_sizes || !d_coff || !d_decout || !d_sout) {
             printf("     N=%d: buffer alloc failed (%d)\n", N, err);
-            if (d_prefix) clReleaseMemObject(d_prefix); if (d_own) clReleaseMemObject(d_own);
-            if (d_out) clReleaseMemObject(d_out); if (d_sizes) clReleaseMemObject(d_sizes);
-            if (d_coff) clReleaseMemObject(d_coff); if (d_decout) clReleaseMemObject(d_decout);
+            if (d_prefix) clReleaseMemObject(d_prefix);
+            if (d_own) clReleaseMemObject(d_own);
+            if (d_out) clReleaseMemObject(d_out);
+            if (d_sizes) clReleaseMemObject(d_sizes);
+            if (d_coff) clReleaseMemObject(d_coff);
+            if (d_decout) clReleaseMemObject(d_decout);
             if (d_sout) clReleaseMemObject(d_sout);
             continue;
         }
@@ -1030,7 +1240,7 @@ static int run_lz4_tp_bench(const char* input_path, int block_size, double bench
     clReleaseKernel(kbuild); clReleaseKernel(kscan); clReleaseKernel(kdec);
     clReleaseProgram(progtp);
     clReleaseMemObject(d_input);
-    unsetenv("LZ4_GPU_EPOCH32");
+    lz4_unset_env("LZ4_GPU_EPOCH32");
     free(input_ref);
     if (queue) clReleaseCommandQueue(queue);
     if (ctx) clReleaseContext(ctx);
@@ -1054,248 +1264,804 @@ static int run_lz4_tp_bench(const char* input_path, int block_size, double bench
  * ==========================================================================*/
 #define LZ4TP_MAGIC "LZ4TP1\0\0"
 
-static int lz4_tp_compress_to_file(const char* input_path, const char* output_path,
-                                   int N, int block_size) {
-    struct stat st;
-    if (!input_path || stat(input_path, &st) != 0 || st.st_size <= 0) {
-        fprintf(stderr, "tp-compress: invalid input\n"); return 1;
+static int lz4_tp_replace_path(const char* temp_path, const char* output_path);
+
+static int lz4_tp_write_metrics(const char* operation, size_t input_bytes, size_t output_bytes,
+                                int N, int block_size, int hash_log,
+                                size_t chunk_blocks,
+                                uint64_t kernel_us, uint64_t no_ocl_us,
+                                uint64_t total_us, uint64_t ocl_setup_us) {
+    if (!g_cli_metrics_path) return 0;
+    char temp_path[PATH_MAX];
+    if (snprintf(temp_path, sizeof(temp_path), "%s.tmp.%lu", g_cli_metrics_path,
+                 (unsigned long)getpid()) >= (int)sizeof(temp_path)) {
+        fprintf(stderr, "metrics path is too long\n");
+        return -1;
     }
-    if (block_size <= 0) block_size = 64 * 1024;
-    if (N < 1) N = 1; if (N > 64) N = 64;
-
-    size_t orig_size = (size_t)st.st_size;
-    unsigned char* input_ref = (unsigned char*)malloc(orig_size);
-    unsigned long rd_us = 0;
-    if (!input_ref || lz4_read_file_to_buf(input_path, input_ref, orig_size, &rd_us) != 0) {
-        free(input_ref); fprintf(stderr, "tp-compress: read failed\n"); return 1;
+    FILE* f = fopen(temp_path, "w");
+    if (!f) { fprintf(stderr, "cannot write metrics file %s\n", temp_path); return -1; }
+    double ratio_pct = 0.0;
+    if (strcmp(operation, "compress") == 0) {
+        ratio_pct = input_bytes ? 100.0 * (double)output_bytes / (double)input_bytes : 0.0;
+    } else {
+        ratio_pct = output_bytes ? 100.0 * (double)input_bytes / (double)output_bytes : 0.0;
     }
-
-    setenv("LZ4_GPU_EPOCH32", "1", 1);   /* two-phase prefix dicts require epoch32 */
-    ocl_init();
-    if (!ctx || !queue) { free(input_ref); fprintf(stderr, "tp-compress: OpenCL init failed\n"); return 1; }
-
-    int hash_log = g_cli_hash_log;
-    size_t dict_entries = (size_t)1u << hash_log;
-    size_t nblk = (orig_size + (size_t)block_size - 1) / (size_t)block_size;
-    int nk = N - 1;
-    int segLenMax = (block_size + N - 1) / N;
-    int segMaxOut = segLenMax + segLenMax / 255 + 64;
-    size_t meta_cnt = nblk * (size_t)N;
-
-    cl_int err = CL_SUCCESS;
-    cl_program prog = lz4_load_program(ctx, dev, hash_log, (size_t)block_size);
-    if (!prog) { fprintf(stderr, "tp-compress: prog load failed\n"); free(input_ref); return 1; }
-    cl_kernel kbuild = clCreateKernel(prog, "lz4_tp_build_prefix", &err);
-    cl_kernel kscan  = clCreateKernel(prog, "lz4_tp_scan_seg", &err);
-    if (!kbuild || !kscan) { fprintf(stderr, "tp-compress: kernels failed %d\n", err); free(input_ref); return 1; }
-
-    size_t prefix_bytes = (size_t)nblk * (size_t)nk * dict_entries * sizeof(cl_uint);
-    size_t own_bytes    = (size_t)nblk * (size_t)N  * dict_entries * sizeof(cl_uint);
-    size_t out_bytes    = (size_t)nblk * (size_t)N  * (size_t)segMaxOut;
-
-    cl_mem d_input  = clCreateBuffer(ctx, CL_MEM_READ_ONLY, orig_size, NULL, &err);
-    cl_mem d_prefix = clCreateBuffer(ctx, CL_MEM_READ_WRITE, prefix_bytes ? prefix_bytes : 4, NULL, &err);
-    cl_mem d_own    = clCreateBuffer(ctx, CL_MEM_READ_WRITE, own_bytes, NULL, &err);
-    cl_mem d_out    = clCreateBuffer(ctx, CL_MEM_READ_WRITE, out_bytes, NULL, &err);
-    cl_mem d_sizes  = clCreateBuffer(ctx, CL_MEM_READ_WRITE, meta_cnt * sizeof(cl_uint), NULL, &err);
-    if (!d_input || !d_prefix || !d_own || !d_out || !d_sizes) {
-        fprintf(stderr, "tp-compress: buffer alloc failed (%d)\n", err); free(input_ref); return 1;
+    int ok = fprintf(
+        f,
+        "{\n"
+        "  \"schema\": \"heterolz.operation-metric.v1\",\n"
+        "  \"operation\": \"%s\",\n"
+        "  \"input_bytes\": %zu,\n"
+        "  \"output_bytes\": %zu,\n"
+        "  \"n\": %d,\n"
+        "  \"block_size\": %d,\n"
+        "  \"hash_log\": %d,\n"
+        "  \"chunk_blocks\": %zu,\n"
+        "  \"kernel_us\": %llu,\n"
+        "  \"no_ocl_us\": %llu,\n"
+        "  \"total_us\": %llu,\n"
+        "  \"ocl_setup_us\": %llu,\n"
+        "  \"ratio_pct\": %.9f\n"
+        "}\n",
+        operation, input_bytes, output_bytes, N, block_size, hash_log, chunk_blocks,
+        (unsigned long long)kernel_us, (unsigned long long)no_ocl_us,
+        (unsigned long long)total_us, (unsigned long long)ocl_setup_us, ratio_pct) >= 0;
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) { remove(temp_path); return -1; }
+    if (lz4_tp_replace_path(temp_path, g_cli_metrics_path) != 0) {
+        fprintf(stderr, "cannot finalize metrics file %s\n", g_cli_metrics_path);
+        remove(temp_path);
+        return -1;
     }
-    clEnqueueWriteBuffer(queue, d_input, CL_TRUE, 0, orig_size, input_ref, 0, NULL, NULL);
-    { cl_uint zero = 0;
-      if (prefix_bytes) clEnqueueFillBuffer(queue, d_prefix, &zero, sizeof(zero), 0, prefix_bytes, 0, NULL, NULL);
-      clEnqueueFillBuffer(queue, d_own, &zero, sizeof(zero), 0, own_bytes, 0, NULL, NULL);
-      clFinish(queue);
-    }
-
-    cl_int i_nblk = (cl_int)nblk, i_insize = (cl_int)orig_size, i_blk = block_size,
-           i_segmax = segMaxOut, i_N = N;
-    cl_uint epoch = 1;
-    size_t lws1 = 1;
-    clSetKernelArg(kbuild, 0, sizeof(cl_mem), &d_input);
-    clSetKernelArg(kbuild, 1, sizeof(cl_mem), &d_prefix);
-    clSetKernelArg(kbuild, 2, sizeof(cl_int), &i_nblk);
-    clSetKernelArg(kbuild, 3, sizeof(cl_int), &i_insize);
-    clSetKernelArg(kbuild, 4, sizeof(cl_int), &i_blk);
-    clSetKernelArg(kbuild, 5, sizeof(cl_int), &i_N);
-    clSetKernelArg(kbuild, 6, sizeof(cl_uint), &epoch);
-    clSetKernelArg(kscan, 0, sizeof(cl_mem), &d_input);
-    clSetKernelArg(kscan, 1, sizeof(cl_mem), &d_out);
-    clSetKernelArg(kscan, 2, sizeof(cl_mem), &d_sizes);
-    clSetKernelArg(kscan, 3, sizeof(cl_mem), &d_own);
-    clSetKernelArg(kscan, 4, sizeof(cl_mem), &d_prefix);
-    clSetKernelArg(kscan, 5, sizeof(cl_int), &i_nblk);
-    clSetKernelArg(kscan, 6, sizeof(cl_int), &i_insize);
-    clSetKernelArg(kscan, 7, sizeof(cl_int), &i_blk);
-    clSetKernelArg(kscan, 8, sizeof(cl_int), &i_segmax);
-    clSetKernelArg(kscan, 9, sizeof(cl_int), &i_N);
-    clSetKernelArg(kscan, 10, sizeof(cl_uint), &epoch);
-
-    if (nk >= 1) {
-        size_t g_build = (size_t)nblk * (size_t)nk * 4; /* LZ4_TP_BUILD_CHUNKS=4 */
-        err = clEnqueueNDRangeKernel(queue, kbuild, 1, NULL, &g_build, &lws1, 0, NULL, NULL);
-        if (err != CL_SUCCESS) { fprintf(stderr, "tp-compress: build enqueue %d\n", err); return 1; }
-    }
-    size_t g_scan = (size_t)nblk * (size_t)N;
-    err = clEnqueueNDRangeKernel(queue, kscan, 1, NULL, &g_scan, &lws1, 0, NULL, NULL);
-    if (err != CL_SUCCESS) { fprintf(stderr, "tp-compress: scan enqueue %d\n", err); return 1; }
-    clFinish(queue);
-
-    cl_uint* sizes = (cl_uint*)malloc(meta_cnt * sizeof(cl_uint));
-    unsigned char* padded = (unsigned char*)malloc(out_bytes);
-    if (!sizes || !padded) { fprintf(stderr, "tp-compress: host oom\n"); return 1; }
-    clEnqueueReadBuffer(queue, d_sizes, CL_TRUE, 0, meta_cnt * sizeof(cl_uint), sizes, 0, NULL, NULL);
-    clEnqueueReadBuffer(queue, d_out,   CL_TRUE, 0, out_bytes, padded, 0, NULL, NULL);
-
-    /* compact + sanity */
-    size_t payload_total = 0;
-    for (size_t g = 0; g < meta_cnt; g++) {
-        if (sizes[g] == 0 || sizes[g] > (cl_uint)segMaxOut) {
-            fprintf(stderr, "tp-compress: bad segment size seg=%zu sz=%u (overflow?)\n", g, sizes[g]);
-            return 1;
-        }
-        payload_total += sizes[g];
-    }
-    unsigned char* payload = (unsigned char*)malloc(payload_total);
-    if (!payload) { fprintf(stderr, "tp-compress: payload oom\n"); return 1; }
-    size_t off = 0;
-    for (size_t g = 0; g < meta_cnt; g++) {
-        memcpy(payload + off, padded + g * (size_t)segMaxOut, sizes[g]);
-        off += sizes[g];
-    }
-
-    /* write frame */
-    FILE* f = fopen(output_path, "wb");
-    if (!f) { fprintf(stderr, "tp-compress: cannot open %s\n", output_path); return 1; }
-    cl_uint u_N = (cl_uint)N, u_hl = (cl_uint)hash_log, u_bs = (cl_uint)block_size, u_nblk = (cl_uint)nblk;
-    unsigned long long u_orig = (unsigned long long)orig_size;
-    fwrite(LZ4TP_MAGIC, 1, 8, f);
-    fwrite(&u_N, 4, 1, f); fwrite(&u_hl, 4, 1, f); fwrite(&u_bs, 4, 1, f); fwrite(&u_nblk, 4, 1, f);
-    fwrite(&u_orig, 8, 1, f);
-    fwrite(sizes, sizeof(cl_uint), meta_cnt, f);
-    fwrite(payload, 1, payload_total, f);
-    fclose(f);
-
-    size_t frame_total = 8 + 4*4 + 8 + meta_cnt * sizeof(cl_uint) + payload_total;
-    fprintf(stderr, "[tp-compress] %s -> %s : %zu -> %zu (%.3f:1) N=%d blocks=%zu\n",
-            input_path, output_path, orig_size, frame_total,
-            frame_total > 0 ? (double)orig_size / (double)frame_total : 0.0, N, nblk);
-
-    free(sizes); free(padded); free(payload); free(input_ref);
-    clReleaseMemObject(d_input); clReleaseMemObject(d_prefix); clReleaseMemObject(d_own);
-    clReleaseMemObject(d_out); clReleaseMemObject(d_sizes);
-    clReleaseKernel(kbuild); clReleaseKernel(kscan); clReleaseProgram(prog);
-    unsetenv("LZ4_GPU_EPOCH32");
-    if (queue) clReleaseCommandQueue(queue);
-    if (ctx) clReleaseContext(ctx);
     return 0;
 }
 
+static int lz4_tp_size_mul(size_t a, size_t b, size_t* out) {
+    if (!out || (a != 0 && b > SIZE_MAX / a)) return -1;
+    *out = a * b;
+    return 0;
+}
+
+static int lz4_tp_size_add(size_t a, size_t b, size_t* out) {
+    if (!out || b > SIZE_MAX - a) return -1;
+    *out = a + b;
+    return 0;
+}
+
+static int lz4_tp_write_exact(FILE* f, const void* data, size_t size) {
+    return size == 0 || (f && fwrite(data, 1, size, f) == size);
+}
+
+static int lz4_tp_read_exact(FILE* f, void* data, size_t size) {
+    return size == 0 || (f && fread(data, 1, size, f) == size);
+}
+
+static int lz4_tp_make_temp_path(const char* output_path, char* temp_path, size_t capacity) {
+    if (!output_path || !*output_path || !temp_path || capacity == 0 ||
+        snprintf(temp_path, capacity, "%s.tmp.%lu", output_path,
+                 (unsigned long)getpid()) >= (int)capacity) {
+        fprintf(stderr, "LZ4TP1 output path is too long\n");
+        return -1;
+    }
+    remove(temp_path);
+    return 0;
+}
+
+static int lz4_tp_replace_path(const char* temp_path, const char* output_path) {
+    if (!temp_path || !output_path) return -1;
+#if defined(_WIN32)
+    return MoveFileExA(temp_path, output_path,
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) ? 0 : -1;
+#else
+    return rename(temp_path, output_path);
+#endif
+}
+
+static int lz4_tp_finalize_temp_output(FILE** fp, const char* temp_path, const char* output_path) {
+    if (!fp || !*fp) return -1;
+    if (fflush(*fp) != 0 || fclose(*fp) != 0) {
+        *fp = NULL;
+        remove(temp_path);
+        fprintf(stderr, "cannot finalize temporary output %s\n", temp_path);
+        return -1;
+    }
+    *fp = NULL;
+    if (lz4_tp_replace_path(temp_path, output_path) != 0) {
+        remove(temp_path);
+        fprintf(stderr, "cannot rename temporary output to %s\n", output_path);
+        return -1;
+    }
+    return 0;
+}
+
+static size_t lz4_tp_apply_test_chunk_override(size_t safe_limit) {
+    const char* value = getenv("LZ4TP_TEST_CHUNK_BLOCKS");
+    if (!value || !*value || safe_limit == 0) return safe_limit;
+    char* end = NULL;
+    errno = 0;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || parsed == 0 || parsed > (unsigned long long)SIZE_MAX)
+        return safe_limit;
+    if ((size_t)parsed < safe_limit) return (size_t)parsed;
+    return safe_limit;
+}
+
+static size_t lz4_tp_device_alloc_budget(cl_ulong max_alloc, size_t fallback) {
+    if (!max_alloc) return fallback;
+    cl_ulong budget = (max_alloc / 4) * 3;
+    if (budget > (cl_ulong)SIZE_MAX) return SIZE_MAX;
+    return (size_t)budget;
+}
+
+static size_t lz4_tp_device_global_budget(cl_ulong global_mem, size_t fallback) {
+    size_t cap = (size_t)512 * 1024 * 1024;
+    if (!global_mem) return fallback < cap ? fallback : cap;
+    cl_ulong budget = global_mem / 4;
+    if (budget > (cl_ulong)cap) return cap;
+    return (size_t)budget;
+}
+
+static size_t lz4_tp_choose_chunk_blocks(size_t total_blocks, int N, int block_size,
+                                         size_t dict_entries) {
+    if (total_blocks == 0 || N < 1 || block_size < 1) return 0;
+    const size_t hard_cap = 512;
+    size_t seg_len_max = ((size_t)block_size + (size_t)N - 1) / (size_t)N;
+    size_t seg_max_out = 0, per_prefix = 0, per_own = 0, per_output = 0;
+    size_t per_total = 0, tmp = 0;
+    if (lz4_tp_size_add(seg_len_max, seg_len_max / 255, &seg_max_out) != 0 ||
+        lz4_tp_size_add(seg_max_out, 64, &seg_max_out) != 0 ||
+        lz4_tp_size_mul((size_t)(N - 1), dict_entries, &tmp) != 0 ||
+        lz4_tp_size_mul(tmp, sizeof(cl_uint), &per_prefix) != 0 ||
+        lz4_tp_size_mul((size_t)N, dict_entries, &tmp) != 0 ||
+        lz4_tp_size_mul(tmp, sizeof(cl_uint), &per_own) != 0 ||
+        lz4_tp_size_mul((size_t)N, seg_max_out, &per_output) != 0 ||
+        lz4_tp_size_add((size_t)block_size, per_prefix, &per_total) != 0 ||
+        lz4_tp_size_add(per_total, per_own, &per_total) != 0 ||
+        lz4_tp_size_add(per_total, per_output, &per_total) != 0 ||
+        lz4_tp_size_mul((size_t)N, sizeof(cl_uint), &tmp) != 0 ||
+        lz4_tp_size_add(per_total, tmp, &per_total) != 0 || per_output == 0) {
+        return 0;
+    }
+
+    size_t limit = total_blocks < hard_cap ? total_blocks : hard_cap;
+    size_t by_offset = (size_t)UINT_MAX / per_output;
+    if (by_offset < limit) limit = by_offset;
+
+    cl_ulong max_alloc = 0, global_mem = 0;
+    if (dev) {
+        clGetDeviceInfo(dev, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc), &max_alloc, NULL);
+        clGetDeviceInfo(dev, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(global_mem), &global_mem, NULL);
+    }
+    size_t alloc_budget = lz4_tp_device_alloc_budget(max_alloc, (size_t)256 * 1024 * 1024);
+    size_t components[] = {(size_t)block_size, per_prefix, per_own, per_output};
+    for (size_t i = 0; i < sizeof(components) / sizeof(components[0]); i++) {
+        if (components[i] == 0) continue;
+        size_t by_alloc = alloc_budget / components[i];
+        if (by_alloc < limit) limit = by_alloc;
+    }
+    size_t global_budget = lz4_tp_device_global_budget(global_mem, (size_t)512 * 1024 * 1024);
+    size_t by_global = global_budget / per_total;
+    if (by_global < limit) limit = by_global;
+    return lz4_tp_apply_test_chunk_override(limit);
+}
+
+static size_t lz4_tp_choose_decode_chunk_blocks(size_t total_blocks, int N, int block_size,
+                                                size_t seg_max_out) {
+    if (total_blocks == 0 || N < 1 || block_size < 1 || seg_max_out == 0) return 0;
+    const size_t hard_cap = 512;
+    size_t per_payload = 0, per_meta = 0, per_total = 0, tmp = 0;
+    if (lz4_tp_size_mul((size_t)N, seg_max_out, &per_payload) != 0 ||
+        lz4_tp_size_mul((size_t)N, 2 * sizeof(cl_uint), &per_meta) != 0 ||
+        lz4_tp_size_add(per_payload, (size_t)block_size, &per_total) != 0 ||
+        lz4_tp_size_add(per_total, per_meta, &per_total) != 0 ||
+        lz4_tp_size_add(per_total, sizeof(cl_uint), &per_total) != 0 || per_payload == 0) {
+        return 0;
+    }
+    size_t limit = total_blocks < hard_cap ? total_blocks : hard_cap;
+    size_t by_offset = (size_t)UINT_MAX / per_payload;
+    if (by_offset < limit) limit = by_offset;
+
+    cl_ulong max_alloc = 0, global_mem = 0;
+    if (dev) {
+        clGetDeviceInfo(dev, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc), &max_alloc, NULL);
+        clGetDeviceInfo(dev, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(global_mem), &global_mem, NULL);
+    }
+    size_t alloc_budget = lz4_tp_device_alloc_budget(max_alloc, (size_t)256 * 1024 * 1024);
+    size_t components[] = {per_payload, (size_t)block_size, per_meta, sizeof(cl_uint)};
+    for (size_t i = 0; i < sizeof(components) / sizeof(components[0]); i++) {
+        if (components[i] == 0) continue;
+        tmp = alloc_budget / components[i];
+        if (tmp < limit) limit = tmp;
+    }
+    size_t global_budget = lz4_tp_device_global_budget(global_mem, (size_t)512 * 1024 * 1024);
+    tmp = global_budget / per_total;
+    if (tmp < limit) limit = tmp;
+    return lz4_tp_apply_test_chunk_override(limit);
+}
+
+static int lz4_tp_compress_chunk(const unsigned char* input, size_t input_size,
+                                 size_t chunk_nblk, int N, int block_size,
+                                 size_t dict_entries, int seg_max_out,
+                                 cl_kernel kbuild, cl_kernel kscan,
+                                 cl_uint* sizes_out, unsigned char* payload,
+                                 size_t payload_capacity, size_t* payload_used,
+                                 uint64_t* kernel_us) {
+    int status = 1;
+    int nk = N - 1;
+    size_t meta_cnt = 0, prefix_bytes = 0, own_bytes = 0, out_bytes = 0, tmp = 0;
+    cl_int err = CL_SUCCESS;
+    cl_mem d_input = NULL, d_prefix = NULL, d_own = NULL, d_out = NULL, d_sizes = NULL;
+    unsigned char* padded = NULL;
+    cl_event build_event = NULL, scan_event = NULL;
+
+    if (!input || input_size == 0 || input_size > (size_t)INT_MAX ||
+        chunk_nblk == 0 || chunk_nblk > (size_t)INT_MAX || N < 1 ||
+        block_size < 1 || seg_max_out < 1 || !sizes_out || !payload ||
+        !payload_used || !kernel_us ||
+        lz4_tp_size_mul(chunk_nblk, (size_t)N, &meta_cnt) != 0 ||
+        lz4_tp_size_mul(chunk_nblk, (size_t)nk, &tmp) != 0 ||
+        lz4_tp_size_mul(tmp, dict_entries, &tmp) != 0 ||
+        lz4_tp_size_mul(tmp, sizeof(cl_uint), &prefix_bytes) != 0 ||
+        lz4_tp_size_mul(meta_cnt, dict_entries, &tmp) != 0 ||
+        lz4_tp_size_mul(tmp, sizeof(cl_uint), &own_bytes) != 0 ||
+        lz4_tp_size_mul(meta_cnt, (size_t)seg_max_out, &out_bytes) != 0 ||
+        out_bytes > payload_capacity) {
+        fprintf(stderr, "tp-compress: invalid chunk dimensions\n");
+        goto done;
+    }
+
+    d_input = clCreateBuffer(ctx, CL_MEM_READ_ONLY, input_size, NULL, &err);
+    d_prefix = clCreateBuffer(ctx, CL_MEM_READ_WRITE, prefix_bytes ? prefix_bytes : 4, NULL, &err);
+    d_own = clCreateBuffer(ctx, CL_MEM_READ_WRITE, own_bytes, NULL, &err);
+    d_out = clCreateBuffer(ctx, CL_MEM_READ_WRITE, out_bytes, NULL, &err);
+    d_sizes = clCreateBuffer(ctx, CL_MEM_READ_WRITE, meta_cnt * sizeof(cl_uint), NULL, &err);
+    if (!d_input || !d_prefix || !d_own || !d_out || !d_sizes) {
+        fprintf(stderr, "tp-compress: chunk buffer alloc failed (%d)\n", err);
+        goto done;
+    }
+    if (clEnqueueWriteBuffer(queue, d_input, CL_TRUE, 0, input_size, input, 0, NULL, NULL) != CL_SUCCESS) goto done;
+    {
+        cl_uint zero = 0;
+        if (prefix_bytes && clEnqueueFillBuffer(queue, d_prefix, &zero, sizeof(zero), 0,
+                                                prefix_bytes, 0, NULL, NULL) != CL_SUCCESS) goto done;
+        if (clEnqueueFillBuffer(queue, d_own, &zero, sizeof(zero), 0,
+                                own_bytes, 0, NULL, NULL) != CL_SUCCESS) goto done;
+        if (clFinish(queue) != CL_SUCCESS) goto done;
+    }
+
+    cl_int i_nblk = (cl_int)chunk_nblk, i_insize = (cl_int)input_size, i_blk = block_size,
+           i_segmax = seg_max_out, i_N = N;
+    cl_uint epoch = 1;
+    size_t lws = 1;
+    cl_int arg_err = CL_SUCCESS;
+    arg_err |= clSetKernelArg(kbuild, 0, sizeof(cl_mem), &d_input);
+    arg_err |= clSetKernelArg(kbuild, 1, sizeof(cl_mem), &d_prefix);
+    arg_err |= clSetKernelArg(kbuild, 2, sizeof(cl_int), &i_nblk);
+    arg_err |= clSetKernelArg(kbuild, 3, sizeof(cl_int), &i_insize);
+    arg_err |= clSetKernelArg(kbuild, 4, sizeof(cl_int), &i_blk);
+    arg_err |= clSetKernelArg(kbuild, 5, sizeof(cl_int), &i_N);
+    arg_err |= clSetKernelArg(kbuild, 6, sizeof(cl_uint), &epoch);
+    arg_err |= clSetKernelArg(kscan, 0, sizeof(cl_mem), &d_input);
+    arg_err |= clSetKernelArg(kscan, 1, sizeof(cl_mem), &d_out);
+    arg_err |= clSetKernelArg(kscan, 2, sizeof(cl_mem), &d_sizes);
+    arg_err |= clSetKernelArg(kscan, 3, sizeof(cl_mem), &d_own);
+    arg_err |= clSetKernelArg(kscan, 4, sizeof(cl_mem), &d_prefix);
+    arg_err |= clSetKernelArg(kscan, 5, sizeof(cl_int), &i_nblk);
+    arg_err |= clSetKernelArg(kscan, 6, sizeof(cl_int), &i_insize);
+    arg_err |= clSetKernelArg(kscan, 7, sizeof(cl_int), &i_blk);
+    arg_err |= clSetKernelArg(kscan, 8, sizeof(cl_int), &i_segmax);
+    arg_err |= clSetKernelArg(kscan, 9, sizeof(cl_int), &i_N);
+    arg_err |= clSetKernelArg(kscan, 10, sizeof(cl_uint), &epoch);
+    if (arg_err != CL_SUCCESS) goto done;
+
+    if (nk >= 1) {
+        size_t g_build = chunk_nblk * (size_t)nk * 4;
+        err = clEnqueueNDRangeKernel(queue, kbuild, 1, NULL, &g_build, &lws, 0, NULL, &build_event);
+        if (err != CL_SUCCESS) goto done;
+    }
+    size_t g_scan = chunk_nblk * (size_t)N;
+    err = clEnqueueNDRangeKernel(queue, kscan, 1, NULL, &g_scan, &lws, 0, NULL, &scan_event);
+    if (err != CL_SUCCESS) goto done;
+    if (clFinish(queue) != CL_SUCCESS) goto done;
+    if (build_event) *kernel_us += (uint64_t)(event_elapsed_us(build_event) + 0.5);
+    if (scan_event) *kernel_us += (uint64_t)(event_elapsed_us(scan_event) + 0.5);
+
+    padded = (unsigned char*)malloc(out_bytes);
+    if (!padded) goto done;
+    if (clEnqueueReadBuffer(queue, d_sizes, CL_TRUE, 0, meta_cnt * sizeof(cl_uint),
+                            sizes_out, 0, NULL, NULL) != CL_SUCCESS) goto done;
+    if (clEnqueueReadBuffer(queue, d_out, CL_TRUE, 0, out_bytes,
+                            padded, 0, NULL, NULL) != CL_SUCCESS) goto done;
+    for (size_t g = 0; g < meta_cnt; g++) {
+        size_t size = sizes_out[g];
+        if (size == 0 || size > (size_t)seg_max_out || size > payload_capacity ||
+            *payload_used > payload_capacity - size) {
+            fprintf(stderr, "tp-compress: invalid chunk segment size\n");
+            goto done;
+        }
+        memcpy(payload + *payload_used, padded + g * (size_t)seg_max_out, size);
+        *payload_used += size;
+    }
+    status = 0;
+
+done:
+    if (build_event) clReleaseEvent(build_event);
+    if (scan_event) clReleaseEvent(scan_event);
+    free(padded);
+    if (d_input) clReleaseMemObject(d_input);
+    if (d_prefix) clReleaseMemObject(d_prefix);
+    if (d_own) clReleaseMemObject(d_own);
+    if (d_out) clReleaseMemObject(d_out);
+    if (d_sizes) clReleaseMemObject(d_sizes);
+    return status;
+}
+
+static int lz4_tp_decompress_chunk(const unsigned char* payload, size_t payload_size,
+                                   const cl_uint* comp_off, const cl_uint* comp_sizes,
+                                   size_t chunk_nblk, int N, int block_size,
+                                   cl_kernel kdec, unsigned char* dec, cl_uint* sizes_out,
+                                   uint64_t* kernel_us) {
+    int status = 1;
+    size_t meta_cnt = 0, dec_bytes = 0;
+    cl_int err = CL_SUCCESS;
+    cl_mem d_payload = NULL, d_coff = NULL, d_csz = NULL, d_decout = NULL, d_sout = NULL;
+    cl_event dec_event = NULL;
+    if (!payload || payload_size == 0 || payload_size > (size_t)UINT_MAX ||
+        !comp_off || !comp_sizes || !dec || !sizes_out || !kernel_us ||
+        chunk_nblk == 0 || chunk_nblk > (size_t)INT_MAX || N < 1 || block_size < 1 ||
+        lz4_tp_size_mul(chunk_nblk, (size_t)N, &meta_cnt) != 0 ||
+        lz4_tp_size_mul(chunk_nblk, (size_t)block_size, &dec_bytes) != 0) {
+        fprintf(stderr, "tp-decompress: invalid chunk dimensions\n");
+        goto done;
+    }
+
+    d_payload = clCreateBuffer(ctx, CL_MEM_READ_ONLY, payload_size, NULL, &err);
+    d_coff = clCreateBuffer(ctx, CL_MEM_READ_ONLY, meta_cnt * sizeof(cl_uint), NULL, &err);
+    d_csz = clCreateBuffer(ctx, CL_MEM_READ_ONLY, meta_cnt * sizeof(cl_uint), NULL, &err);
+    d_decout = clCreateBuffer(ctx, CL_MEM_READ_WRITE, dec_bytes, NULL, &err);
+    d_sout = clCreateBuffer(ctx, CL_MEM_READ_WRITE, chunk_nblk * sizeof(cl_uint), NULL, &err);
+    if (!d_payload || !d_coff || !d_csz || !d_decout || !d_sout) {
+        fprintf(stderr, "tp-decompress: chunk buffer alloc failed (%d)\n", err);
+        goto done;
+    }
+    if (clEnqueueWriteBuffer(queue, d_payload, CL_TRUE, 0, payload_size, payload, 0, NULL, NULL) != CL_SUCCESS ||
+        clEnqueueWriteBuffer(queue, d_coff, CL_TRUE, 0, meta_cnt * sizeof(cl_uint), comp_off, 0, NULL, NULL) != CL_SUCCESS ||
+        clEnqueueWriteBuffer(queue, d_csz, CL_TRUE, 0, meta_cnt * sizeof(cl_uint), comp_sizes, 0, NULL, NULL) != CL_SUCCESS) {
+        goto done;
+    }
+
+    cl_uint u_blk = (cl_uint)block_size, u_tot = (cl_uint)chunk_nblk;
+    cl_int i_N = N;
+    cl_int arg_err = CL_SUCCESS;
+    arg_err |= clSetKernelArg(kdec, 0, sizeof(cl_mem), &d_payload);
+    arg_err |= clSetKernelArg(kdec, 1, sizeof(cl_mem), &d_decout);
+    arg_err |= clSetKernelArg(kdec, 2, sizeof(cl_mem), &d_coff);
+    arg_err |= clSetKernelArg(kdec, 3, sizeof(cl_mem), &d_csz);
+    arg_err |= clSetKernelArg(kdec, 4, sizeof(cl_mem), &d_sout);
+    arg_err |= clSetKernelArg(kdec, 5, sizeof(cl_uint), &u_blk);
+    arg_err |= clSetKernelArg(kdec, 6, sizeof(cl_int), &i_N);
+    arg_err |= clSetKernelArg(kdec, 7, sizeof(cl_uint), &u_tot);
+    if (arg_err != CL_SUCCESS) goto done;
+
+    size_t g_dec = chunk_nblk, lws = 1;
+    err = clEnqueueNDRangeKernel(queue, kdec, 1, NULL, &g_dec, &lws, 0, NULL, &dec_event);
+    if (err != CL_SUCCESS || clFinish(queue) != CL_SUCCESS) goto done;
+    *kernel_us += (uint64_t)(event_elapsed_us(dec_event) + 0.5);
+    if (clEnqueueReadBuffer(queue, d_decout, CL_TRUE, 0, dec_bytes, dec, 0, NULL, NULL) != CL_SUCCESS ||
+        clEnqueueReadBuffer(queue, d_sout, CL_TRUE, 0, chunk_nblk * sizeof(cl_uint), sizes_out, 0, NULL, NULL) != CL_SUCCESS) {
+        goto done;
+    }
+    status = 0;
+
+done:
+    if (dec_event) clReleaseEvent(dec_event);
+    if (d_payload) clReleaseMemObject(d_payload);
+    if (d_coff) clReleaseMemObject(d_coff);
+    if (d_csz) clReleaseMemObject(d_csz);
+    if (d_decout) clReleaseMemObject(d_decout);
+    if (d_sout) clReleaseMemObject(d_sout);
+    return status;
+}
+
+static int lz4_tp_compress_to_file(const char* input_path, const char* output_path,
+                                   int N, int block_size,
+                                   uint64_t pre_total_us, uint64_t pre_ocl_setup_us) {
+    uint64_t total_start = get_us();
+    int status = 1, env_set = 0, temp_active = 0;
+    struct stat st;
+    FILE* input_file = NULL;
+    FILE* output_file = NULL;
+    cl_program prog = NULL;
+    cl_kernel kbuild = NULL, kscan = NULL;
+    cl_uint* sizes = NULL;
+    unsigned char* input_chunk = NULL;
+    unsigned char* payload_chunk = NULL;
+    char temp_path[PATH_MAX] = {0};
+    if (!input_path || !output_path || !*output_path || paths_identify_same_file(input_path, output_path) ||
+        (g_cli_metrics_path && (paths_identify_same_file(g_cli_metrics_path, input_path) ||
+                                paths_identify_same_file(g_cli_metrics_path, output_path))) ||
+        stat(input_path, &st) != 0 || st.st_size < 0 ||
+        (uint64_t)st.st_size > (uint64_t)SIZE_MAX) {
+        fprintf(stderr, "tp-compress: invalid input\n"); return 1;
+    }
+    if ((N != 1 && N != 2 && N != 4 && N != 8) || block_size < 1 ||
+        g_cli_hash_log < 11 || g_cli_hash_log > 15) {
+        fprintf(stderr, "tp-compress: unsupported frame parameters\n"); return 1;
+    }
+
+    size_t orig_size = (size_t)st.st_size;
+    if (lz4_tp_make_temp_path(output_path, temp_path, sizeof(temp_path)) != 0) return 1;
+    temp_active = 1;
+    if (orig_size == 0) {
+        output_file = fopen(temp_path, "wb");
+        if (!output_file) { fprintf(stderr, "tp-compress: cannot open %s\n", temp_path); goto done; }
+        cl_uint u_N = 1, u_hl = (cl_uint)g_cli_hash_log;
+        cl_uint u_bs = (cl_uint)block_size, u_nblk = 0;
+        unsigned long long u_orig = 0;
+        if (!lz4_tp_write_exact(output_file, LZ4TP_MAGIC, 8) ||
+            !lz4_tp_write_exact(output_file, &u_N, 4) ||
+            !lz4_tp_write_exact(output_file, &u_hl, 4) ||
+            !lz4_tp_write_exact(output_file, &u_bs, 4) ||
+            !lz4_tp_write_exact(output_file, &u_nblk, 4) ||
+            !lz4_tp_write_exact(output_file, &u_orig, 8) ||
+            lz4_tp_finalize_temp_output(&output_file, temp_path, output_path) != 0) {
+            fprintf(stderr, "tp-compress: write failed\n"); goto done;
+        }
+        temp_active = 0;
+        uint64_t total_end = get_us();
+        uint64_t total_us = total_end - total_start + pre_total_us;
+        uint64_t host_pre_us = pre_total_us >= pre_ocl_setup_us ?
+                               pre_total_us - pre_ocl_setup_us : 0;
+        if (lz4_tp_write_metrics("compress", 0, 32, 1, block_size, g_cli_hash_log,
+                                 0, 0, total_end - total_start + host_pre_us,
+                                 total_us, pre_ocl_setup_us) != 0) goto done;
+        fprintf(stderr, "[tp-compress] %s -> %s : empty LZ4TP1 frame\n", input_path, output_path);
+        status = 0;
+        goto done;
+    }
+
+    uint64_t ocl_start = get_us();
+    if (lz4_set_env("LZ4_GPU_EPOCH32", "1") != 0) {
+        fprintf(stderr, "tp-compress: cannot set epoch mode\n"); goto done;
+    }
+    env_set = 1;
+    ocl_init();
+    if (!ctx || !queue) { fprintf(stderr, "tp-compress: OpenCL init failed\n"); goto done; }
+
+    int hash_log = g_cli_hash_log;
+    size_t dict_entries = (size_t)1u << hash_log;
+    size_t nblk = orig_size / (size_t)block_size + (orig_size % (size_t)block_size != 0);
+    if (nblk > (size_t)UINT_MAX) { fprintf(stderr, "tp-compress: too many blocks\n"); goto done; }
+    size_t seg_len_max = ((size_t)block_size + (size_t)N - 1) / (size_t)N;
+    size_t seg_max_out = 0, meta_cnt = 0;
+    if (lz4_tp_size_add(seg_len_max, seg_len_max / 255, &seg_max_out) != 0 ||
+        lz4_tp_size_add(seg_max_out, 64, &seg_max_out) != 0 || seg_max_out > (size_t)INT_MAX ||
+        lz4_tp_size_mul(nblk, (size_t)N, &meta_cnt) != 0 ||
+        meta_cnt > SIZE_MAX / sizeof(cl_uint)) {
+        fprintf(stderr, "tp-compress: frame dimensions overflow\n"); goto done;
+    }
+
+    cl_int err = CL_SUCCESS;
+    prog = lz4_load_program(ctx, dev, hash_log, (size_t)block_size);
+    if (!prog) { fprintf(stderr, "tp-compress: prog load failed\n"); goto done; }
+    kbuild = clCreateKernel(prog, "lz4_tp_build_prefix", &err);
+    kscan = clCreateKernel(prog, "lz4_tp_scan_seg", &err);
+    if (!kbuild || !kscan) { fprintf(stderr, "tp-compress: kernels failed %d\n", err); goto done; }
+    uint64_t work_start = get_us();
+
+    size_t chunk_blocks = lz4_tp_choose_chunk_blocks(nblk, N, block_size, dict_entries);
+    size_t chunk_input_capacity = 0, chunk_meta_capacity = 0, chunk_payload_capacity = 0;
+    if (chunk_blocks == 0 ||
+        lz4_tp_size_mul(chunk_blocks, (size_t)block_size, &chunk_input_capacity) != 0 ||
+        chunk_input_capacity > (size_t)INT_MAX ||
+        lz4_tp_size_mul(chunk_blocks, (size_t)N, &chunk_meta_capacity) != 0 ||
+        lz4_tp_size_mul(chunk_meta_capacity, seg_max_out, &chunk_payload_capacity) != 0 ||
+        chunk_payload_capacity > (size_t)UINT_MAX) {
+        fprintf(stderr, "tp-compress: no safe OpenCL chunk size\n"); goto done;
+    }
+    sizes = (cl_uint*)calloc(meta_cnt, sizeof(cl_uint));
+    input_chunk = (unsigned char*)malloc(chunk_input_capacity);
+    payload_chunk = (unsigned char*)malloc(chunk_payload_capacity);
+    input_file = fopen(input_path, "rb");
+    output_file = fopen(temp_path, "w+b");
+    if (!sizes || !input_chunk || !payload_chunk || !input_file || !output_file) {
+        fprintf(stderr, "tp-compress: host allocation or file open failed\n"); goto done;
+    }
+
+    cl_uint u_N = (cl_uint)N, u_hl = (cl_uint)hash_log, u_bs = (cl_uint)block_size, u_nblk = (cl_uint)nblk;
+    unsigned long long u_orig = (unsigned long long)orig_size;
+    if (!lz4_tp_write_exact(output_file, LZ4TP_MAGIC, 8) ||
+        !lz4_tp_write_exact(output_file, &u_N, 4) ||
+        !lz4_tp_write_exact(output_file, &u_hl, 4) ||
+        !lz4_tp_write_exact(output_file, &u_bs, 4) ||
+        !lz4_tp_write_exact(output_file, &u_nblk, 4) ||
+        !lz4_tp_write_exact(output_file, &u_orig, 8) ||
+        !lz4_tp_write_exact(output_file, sizes, meta_cnt * sizeof(cl_uint))) {
+        fprintf(stderr, "tp-compress: frame header write failed\n"); goto done;
+    }
+
+    size_t payload_total = 0;
+    uint64_t kernel_us = 0;
+    for (size_t base = 0; base < nblk; base += chunk_blocks) {
+        size_t this_blocks = nblk - base;
+        if (this_blocks > chunk_blocks) this_blocks = chunk_blocks;
+        size_t nominal_bytes = this_blocks * (size_t)block_size;
+        size_t consumed = base * (size_t)block_size;
+        size_t remaining = orig_size - consumed;
+        size_t input_bytes = remaining < nominal_bytes ? remaining : nominal_bytes;
+        if (!lz4_tp_read_exact(input_file, input_chunk, input_bytes)) {
+            fprintf(stderr, "tp-compress: input changed or read failed\n"); goto done;
+        }
+        size_t payload_used = 0;
+        if (lz4_tp_compress_chunk(input_chunk, input_bytes, this_blocks, N, block_size,
+                                  dict_entries, (int)seg_max_out,
+                                  kbuild, kscan, sizes + base * (size_t)N,
+                                  payload_chunk, chunk_payload_capacity, &payload_used,
+                                  &kernel_us) != 0 ||
+            !lz4_tp_write_exact(output_file, payload_chunk, payload_used) ||
+            lz4_tp_size_add(payload_total, payload_used, &payload_total) != 0) {
+            fprintf(stderr, "tp-compress: chunk processing failed\n"); goto done;
+        }
+    }
+    if (fgetc(input_file) != EOF || ferror(input_file)) {
+        fprintf(stderr, "tp-compress: input size changed during compression\n"); goto done;
+    }
+    if (fseek(output_file, 32L, SEEK_SET) != 0 ||
+        !lz4_tp_write_exact(output_file, sizes, meta_cnt * sizeof(cl_uint)) ||
+        lz4_tp_finalize_temp_output(&output_file, temp_path, output_path) != 0) {
+        fprintf(stderr, "tp-compress: frame finalization failed\n"); goto done;
+    }
+    temp_active = 0;
+
+    size_t frame_total = 0, meta_bytes = meta_cnt * sizeof(cl_uint);
+    if (lz4_tp_size_add(32, meta_bytes, &frame_total) != 0 ||
+        lz4_tp_size_add(frame_total, payload_total, &frame_total) != 0) {
+        fprintf(stderr, "tp-compress: frame size overflow\n"); goto done;
+    }
+    uint64_t work_end = get_us();
+    uint64_t host_pre_us = pre_total_us >= pre_ocl_setup_us ?
+                           pre_total_us - pre_ocl_setup_us : 0;
+    uint64_t no_ocl_us = (ocl_start - total_start) + (work_end - work_start) + host_pre_us;
+    uint64_t total_us = work_end - total_start + pre_total_us;
+    uint64_t ocl_setup_us = work_start - ocl_start + pre_ocl_setup_us;
+    if (lz4_tp_write_metrics("compress", orig_size, frame_total, N, block_size, hash_log,
+                             chunk_blocks, kernel_us, no_ocl_us, total_us,
+                             ocl_setup_us) != 0) goto done;
+    fprintf(stderr, "[tp-compress] %s -> %s : %zu -> %zu (%.3f:1) N=%d blocks=%zu chunk=%zu\n",
+            input_path, output_path, orig_size, frame_total,
+            frame_total > 0 ? (double)orig_size / (double)frame_total : 0.0, N, nblk, chunk_blocks);
+    status = 0;
+
+done:
+    if (input_file) fclose(input_file);
+    if (output_file) fclose(output_file);
+    if (temp_active) remove(temp_path);
+    free(sizes);
+    free(input_chunk);
+    free(payload_chunk);
+    if (kbuild) clReleaseKernel(kbuild);
+    if (kscan) clReleaseKernel(kscan);
+    if (prog) clReleaseProgram(prog);
+    if (env_set) lz4_unset_env("LZ4_GPU_EPOCH32");
+    if (queue) { clReleaseCommandQueue(queue); queue = NULL; }
+    if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+    return status;
+}
+
 static int lz4_tp_decompress_from_file(const char* input_path, const char* output_path) {
-    FILE* f = fopen(input_path, "rb");
-    if (!f) { fprintf(stderr, "tp-decompress: cannot open %s\n", input_path); return 1; }
+    uint64_t total_start = get_us();
+    int status = 1, env_set = 0, temp_active = 0;
+    struct stat frame_st;
+    FILE* input_file = NULL;
+    FILE* output_file = NULL;
+    cl_program prog = NULL;
+    cl_kernel kdec = NULL;
+    cl_uint* comp_sizes = NULL;
+    cl_uint* comp_off = NULL;
+    cl_uint* chunk_sizes_out = NULL;
+    unsigned char* payload = NULL;
+    unsigned char* dec = NULL;
+    char temp_path[PATH_MAX] = {0};
+    if (!input_path || !output_path || !*output_path || paths_identify_same_file(input_path, output_path) ||
+        (g_cli_metrics_path && (paths_identify_same_file(g_cli_metrics_path, input_path) ||
+                                paths_identify_same_file(g_cli_metrics_path, output_path))) ||
+        stat(input_path, &frame_st) != 0 || frame_st.st_size < 0 ||
+        (uint64_t)frame_st.st_size > (uint64_t)SIZE_MAX) {
+        fprintf(stderr, "tp-decompress: invalid input\n"); return 1;
+    }
+    size_t frame_size = (size_t)frame_st.st_size;
+    if (frame_size < 32) { fprintf(stderr, "tp-decompress: truncated header\n"); return 1; }
+    input_file = fopen(input_path, "rb");
+    if (!input_file) { fprintf(stderr, "tp-decompress: cannot open %s\n", input_path); return 1; }
     char magic[8] = {0};
     cl_uint u_N = 0, u_hl = 0, u_bs = 0, u_nblk = 0;
     unsigned long long u_orig = 0;
-    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, LZ4TP_MAGIC, 8) != 0) {
-        fprintf(stderr, "tp-decompress: not a LZ4TP frame\n"); fclose(f); return 1;
+    if (!lz4_tp_read_exact(input_file, magic, 8) || memcmp(magic, LZ4TP_MAGIC, 8) != 0 ||
+        !lz4_tp_read_exact(input_file, &u_N, 4) ||
+        !lz4_tp_read_exact(input_file, &u_hl, 4) ||
+        !lz4_tp_read_exact(input_file, &u_bs, 4) ||
+        !lz4_tp_read_exact(input_file, &u_nblk, 4) ||
+        !lz4_tp_read_exact(input_file, &u_orig, 8)) {
+        fprintf(stderr, "tp-decompress: invalid or truncated LZ4TP1 header\n"); goto done;
     }
-    fread(&u_N, 4, 1, f); fread(&u_hl, 4, 1, f); fread(&u_bs, 4, 1, f); fread(&u_nblk, 4, 1, f);
-    fread(&u_orig, 8, 1, f);
     int N = (int)u_N, hash_log = (int)u_hl, block_size = (int)u_bs;
-    size_t nblk = (size_t)u_nblk, orig_size = (size_t)u_orig, meta_cnt = nblk * (size_t)N;
-    if (N < 1 || block_size <= 0 || nblk == 0) { fprintf(stderr, "tp-decompress: bad header\n"); fclose(f); return 1; }
+    if ((N != 1 && N != 2 && N != 4 && N != 8) || hash_log < 11 || hash_log > 15 ||
+        block_size < 1 || u_orig > (unsigned long long)SIZE_MAX) {
+        fprintf(stderr, "tp-decompress: unsupported frame parameters\n"); goto done;
+    }
+    size_t nblk = (size_t)u_nblk, orig_size = (size_t)u_orig;
+    size_t expected_nblk = orig_size / (size_t)block_size + (orig_size % (size_t)block_size != 0);
+    size_t meta_cnt = 0, meta_bytes = 0, header_bytes = 0;
+    size_t seg_len_max = ((size_t)block_size + (size_t)N - 1) / (size_t)N;
+    size_t seg_max_out = 0;
+    if (nblk != expected_nblk || lz4_tp_size_mul(nblk, (size_t)N, &meta_cnt) != 0 ||
+        lz4_tp_size_mul(meta_cnt, sizeof(cl_uint), &meta_bytes) != 0 ||
+        lz4_tp_size_add(32, meta_bytes, &header_bytes) != 0 || header_bytes > frame_size ||
+        lz4_tp_size_add(seg_len_max, seg_len_max / 255, &seg_max_out) != 0 ||
+        lz4_tp_size_add(seg_max_out, 64, &seg_max_out) != 0 || seg_max_out > (size_t)INT_MAX) {
+        fprintf(stderr, "tp-decompress: invalid frame dimensions\n"); goto done;
+    }
+    if (orig_size == 0) {
+        if (frame_size != 32 || fgetc(input_file) != EOF) {
+            fprintf(stderr, "tp-decompress: trailing data in empty frame\n"); goto done;
+        }
+        if (lz4_tp_make_temp_path(output_path, temp_path, sizeof(temp_path)) != 0) goto done;
+        temp_active = 1;
+        output_file = fopen(temp_path, "wb");
+        if (!output_file || lz4_tp_finalize_temp_output(&output_file, temp_path, output_path) != 0) {
+            fprintf(stderr, "tp-decompress: cannot write %s\n", output_path); goto done;
+        }
+        temp_active = 0;
+        uint64_t total_end = get_us();
+        if (lz4_tp_write_metrics("decompress", frame_size, 0, N, block_size, hash_log,
+                                 0, 0, total_end - total_start, total_end - total_start, 0) != 0) goto done;
+        fprintf(stderr, "[tp-decompress] %s -> %s : empty frame OK\n", input_path, output_path);
+        status = 0;
+        goto done;
+    }
 
-    cl_uint* comp_sizes = (cl_uint*)malloc(meta_cnt * sizeof(cl_uint));
-    if (!comp_sizes || fread(comp_sizes, sizeof(cl_uint), meta_cnt, f) != meta_cnt) {
-        fprintf(stderr, "tp-decompress: cannot read sizes\n"); fclose(f); return 1;
+    comp_sizes = (cl_uint*)malloc(meta_bytes);
+    if (!comp_sizes || !lz4_tp_read_exact(input_file, comp_sizes, meta_bytes)) {
+        fprintf(stderr, "tp-decompress: cannot read sizes\n"); goto done;
     }
     size_t payload_total = 0;
-    for (size_t g = 0; g < meta_cnt; g++) payload_total += comp_sizes[g];
-    unsigned char* payload = (unsigned char*)malloc(payload_total);
-    if (!payload || fread(payload, 1, payload_total, f) != payload_total) {
-        fprintf(stderr, "tp-decompress: cannot read payload\n"); fclose(f); return 1;
+    for (size_t g = 0; g < meta_cnt; g++) {
+        if (comp_sizes[g] == 0 || comp_sizes[g] > seg_max_out ||
+            lz4_tp_size_add(payload_total, (size_t)comp_sizes[g], &payload_total) != 0) {
+            fprintf(stderr, "tp-decompress: invalid compressed segment size\n"); goto done;
+        }
     }
-    fclose(f);
+    size_t expected_frame_size = 0;
+    if (lz4_tp_size_add(header_bytes, payload_total, &expected_frame_size) != 0 ||
+        expected_frame_size != frame_size) {
+        fprintf(stderr, "tp-decompress: payload length or trailing data mismatch\n"); goto done;
+    }
 
-    /* comp_offsets = prefix sum of comp_sizes (compacted layout) */
-    cl_uint* comp_off = (cl_uint*)malloc(meta_cnt * sizeof(cl_uint));
-    { size_t acc = 0; for (size_t g = 0; g < meta_cnt; g++) { comp_off[g] = (cl_uint)acc; acc += comp_sizes[g]; } }
-
-    setenv("LZ4_GPU_EPOCH32", "1", 1);   /* keep build identical to compress side */
+    uint64_t ocl_start = get_us();
+    if (lz4_set_env("LZ4_GPU_EPOCH32", "1") != 0) {
+        fprintf(stderr, "tp-decompress: cannot set epoch mode\n"); goto done;
+    }
+    env_set = 1;
     ocl_init();
-    if (!ctx || !queue) { fprintf(stderr, "tp-decompress: OpenCL init failed\n"); return 1; }
+    if (!ctx || !queue) { fprintf(stderr, "tp-decompress: OpenCL init failed\n"); goto done; }
 
     cl_int err = CL_SUCCESS;
-    cl_program prog = lz4_load_program(ctx, dev, hash_log > 0 ? hash_log : g_cli_hash_log, (size_t)block_size);
-    if (!prog) { fprintf(stderr, "tp-decompress: prog load failed\n"); return 1; }
-    cl_kernel kdec = clCreateKernel(prog, "lz4_tp_decompress_segmented", &err);
-    if (!kdec) { fprintf(stderr, "tp-decompress: kernel failed %d\n", err); return 1; }
+    prog = lz4_load_program(ctx, dev, hash_log, (size_t)block_size);
+    if (!prog) { fprintf(stderr, "tp-decompress: prog load failed\n"); goto done; }
+    kdec = clCreateKernel(prog, "lz4_tp_decompress_segmented", &err);
+    if (!kdec) { fprintf(stderr, "tp-decompress: kernel failed %d\n", err); goto done; }
+    uint64_t work_start = get_us();
 
-    size_t dec_bytes = nblk * (size_t)block_size;
-    cl_mem d_payload = clCreateBuffer(ctx, CL_MEM_READ_ONLY, payload_total ? payload_total : 4, NULL, &err);
-    cl_mem d_coff    = clCreateBuffer(ctx, CL_MEM_READ_ONLY, meta_cnt * sizeof(cl_uint), NULL, &err);
-    cl_mem d_csz     = clCreateBuffer(ctx, CL_MEM_READ_ONLY, meta_cnt * sizeof(cl_uint), NULL, &err);
-    cl_mem d_decout  = clCreateBuffer(ctx, CL_MEM_READ_WRITE, dec_bytes, NULL, &err);
-    cl_mem d_sout    = clCreateBuffer(ctx, CL_MEM_READ_WRITE, nblk * sizeof(cl_uint), NULL, &err);
-    if (!d_payload || !d_coff || !d_csz || !d_decout || !d_sout) {
-        fprintf(stderr, "tp-decompress: buffer alloc failed (%d)\n", err); return 1;
+    size_t chunk_blocks = lz4_tp_choose_decode_chunk_blocks(nblk, N, block_size, seg_max_out);
+    size_t chunk_meta_capacity = 0, chunk_payload_capacity = 0, chunk_dec_capacity = 0;
+    if (chunk_blocks == 0 ||
+        lz4_tp_size_mul(chunk_blocks, (size_t)N, &chunk_meta_capacity) != 0 ||
+        lz4_tp_size_mul(chunk_meta_capacity, seg_max_out, &chunk_payload_capacity) != 0 ||
+        chunk_payload_capacity > (size_t)UINT_MAX ||
+        lz4_tp_size_mul(chunk_blocks, (size_t)block_size, &chunk_dec_capacity) != 0) {
+        fprintf(stderr, "tp-decompress: no safe OpenCL chunk size\n"); goto done;
     }
-    if (payload_total) clEnqueueWriteBuffer(queue, d_payload, CL_TRUE, 0, payload_total, payload, 0, NULL, NULL);
-    clEnqueueWriteBuffer(queue, d_coff, CL_TRUE, 0, meta_cnt * sizeof(cl_uint), comp_off, 0, NULL, NULL);
-    clEnqueueWriteBuffer(queue, d_csz,  CL_TRUE, 0, meta_cnt * sizeof(cl_uint), comp_sizes, 0, NULL, NULL);
-
-    cl_uint u_blk = (cl_uint)block_size, u_tot = (cl_uint)nblk; cl_int i_N = N;
-    clSetKernelArg(kdec, 0, sizeof(cl_mem), &d_payload);
-    clSetKernelArg(kdec, 1, sizeof(cl_mem), &d_decout);
-    clSetKernelArg(kdec, 2, sizeof(cl_mem), &d_coff);
-    clSetKernelArg(kdec, 3, sizeof(cl_mem), &d_csz);
-    clSetKernelArg(kdec, 4, sizeof(cl_mem), &d_sout);
-    clSetKernelArg(kdec, 5, sizeof(cl_uint), &u_blk);
-    clSetKernelArg(kdec, 6, sizeof(cl_int), &i_N);
-    clSetKernelArg(kdec, 7, sizeof(cl_uint), &u_tot);
-
-    size_t g_dec = nblk, lws1 = 1;
-    err = clEnqueueNDRangeKernel(queue, kdec, 1, NULL, &g_dec, &lws1, 0, NULL, NULL);
-    if (err != CL_SUCCESS) { fprintf(stderr, "tp-decompress: dec enqueue %d\n", err); return 1; }
-    clFinish(queue);
-
-    unsigned char* dec = (unsigned char*)malloc(dec_bytes);
-    cl_uint* sout = (cl_uint*)malloc(nblk * sizeof(cl_uint));
-    clEnqueueReadBuffer(queue, d_decout, CL_TRUE, 0, dec_bytes, dec, 0, NULL, NULL);
-    clEnqueueReadBuffer(queue, d_sout, CL_TRUE, 0, nblk * sizeof(cl_uint), sout, 0, NULL, NULL);
-
-    /* validate per-block decoded lengths sum to orig_size */
-    size_t total = 0;
-    for (size_t b = 0; b < nblk; b++) {
-        if (sout[b] == 0xFFFFFFFFu) { fprintf(stderr, "tp-decompress: block %zu decode error\n", b); return 1; }
-        total += sout[b];
+    payload = (unsigned char*)malloc(chunk_payload_capacity);
+    comp_off = (cl_uint*)malloc(chunk_meta_capacity * sizeof(cl_uint));
+    chunk_sizes_out = (cl_uint*)malloc(chunk_blocks * sizeof(cl_uint));
+    dec = (unsigned char*)malloc(chunk_dec_capacity);
+    if (!payload || !comp_off || !chunk_sizes_out || !dec ||
+        lz4_tp_make_temp_path(output_path, temp_path, sizeof(temp_path)) != 0) {
+        fprintf(stderr, "tp-decompress: host allocation failed\n"); goto done;
     }
-    if (total != orig_size) {
-        fprintf(stderr, "tp-decompress: length mismatch got=%zu expect=%zu\n", total, orig_size); return 1;
+    temp_active = 1;
+    output_file = fopen(temp_path, "wb");
+    if (!output_file) { fprintf(stderr, "tp-decompress: cannot open %s\n", temp_path); goto done; }
+
+    uint64_t kernel_us = 0;
+    size_t written_total = 0;
+    for (size_t base = 0; base < nblk; base += chunk_blocks) {
+        size_t this_blocks = nblk - base;
+        if (this_blocks > chunk_blocks) this_blocks = chunk_blocks;
+        size_t this_meta = this_blocks * (size_t)N;
+        size_t chunk_payload_size = 0;
+        for (size_t g = 0; g < this_meta; g++) {
+            cl_uint csize = comp_sizes[base * (size_t)N + g];
+            if (chunk_payload_size > (size_t)UINT_MAX ||
+                csize > (cl_uint)((size_t)UINT_MAX - chunk_payload_size)) {
+                fprintf(stderr, "tp-decompress: chunk offset overflow\n"); goto done;
+            }
+            comp_off[g] = (cl_uint)chunk_payload_size;
+            chunk_payload_size += csize;
+        }
+        if (chunk_payload_size > chunk_payload_capacity ||
+            !lz4_tp_read_exact(input_file, payload, chunk_payload_size)) {
+            fprintf(stderr, "tp-decompress: payload read failed\n"); goto done;
+        }
+        for (size_t b = 0; b < this_blocks; b++) {
+            size_t global_block = base + b;
+            size_t block_start = global_block * (size_t)block_size;
+            size_t block_len = orig_size - block_start;
+            if (block_len > (size_t)block_size) block_len = (size_t)block_size;
+            size_t seg_len = (block_len + (size_t)N - 1) / (size_t)N;
+            for (int s = 0; s < N; s++) {
+                size_t local_g = b * (size_t)N + (size_t)s;
+                size_t lo = (size_t)s * seg_len;
+                if (lo >= block_len &&
+                    (comp_sizes[base * (size_t)N + local_g] != 1 || payload[comp_off[local_g]] != 0)) {
+                    fprintf(stderr, "tp-decompress: non-canonical empty segment\n"); goto done;
+                }
+            }
+        }
+        if (lz4_tp_decompress_chunk(payload, chunk_payload_size, comp_off,
+                                    comp_sizes + base * (size_t)N, this_blocks, N,
+                                    block_size, kdec, dec, chunk_sizes_out, &kernel_us) != 0) {
+            fprintf(stderr, "tp-decompress: chunk decode failed\n"); goto done;
+        }
+        for (size_t b = 0; b < this_blocks; b++) {
+            size_t global_block = base + b;
+            size_t block_start = global_block * (size_t)block_size;
+            size_t expected = orig_size - block_start;
+            if (expected > (size_t)block_size) expected = (size_t)block_size;
+            if (chunk_sizes_out[b] != (cl_uint)expected ||
+                !lz4_tp_write_exact(output_file, dec + b * (size_t)block_size, expected) ||
+                lz4_tp_size_add(written_total, expected, &written_total) != 0) {
+                fprintf(stderr, "tp-decompress: block %zu length or write failure\n", global_block); goto done;
+            }
+        }
     }
+    if (written_total != orig_size || fgetc(input_file) != EOF || ferror(input_file) ||
+        lz4_tp_finalize_temp_output(&output_file, temp_path, output_path) != 0) {
+        fprintf(stderr, "tp-decompress: final length or output failure\n"); goto done;
+    }
+    temp_active = 0;
+    uint64_t work_end = get_us();
+    uint64_t no_ocl_us = (ocl_start - total_start) + (work_end - work_start);
+    if (lz4_tp_write_metrics("decompress", frame_size, orig_size, N, block_size, hash_log,
+                             chunk_blocks, kernel_us, no_ocl_us, work_end - total_start,
+                             work_start - ocl_start) != 0) goto done;
+    fprintf(stderr, "[tp-decompress] %s -> %s : %zu bytes N=%d blocks=%zu chunk=%zu OK\n",
+            input_path, output_path, orig_size, N, nblk, chunk_blocks);
+    status = 0;
 
-    FILE* of = fopen(output_path, "wb");
-    if (!of) { fprintf(stderr, "tp-decompress: cannot open %s\n", output_path); return 1; }
-    fwrite(dec, 1, orig_size, of);   /* full blocks are exactly block_size, last is remainder */
-    fclose(of);
-    fprintf(stderr, "[tp-decompress] %s -> %s : %zu bytes N=%d blocks=%zu OK\n",
-            input_path, output_path, orig_size, N, nblk);
-
-    free(comp_sizes); free(comp_off); free(payload); free(dec); free(sout);
-    clReleaseMemObject(d_payload); clReleaseMemObject(d_coff); clReleaseMemObject(d_csz);
-    clReleaseMemObject(d_decout); clReleaseMemObject(d_sout);
-    clReleaseKernel(kdec); clReleaseProgram(prog);
-    unsetenv("LZ4_GPU_EPOCH32");
-    if (queue) clReleaseCommandQueue(queue);
-    if (ctx) clReleaseContext(ctx);
-    return 0;
+done:
+    if (input_file) fclose(input_file);
+    if (output_file) fclose(output_file);
+    if (temp_active) remove(temp_path);
+    free(comp_sizes);
+    free(comp_off);
+    free(chunk_sizes_out);
+    free(payload);
+    free(dec);
+    if (kdec) clReleaseKernel(kdec);
+    if (prog) clReleaseProgram(prog);
+    if (env_set) lz4_unset_env("LZ4_GPU_EPOCH32");
+    if (queue) { clReleaseCommandQueue(queue); queue = NULL; }
+    if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+    return status;
 }
 /* ============================================================================
  * I2: the selector, IN the binary (not Python).
  *   --calibrate <file> [-o profile] : measure this device's W_sat, store it.
- *   -c --auto <in> -o <out>         : runtime pick N* = clamp(round(0.75*W_sat/nblk),1,8),
- *                                     dispatch two-phase (N=1 == base via seg path).
+ *   -c --auto <in> -o <out>         : choose the largest N in {1,2,4,8} with
+ *                                     min(file_blocks, safe_chunk_N)*N <=
+ *                                     0.75*W_sat, then dispatch
+ *                                     two-phase (N=1 == base via seg path).
  * Consistency with deployment: calibration measures the SAME tp kernels that
  * --auto dispatches (base = tp N=1), so the fitted W_sat matches what --auto uses.
  * ==========================================================================*/
@@ -1308,14 +2074,22 @@ static double lz4_tp_measure_one(const unsigned char* input_ref, size_t size, in
                                  cl_kernel kbuild, cl_kernel kscan) {
     cl_int err = CL_SUCCESS;
     size_t dict_entries = (size_t)1u << hash_log;
-    size_t nblk = (size + (size_t)block_size - 1) / (size_t)block_size;
+    size_t nblk = size / (size_t)block_size + (size % (size_t)block_size != 0);
     int nk = N - 1;
-    int segLenMax = (block_size + N - 1) / N;
-    int segMaxOut = segLenMax + segLenMax / 255 + 64;
-    size_t meta_cnt = nblk * (size_t)N;
-    size_t prefix_bytes = (size_t)nblk * (size_t)nk * dict_entries * sizeof(cl_uint);
-    size_t own_bytes    = (size_t)nblk * (size_t)N  * dict_entries * sizeof(cl_uint);
-    size_t out_bytes    = (size_t)nblk * (size_t)N  * (size_t)segMaxOut;
+    size_t seg_len_max = ((size_t)block_size + (size_t)N - 1) / (size_t)N;
+    size_t seg_max_out = 0, meta_cnt = 0, prefix_bytes = 0, own_bytes = 0, out_bytes = 0, tmp = 0;
+    if (!input_ref || size == 0 || size > INT_MAX || !kbuild || !kscan ||
+        lz4_tp_size_add(seg_len_max, seg_len_max / 255, &seg_max_out) != 0 ||
+        lz4_tp_size_add(seg_max_out, 64, &seg_max_out) != 0 || seg_max_out > INT_MAX ||
+        lz4_tp_size_mul(nblk, (size_t)N, &meta_cnt) != 0 ||
+        lz4_tp_size_mul(nblk, (size_t)nk, &tmp) != 0 ||
+        lz4_tp_size_mul(tmp, dict_entries, &tmp) != 0 ||
+        lz4_tp_size_mul(tmp, sizeof(cl_uint), &prefix_bytes) != 0 ||
+        lz4_tp_size_mul(meta_cnt, dict_entries, &tmp) != 0 ||
+        lz4_tp_size_mul(tmp, sizeof(cl_uint), &own_bytes) != 0 ||
+        lz4_tp_size_mul(meta_cnt, seg_max_out, &out_bytes) != 0) {
+        return 0.0;
+    }
 
     cl_mem d_input  = clCreateBuffer(ctx, CL_MEM_READ_ONLY, size, NULL, &err);
     cl_mem d_prefix = clCreateBuffer(ctx, CL_MEM_READ_WRITE, prefix_bytes ? prefix_bytes : 4, NULL, &err);
@@ -1323,53 +2097,99 @@ static double lz4_tp_measure_one(const unsigned char* input_ref, size_t size, in
     cl_mem d_out    = clCreateBuffer(ctx, CL_MEM_READ_WRITE, out_bytes, NULL, &err);
     cl_mem d_sizes  = clCreateBuffer(ctx, CL_MEM_READ_WRITE, meta_cnt * sizeof(cl_uint), NULL, &err);
     if (!d_input || !d_prefix || !d_own || !d_out || !d_sizes) {
-        if (d_input) clReleaseMemObject(d_input); if (d_prefix) clReleaseMemObject(d_prefix);
-        if (d_own) clReleaseMemObject(d_own); if (d_out) clReleaseMemObject(d_out);
+        if (d_input) clReleaseMemObject(d_input);
+        if (d_prefix) clReleaseMemObject(d_prefix);
+        if (d_own) clReleaseMemObject(d_own);
+        if (d_out) clReleaseMemObject(d_out);
         if (d_sizes) clReleaseMemObject(d_sizes);
         return 0.0;
     }
-    clEnqueueWriteBuffer(queue, d_input, CL_TRUE, 0, size, input_ref, 0, NULL, NULL);
+    if (clEnqueueWriteBuffer(queue, d_input, CL_TRUE, 0, size, input_ref, 0, NULL, NULL) != CL_SUCCESS) {
+        clReleaseMemObject(d_input); clReleaseMemObject(d_prefix); clReleaseMemObject(d_own);
+        clReleaseMemObject(d_out); clReleaseMemObject(d_sizes);
+        return 0.0;
+    }
     { cl_uint zero = 0;
-      if (prefix_bytes) clEnqueueFillBuffer(queue, d_prefix, &zero, 4, 0, prefix_bytes, 0, NULL, NULL);
-      clEnqueueFillBuffer(queue, d_own, &zero, 4, 0, own_bytes, 0, NULL, NULL);
-      clFinish(queue); }
+      if ((prefix_bytes && clEnqueueFillBuffer(queue, d_prefix, &zero, 4, 0, prefix_bytes, 0, NULL, NULL) != CL_SUCCESS) ||
+          clEnqueueFillBuffer(queue, d_own, &zero, 4, 0, own_bytes, 0, NULL, NULL) != CL_SUCCESS ||
+          clFinish(queue) != CL_SUCCESS) {
+          clReleaseMemObject(d_input); clReleaseMemObject(d_prefix); clReleaseMemObject(d_own);
+          clReleaseMemObject(d_out); clReleaseMemObject(d_sizes);
+          return 0.0;
+      } }
 
-    cl_int i_nblk = (cl_int)nblk, i_insize = (cl_int)size, i_blk = block_size, i_segmax = segMaxOut, i_N = N;
+    cl_int i_nblk = (cl_int)nblk, i_insize = (cl_int)size, i_blk = block_size, i_segmax = (cl_int)seg_max_out, i_N = N;
     size_t lws1 = 1, g_build = (size_t)nblk * (size_t)nk * 4, g_scan = (size_t)nblk * (size_t)N;
-    clSetKernelArg(kbuild,0,sizeof(cl_mem),&d_input); clSetKernelArg(kbuild,1,sizeof(cl_mem),&d_prefix);
-    clSetKernelArg(kbuild,2,sizeof(cl_int),&i_nblk); clSetKernelArg(kbuild,3,sizeof(cl_int),&i_insize);
-    clSetKernelArg(kbuild,4,sizeof(cl_int),&i_blk); clSetKernelArg(kbuild,5,sizeof(cl_int),&i_N);
-    clSetKernelArg(kscan,0,sizeof(cl_mem),&d_input); clSetKernelArg(kscan,1,sizeof(cl_mem),&d_out);
-    clSetKernelArg(kscan,2,sizeof(cl_mem),&d_sizes); clSetKernelArg(kscan,3,sizeof(cl_mem),&d_own);
-    clSetKernelArg(kscan,4,sizeof(cl_mem),&d_prefix); clSetKernelArg(kscan,5,sizeof(cl_int),&i_nblk);
-    clSetKernelArg(kscan,6,sizeof(cl_int),&i_insize); clSetKernelArg(kscan,7,sizeof(cl_int),&i_blk);
-    clSetKernelArg(kscan,8,sizeof(cl_int),&i_segmax); clSetKernelArg(kscan,9,sizeof(cl_int),&i_N);
+    cl_int arg_err = CL_SUCCESS;
+    arg_err |= clSetKernelArg(kbuild,0,sizeof(cl_mem),&d_input); arg_err |= clSetKernelArg(kbuild,1,sizeof(cl_mem),&d_prefix);
+    arg_err |= clSetKernelArg(kbuild,2,sizeof(cl_int),&i_nblk); arg_err |= clSetKernelArg(kbuild,3,sizeof(cl_int),&i_insize);
+    arg_err |= clSetKernelArg(kbuild,4,sizeof(cl_int),&i_blk); arg_err |= clSetKernelArg(kbuild,5,sizeof(cl_int),&i_N);
+    arg_err |= clSetKernelArg(kscan,0,sizeof(cl_mem),&d_input); arg_err |= clSetKernelArg(kscan,1,sizeof(cl_mem),&d_out);
+    arg_err |= clSetKernelArg(kscan,2,sizeof(cl_mem),&d_sizes); arg_err |= clSetKernelArg(kscan,3,sizeof(cl_mem),&d_own);
+    arg_err |= clSetKernelArg(kscan,4,sizeof(cl_mem),&d_prefix); arg_err |= clSetKernelArg(kscan,5,sizeof(cl_int),&i_nblk);
+    arg_err |= clSetKernelArg(kscan,6,sizeof(cl_int),&i_insize); arg_err |= clSetKernelArg(kscan,7,sizeof(cl_int),&i_blk);
+    arg_err |= clSetKernelArg(kscan,8,sizeof(cl_int),&i_segmax); arg_err |= clSetKernelArg(kscan,9,sizeof(cl_int),&i_N);
+    if (arg_err != CL_SUCCESS) {
+        clReleaseMemObject(d_input); clReleaseMemObject(d_prefix); clReleaseMemObject(d_own);
+        clReleaseMemObject(d_out); clReleaseMemObject(d_sizes);
+        return 0.0;
+    }
 
     double us[16]; int nu = 0; cl_uint epoch = 1;
     const int WARM = 2, MEAS = 5;
     for (int it = 0; it < WARM + MEAS; ++it, ++epoch) {
         double t = 0.0;
         if (nk >= 1) {
-            clSetKernelArg(kbuild, 6, sizeof(cl_uint), &epoch);
-            cl_event e; if (clEnqueueNDRangeKernel(queue,kbuild,1,NULL,&g_build,&lws1,0,NULL,&e)!=CL_SUCCESS){break;}
-            clWaitForEvents(1,&e); t += event_elapsed_us(e); clReleaseEvent(e);
+            if (clSetKernelArg(kbuild, 6, sizeof(cl_uint), &epoch) != CL_SUCCESS) break;
+            cl_event e = NULL;
+            if (clEnqueueNDRangeKernel(queue,kbuild,1,NULL,&g_build,&lws1,0,NULL,&e)!=CL_SUCCESS ||
+                clWaitForEvents(1,&e) != CL_SUCCESS) { if (e) clReleaseEvent(e); break; }
+            t += event_elapsed_us(e); clReleaseEvent(e);
         }
-        clSetKernelArg(kscan, 10, sizeof(cl_uint), &epoch);
-        cl_event e2; if (clEnqueueNDRangeKernel(queue,kscan,1,NULL,&g_scan,&lws1,0,NULL,&e2)!=CL_SUCCESS){break;}
-        clWaitForEvents(1,&e2); t += event_elapsed_us(e2); clReleaseEvent(e2);
+        if (clSetKernelArg(kscan, 10, sizeof(cl_uint), &epoch) != CL_SUCCESS) break;
+        cl_event e2 = NULL;
+        if (clEnqueueNDRangeKernel(queue,kscan,1,NULL,&g_scan,&lws1,0,NULL,&e2)!=CL_SUCCESS ||
+            clWaitForEvents(1,&e2) != CL_SUCCESS) { if (e2) clReleaseEvent(e2); break; }
+        t += event_elapsed_us(e2); clReleaseEvent(e2);
         if (it >= WARM && nu < 16) us[nu++] = t;
     }
+    cl_uint* sizes = (cl_uint*)malloc(meta_cnt * sizeof(cl_uint));
+    int sizes_ok = sizes && nu == MEAS &&
+                   clEnqueueReadBuffer(queue, d_sizes, CL_TRUE, 0, meta_cnt * sizeof(cl_uint),
+                                       sizes, 0, NULL, NULL) == CL_SUCCESS;
+    if (sizes_ok) {
+        for (size_t g = 0; g < meta_cnt; g++) {
+            if (sizes[g] == 0 || sizes[g] > seg_max_out) { sizes_ok = 0; break; }
+        }
+    }
+    free(sizes);
     clReleaseMemObject(d_input); clReleaseMemObject(d_prefix); clReleaseMemObject(d_own);
     clReleaseMemObject(d_out); clReleaseMemObject(d_sizes);
-    if (nu == 0) return 0.0;
+    if (!sizes_ok) return 0.0;
     double med = median_double(us, nu);
     return med > 0 ? (double)size / med : 0.0;
 }
 
-static int lz4_tp_pick_N(size_t nblk, int W_sat) {
-    int cand[4] = {1,2,4,8}; int best = 1;
-    double thresh = 0.75 * (double)W_sat;       /* conservative margin (validated) */
-    for (int i = 0; i < 4; i++) if ((double)nblk * cand[i] <= thresh) best = cand[i];
+static int lz4_tp_pick_N_chunked(size_t total_blocks, int W_sat,
+                                 int block_size, int hash_log,
+                                 size_t* selected_chunk_blocks) {
+    int cand[4] = {1, 2, 4, 8};
+    int best = 1;
+    size_t best_chunk = 0;
+    double threshold = 0.75 * (double)W_sat;
+    size_t dict_entries = (size_t)1u << hash_log;
+    for (int i = 0; i < 4; i++) {
+        size_t chunk = lz4_tp_choose_chunk_blocks(total_blocks, cand[i], block_size, dict_entries);
+        if (chunk == 0) continue;
+        size_t effective_blocks = total_blocks < chunk ? total_blocks : chunk;
+        if ((double)effective_blocks * (double)cand[i] <= threshold) {
+            best = cand[i];
+            best_chunk = chunk;
+        } else if (cand[i] == 1 && best_chunk == 0) {
+            best_chunk = chunk;
+        }
+    }
+    if (selected_chunk_blocks) *selected_chunk_blocks = best_chunk;
     return best;
 }
 
@@ -1383,81 +2203,77 @@ static const char* lz4_profile_path(void) {
     return (p && *p) ? p : "lz4tp.profile";
 }
 
-/* read W_sat for the current device from the profile; returns W_sat or 0 if absent */
-static int lz4_profile_lookup(const char* devname) {
-    FILE* f = fopen(lz4_profile_path(), "r");
-    if (!f) return 0;
-    char line[512]; int w = 0;
-    while (fgets(line, sizeof(line), f)) {
-        char* tab = strrchr(line, '\t');
-        if (!tab) continue;
-        *tab = 0;
-        if (strcmp(line, devname) == 0) { w = atoi(tab + 1); break; }
-    }
-    fclose(f);
-    return w;
-}
-
-static void lz4_profile_store(const char* devname, int W_sat) {
-    /* rewrite file: keep other devices, replace/append this one */
-    const char* path = lz4_profile_path();
-    char (*names)[256] = NULL; int* ws = NULL; int cnt = 0, cap = 0, found = 0;
-    FILE* f = fopen(path, "r");
-    if (f) {
-        char line[512];
-        while (fgets(line, sizeof(line), f)) {
-            char* nl = strchr(line, '\n'); if (nl) *nl = 0;
-            char* tab = strrchr(line, '\t'); if (!tab) continue; *tab = 0;
-            if (cnt == cap) { cap = cap ? cap*2 : 8;
-                names = realloc(names, cap*sizeof(*names)); ws = realloc(ws, cap*sizeof(int)); }
-            strncpy(names[cnt], line, 255); names[cnt][255]=0; ws[cnt] = atoi(tab+1); cnt++;
-        }
-        fclose(f);
-    }
-    f = fopen(path, "w");
-    if (!f) { fprintf(stderr, "calibrate: cannot write %s\n", path); free(names); free(ws); return; }
-    for (int i = 0; i < cnt; i++) {
-        if (strcmp(names[i], devname) == 0) { fprintf(f, "%s\t%d\n", devname, W_sat); found = 1; }
-        else fprintf(f, "%s\t%d\n", names[i], ws[i]);
-    }
-    if (!found) fprintf(f, "%s\t%d\n", devname, W_sat);
-    fclose(f); free(names); free(ws);
-}
-
 static int lz4_calibrate_device(const char* cal_file, int block_size) {
     struct stat st;
     if (!cal_file || stat(cal_file, &st) != 0 || st.st_size <= 0) {
         fprintf(stderr, "calibrate: invalid calibration file\n"); return 1;
     }
     if (block_size <= 0) block_size = 64 * 1024;
-    size_t full = (size_t)st.st_size;
-    unsigned char* input_ref = (unsigned char*)malloc(full);
-    unsigned long rd = 0;
-    if (!input_ref || lz4_read_file_to_buf(cal_file, input_ref, full, &rd) != 0) {
-        free(input_ref); fprintf(stderr, "calibrate: read failed\n"); return 1;
+    if ((uint64_t)st.st_size > (uint64_t)SIZE_MAX) {
+        fprintf(stderr, "calibrate: input is too large for this host\n"); return 1;
     }
-    setenv("LZ4_GPU_EPOCH32", "1", 1);
+    size_t full = (size_t)st.st_size;
+    if (lz4_set_env("LZ4_GPU_EPOCH32", "1") != 0) {
+        fprintf(stderr, "calibrate: cannot set epoch mode\n"); return 1;
+    }
     ocl_init();
-    if (!ctx || !queue) { free(input_ref); fprintf(stderr, "calibrate: OpenCL init failed\n"); return 1; }
+    if (!ctx || !queue) {
+        lz4_unset_env("LZ4_GPU_EPOCH32");
+        fprintf(stderr, "calibrate: OpenCL init failed\n"); return 1;
+    }
     char devname[256]; lz4_device_name(devname, sizeof(devname));
     int hash_log = g_cli_hash_log;
+    size_t dict_entries = (size_t)1u << hash_log;
+    size_t full_nblk = full / (size_t)block_size;
+    size_t safe_nblk = full_nblk;
+    int cand[4] = {1,2,4,8};
+    for (int ci = 0; ci < 4; ci++) {
+        size_t safe = lz4_tp_choose_chunk_blocks(full_nblk, cand[ci], block_size, dict_entries);
+        if (safe < safe_nblk) safe_nblk = safe;
+    }
+    if (safe_nblk < 4) {
+        fprintf(stderr, "calibrate: device and input must support at least four complete blocks\n");
+        lz4_unset_env("LZ4_GPU_EPOCH32");
+        if (queue) { clReleaseCommandQueue(queue); queue = NULL; }
+        if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+        return 1;
+    }
+    size_t calibration_bytes = safe_nblk * (size_t)block_size;
+    unsigned char* input_ref = (unsigned char*)malloc(calibration_bytes);
+    unsigned long rd = 0;
+    if (!input_ref || lz4_read_file_to_buf(cal_file, input_ref, calibration_bytes, &rd) != 0) {
+        free(input_ref);
+        lz4_unset_env("LZ4_GPU_EPOCH32");
+        if (queue) { clReleaseCommandQueue(queue); queue = NULL; }
+        if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+        fprintf(stderr, "calibrate: read failed\n"); return 1;
+    }
     cl_int err = CL_SUCCESS;
     cl_program prog = lz4_load_program(ctx, dev, hash_log, (size_t)block_size);
     cl_kernel kbuild = prog ? clCreateKernel(prog, "lz4_tp_build_prefix", &err) : NULL;
     cl_kernel kscan  = prog ? clCreateKernel(prog, "lz4_tp_scan_seg", &err) : NULL;
-    if (!kbuild || !kscan) { fprintf(stderr, "calibrate: kernels failed\n"); return 1; }
+    if (!kbuild || !kscan) {
+        fprintf(stderr, "calibrate: kernels failed\n");
+        free(input_ref);
+        if (kbuild) clReleaseKernel(kbuild);
+        if (kscan) clReleaseKernel(kscan);
+        if (prog) clReleaseProgram(prog);
+        lz4_unset_env("LZ4_GPU_EPOCH32");
+        if (queue) { clReleaseCommandQueue(queue); queue = NULL; }
+        if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+        return 1;
+    }
 
-    /* block-count ladder, capped at the cal file's block count */
-    size_t full_nblk = full / (size_t)block_size;
+    /* Block-count ladder, capped at the largest point all candidate N values can
+     * execute as one deployment-equivalent chunk on this device. */
     int ladder[] = {2,4,8,16,32,64,128,256,384,512,633};
     int NL = (int)(sizeof(ladder)/sizeof(ladder[0]));
-    int cand[4] = {1,2,4,8};
     /* per-ladder-point throughput for N in {1,2,4,8}; store to fit W_sat */
     double tp[16][4]; int nblk_of[16]; int L = 0;
     fprintf(stderr, "[calibrate] device=%s  block=%dK\n", devname, block_size/1024);
     for (int li = 0; li < NL && L < 16; li++) {
         size_t nb = (size_t)ladder[li];
-        if (nb > full_nblk) break;
+        if (nb > safe_nblk) break;
         size_t size = nb * (size_t)block_size;
         nblk_of[L] = (int)nb;
         for (int ci = 0; ci < 4; ci++)
@@ -1466,7 +2282,15 @@ static int lz4_calibrate_device(const char* cal_file, int block_size) {
                 (int)nb, tp[L][0], tp[L][1], tp[L][2], tp[L][3]);
         L++;
     }
-    if (L < 2) { fprintf(stderr, "calibrate: cal file too small (need >=8MB for a useful W_sat)\n"); }
+    if (L < 2) {
+        fprintf(stderr, "calibrate: input must contain at least four complete blocks\n");
+        free(input_ref);
+        clReleaseKernel(kbuild); clReleaseKernel(kscan); clReleaseProgram(prog);
+        lz4_unset_env("LZ4_GPU_EPOCH32");
+        if (queue) { clReleaseCommandQueue(queue); queue = NULL; }
+        if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+        return 1;
+    }
 
     /* fit W_sat: grid W in 1..8192, maximize geomean over ladder of achieved/oracle,
      * where achieved = tp[ pick_raw(nblk,W) ] and pick_raw uses W directly (no 0.75). */
@@ -1489,14 +2313,22 @@ static int lz4_calibrate_device(const char* cal_file, int block_size) {
     }
     bestW = (wlo + whi) / 2;   /* midpoint of the flat optimum plateau (sparse ladder => wide ties) */
     fprintf(stderr, "[calibrate] fitted W_sat = %d  (device=%s)\n", bestW, devname);
-    lz4_profile_store(devname, bestW);
+    if (lz4_tp_profile_store(lz4_profile_path(), devname, block_size, hash_log, bestW) != 0) {
+        fprintf(stderr, "calibrate: cannot store profile %s\n", lz4_profile_path());
+        free(input_ref);
+        clReleaseKernel(kbuild); clReleaseKernel(kscan); clReleaseProgram(prog);
+        lz4_unset_env("LZ4_GPU_EPOCH32");
+        if (queue) { clReleaseCommandQueue(queue); queue = NULL; }
+        if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+        return 1;
+    }
     fprintf(stderr, "[calibrate] stored to %s\n", lz4_profile_path());
 
     free(input_ref);
     clReleaseKernel(kbuild); clReleaseKernel(kscan); clReleaseProgram(prog);
-    unsetenv("LZ4_GPU_EPOCH32");
-    if (queue) clReleaseCommandQueue(queue);
-    if (ctx) clReleaseContext(ctx);
+    lz4_unset_env("LZ4_GPU_EPOCH32");
+    if (queue) { clReleaseCommandQueue(queue); queue = NULL; }
+    if (ctx) { clReleaseContext(ctx); ctx = NULL; }
     return 0;
 }
 
@@ -1505,29 +2337,45 @@ static int lz4_calibrate_device(const char* cal_file, int block_size) {
  * call the real compressor (which re-inits). Cheap relative to compression. */
 static int lz4_tp_compress_auto(const char* input_path, const char* output_path, int block_size) {
     struct stat st;
-    if (!input_path || stat(input_path, &st) != 0 || st.st_size <= 0) {
+    if (!input_path || stat(input_path, &st) != 0 || st.st_size < 0) {
         fprintf(stderr, "auto: invalid input\n"); return 1;
     }
     if (block_size <= 0) block_size = 64 * 1024;
-    size_t nblk = ((size_t)st.st_size + (size_t)block_size - 1) / (size_t)block_size;
+    if (st.st_size == 0)
+        return lz4_tp_compress_to_file(input_path, output_path, 1, block_size, 0, 0);
+    if ((uint64_t)st.st_size > (uint64_t)SIZE_MAX) {
+        fprintf(stderr, "auto: input is too large for this host\n"); return 1;
+    }
+    size_t input_size = (size_t)st.st_size;
+    size_t nblk = input_size / (size_t)block_size + (input_size % (size_t)block_size != 0);
 
+    uint64_t selector_start = get_us();
+    uint64_t selector_ocl_start = get_us();
     ocl_init();
     if (!ctx) { fprintf(stderr, "auto: OpenCL init failed\n"); return 1; }
     char devname[256]; lz4_device_name(devname, sizeof(devname));
-    if (queue) clReleaseCommandQueue(queue);
-    if (ctx) clReleaseContext(ctx);
-    ctx = NULL; queue = NULL;
-
-    int W_sat = lz4_profile_lookup(devname);
+    uint64_t selector_ocl_end = get_us();
+    int W_sat = lz4_tp_profile_lookup(lz4_profile_path(), devname, block_size, g_cli_hash_log);
     int N;
+    size_t selected_chunk = 0;
     if (W_sat <= 0) {
         N = 1;
+        selected_chunk = lz4_tp_choose_chunk_blocks(nblk, N, block_size, (size_t)1u << g_cli_hash_log);
         fprintf(stderr, "[auto] no profile for device \"%s\" (run --calibrate); using N=1 (safe, no gain)\n", devname);
     } else {
-        N = lz4_tp_pick_N(nblk, W_sat);
-        fprintf(stderr, "[auto] device=%s W_sat=%d nblk=%zu -> N=%d\n", devname, W_sat, nblk, N);
+        N = lz4_tp_pick_N_chunked(nblk, W_sat, block_size, g_cli_hash_log, &selected_chunk);
+        fprintf(stderr, "[auto] device=%s W_sat=%d nblk=%zu chunk=%zu -> N=%d\n",
+                devname, W_sat, nblk, selected_chunk, N);
     }
-    return lz4_tp_compress_to_file(input_path, output_path, N, block_size);
+    if (queue) { clReleaseCommandQueue(queue); queue = NULL; }
+    if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+    if (selected_chunk == 0) {
+        fprintf(stderr, "auto: no safe OpenCL chunk size\n"); return 1;
+    }
+    uint64_t selector_end = get_us();
+    return lz4_tp_compress_to_file(input_path, output_path, N, block_size,
+                                   selector_end - selector_start,
+                                   selector_ocl_end - selector_ocl_start);
 }
 int run_lz4_standalone(int argc, char** argv) {
     int mode = mode_compress;
@@ -1573,42 +2421,58 @@ int run_lz4_standalone(int argc, char** argv) {
         } else if (strcmp(argv[i], "--twophase") == 0) {
             twophase_mode = 1;
         } else if (strcmp(argv[i], "-N") == 0) {
-            if (i + 1 < argc) g_cli_tp_n = atoi(argv[++i]);
-            else { fprintf(stderr, "Error: -N requires an argument\n"); return 1; }
+            if (i + 1 >= argc || parse_int_arg(argv[++i], &g_cli_tp_n) != 0) {
+                fprintf(stderr, "Error: -N requires an integer argument\n"); return 1;
+            }
         } else if (strcmp(argv[i], "--tp-bench") == 0) {
             tp_bench_mode = 1;
         } else if (strcmp(argv[i], "--bench") == 0) {
             bench_mode = 1;
             if (i + 1 < argc && argv[i + 1][0] != '-') {
-                bench_seconds = atof(argv[++i]);
+                if (parse_positive_double_arg(argv[++i], &bench_seconds) != 0) {
+                    fprintf(stderr, "Error: --bench duration must be positive\n"); return 1;
+                }
             }
         } else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) {
             if (i + 1 < argc) {
-                strncpy(output_path, argv[++i], sizeof(output_path) - 1);
+                if (copy_cli_path(output_path, sizeof(output_path), argv[++i]) != 0) {
+                    fprintf(stderr, "Error: output path is too long\n"); return 1;
+                }
                 output_explicit = 1;
             } else {
                 fprintf(stderr, "Error: -o requires an argument\n");
                 show_help(argv[0]); return 1;
             }
         } else if (strcmp(argv[i], "-B") == 0 || strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--block-size") == 0) {
-            if (i + 1 < argc) g_cli_fixed_block_bytes = parse_size_bytes(argv[++i]);
-            else { fprintf(stderr, "Error: -B requires an argument\n"); return 1; }
+            if (i + 1 >= argc || (g_cli_fixed_block_bytes = parse_size_bytes(argv[++i])) == 0) {
+                fprintf(stderr, "Error: -B requires a positive byte size\n"); return 1;
+            }
         } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--acceleration") == 0) {
-            if (i + 1 < argc) g_cli_acceleration = atoi(argv[++i]);
-            else { fprintf(stderr, "Error: -a requires an argument\n"); return 1; }
+            if (i + 1 >= argc || parse_int_arg(argv[++i], &g_cli_acceleration) != 0) {
+                fprintf(stderr, "Error: -a requires an integer argument\n"); return 1;
+            }
         } else if (strcmp(argv[i], "--d-bits") == 0) {
-            if (i + 1 < argc) g_cli_hash_log = atoi(argv[++i]);
-            else { fprintf(stderr, "Error: --d-bits requires an argument\n"); return 1; }
+            if (i + 1 >= argc || parse_int_arg(argv[++i], &g_cli_hash_log) != 0) {
+                fprintf(stderr, "Error: --d-bits requires an integer argument\n"); return 1;
+            }
         } else if (strcmp(argv[i], "--local") == 0) {
-            if (i + 1 < argc) g_cli_local_size = atoi(argv[++i]);
-            else { fprintf(stderr, "Error: --local requires an argument\n"); return 1; }
+            int parsed_local = 0;
+            if (i + 1 >= argc || parse_int_arg(argv[++i], &parsed_local) != 0 || parsed_local < 1) {
+                fprintf(stderr, "Error: --local requires a positive integer argument\n"); return 1;
+            }
+            g_cli_local_size = (size_t)parsed_local;
+        } else if (strcmp(argv[i], "--metrics-json") == 0) {
+            if (i + 1 < argc) g_cli_metrics_path = argv[++i];
+            else { fprintf(stderr, "Error: --metrics-json requires an argument\n"); return 1; }
         } else if (argv[i][0] == '-' && strcmp(argv[i], "-") != 0) {
             fprintf(stderr, "Error: Unknown option %s\n", argv[i]);
             show_help(argv[0]); return 1;
         } else {
             if (!input_path) input_path = argv[i];
             else if (!output_explicit) {
-                strncpy(output_path, argv[i], sizeof(output_path)-1);
+                if (copy_cli_path(output_path, sizeof(output_path), argv[i]) != 0) {
+                    fprintf(stderr, "Error: output path is too long\n"); return 1;
+                }
                 output_explicit = 1;
             } else {
                 fprintf(stderr, "Error: Too many positional arguments\n");
@@ -1617,31 +2481,79 @@ int run_lz4_standalone(int argc, char** argv) {
         }
     }
 
+    if (validate_cli_config(twophase_mode) != 0) return 1;
+    int special_modes = calibrate_mode + auto_mode + twophase_mode + tp_bench_mode + bench_mode;
+    if (special_modes > 1) {
+        fprintf(stderr, "Error: --calibrate, --auto, --twophase, --tp-bench, and --bench are mutually exclusive\n");
+        return 1;
+    }
+    if (g_cli_metrics_path && (!*g_cli_metrics_path || path_is_dash(g_cli_metrics_path) ||
+                               (!twophase_mode && !auto_mode))) {
+        fprintf(stderr, "Error: --metrics-json requires --twophase or --auto and a regular output path\n");
+        return 1;
+    }
+
     if (!input_path) {
         show_help(argv[0]);
         return 1;
     }
 
     if (calibrate_mode) {
-        return lz4_calibrate_device(input_path, (int)g_cli_fixed_block_bytes);
+        if (mode != mode_compress || path_is_dash(input_path)) {
+            fprintf(stderr, "Error: --calibrate requires a regular input file in compress mode\n");
+            return 1;
+        }
+        if (output_explicit && paths_identify_same_file(input_path, output_path)) {
+            fprintf(stderr, "Error: calibration profile must not replace its input\n");
+            return 1;
+        }
+        if (output_explicit && lz4_set_env("LZ4TP_PROFILE", output_path) != 0) {
+            fprintf(stderr, "Error: cannot set calibration profile path\n");
+            return 1;
+        }
+        int result = lz4_calibrate_device(input_path, (int)g_cli_fixed_block_bytes);
+        if (output_explicit) lz4_unset_env("LZ4TP_PROFILE");
+        return result;
     }
     if (auto_mode) {
+        if (mode != mode_compress || path_is_dash(input_path) ||
+            (output_explicit && path_is_dash(output_path))) {
+            fprintf(stderr, "Error: --auto requires regular input and output files in compress mode\n");
+            return 1;
+        }
         char au_out[512];
         const char* outp = output_explicit ? output_path : NULL;
-        if (!outp) { snprintf(au_out, sizeof(au_out), "%s.lz4tp", input_path); outp = au_out; }
+        if (!outp) {
+            if (append_cli_suffix(au_out, sizeof(au_out), input_path, ".lz4tp") != 0) {
+                fprintf(stderr, "Error: derived output path is too long\n"); return 1;
+            }
+            outp = au_out;
+        }
+        if (paths_identify_same_file(lz4_profile_path(), input_path) ||
+            paths_identify_same_file(lz4_profile_path(), outp)) {
+            fprintf(stderr, "Error: calibration profile must differ from auto input and output\n");
+            return 1;
+        }
         return lz4_tp_compress_auto(input_path, outp, (int)g_cli_fixed_block_bytes);
     }
 
     if (twophase_mode) {
+        if (path_is_dash(input_path) || (output_explicit && path_is_dash(output_path))) {
+            fprintf(stderr, "Error: LZ4TP1 currently requires regular input and output files\n");
+            return 1;
+        }
         char tp_out[512];
         const char* outp = output_explicit ? output_path : NULL;
         if (!outp) {
-            if (mode == mode_compress) snprintf(tp_out, sizeof(tp_out), "%s.lz4tp", input_path);
-            else snprintf(tp_out, sizeof(tp_out), "%s.tpout", input_path);
+            const char* suffix = mode == mode_compress ? ".lz4tp" : ".tpout";
+            if (append_cli_suffix(tp_out, sizeof(tp_out), input_path, suffix) != 0) {
+                fprintf(stderr, "Error: derived output path is too long\n"); return 1;
+            }
             outp = tp_out;
         }
         if (mode == mode_compress)
-            return lz4_tp_compress_to_file(input_path, outp, g_cli_tp_n, (int)g_cli_fixed_block_bytes);
+            return lz4_tp_compress_to_file(input_path, outp, g_cli_tp_n,
+                                           (int)g_cli_fixed_block_bytes, 0, 0);
         return lz4_tp_decompress_from_file(input_path, outp);
     }
 
@@ -1650,7 +2562,7 @@ int run_lz4_standalone(int argc, char** argv) {
             fprintf(stderr, "Error: --tp-bench does not support stdin input ('-')\n");
             return 1;
         }
-        return run_lz4_tp_bench(input_path, (int)g_cli_fixed_block_bytes, bench_seconds);
+        return run_lz4_tp_bench(input_path, (int)g_cli_fixed_block_bytes);
     }
 
     if (bench_mode) {
@@ -1671,12 +2583,16 @@ int run_lz4_standalone(int argc, char** argv) {
 
     if (!output_explicit) {
         if (path_is_dash(input_path)) {
-            strncpy(output_path, "-", sizeof(output_path) - 1);
+            if (copy_cli_path(output_path, sizeof(output_path), "-") != 0) return 1;
             output_explicit = 1;
         } else if (mode == mode_compress) {
-            snprintf(output_path, sizeof(output_path), "%s.lz4", input_path);
+            if (append_cli_suffix(output_path, sizeof(output_path), input_path, ".lz4") != 0) {
+                fprintf(stderr, "Error: derived output path is too long\n"); return 1;
+            }
         } else {
-            snprintf(output_path, sizeof(output_path), "%s.dec", input_path);
+            if (append_cli_suffix(output_path, sizeof(output_path), input_path, ".dec") != 0) {
+                fprintf(stderr, "Error: derived output path is too long\n"); return 1;
+            }
         }
     }
 
@@ -1812,6 +2728,13 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (argc >= 2) {
+        if (strcmp(argv[1], "--device-info") == 0) {
+            if (argc != 2) {
+                fprintf(stderr, "Error: --device-info does not accept additional arguments\n");
+                return 1;
+            }
+            return lz4_print_device_info();
+        }
         if (strcmp(argv[1], "--daemon") == 0) {
             return run_daemon();
         }
@@ -1838,27 +2761,42 @@ int main(int argc, char** argv) {
                 else if (strcmp(argv[i], "--bench") == 0) {
                     bench_mode = 1;
                     if (i + 1 < argc && argv[i + 1][0] != '-') {
-                        bench_seconds = atof(argv[++i]);
+                        if (parse_positive_double_arg(argv[++i], &bench_seconds) != 0) {
+                            fprintf(stderr, "Error: --bench duration must be positive\n");
+                            return 1;
+                        }
                     }
                 }
                 else if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) && i + 1 < argc) {
-                    strncpy(output, argv[++i], sizeof(output)-1);
+                    if (copy_cli_path(output, sizeof(output), argv[++i]) != 0) {
+                        fprintf(stderr, "Error: output path is too long\n"); return 1;
+                    }
                     output_explicit = 1;
                 } else if ((strcmp(argv[i], "-B") == 0 || strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--block-size") == 0) && i + 1 < argc) {
                     g_cli_fixed_block_bytes = parse_size_bytes(argv[++i]);
                 } else if ((strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--acceleration") == 0) && i + 1 < argc) {
-                    g_cli_acceleration = atoi(argv[++i]);
+                    if (parse_int_arg(argv[++i], &g_cli_acceleration) != 0) {
+                        fprintf(stderr, "Error: acceleration requires an integer\n"); return 1;
+                    }
                 } else if (strcmp(argv[i], "--d-bits") == 0 && i + 1 < argc) {
-                    g_cli_hash_log = atoi(argv[++i]);
+                    if (parse_int_arg(argv[++i], &g_cli_hash_log) != 0) {
+                        fprintf(stderr, "Error: --d-bits requires an integer\n"); return 1;
+                    }
                 } else if ((strcmp(argv[i], "--local") == 0) && i + 1 < argc) {
-                    g_cli_local_size = atoi(argv[++i]);
+                    int parsed_local = 0;
+                    if (parse_int_arg(argv[++i], &parsed_local) != 0 || parsed_local < 1) {
+                        fprintf(stderr, "Error: --local requires a positive integer\n"); return 1;
+                    }
+                    g_cli_local_size = (size_t)parsed_local;
                 } else if (argv[i][0] == '-' && strcmp(argv[i], "-") != 0) {
                     fprintf(stderr, "Error: Unknown option %s\n", argv[i]);
                     return 1;
                 } else {
                     if (!input) input = argv[i];
                     else if (!output_explicit) {
-                        strncpy(output, argv[i], sizeof(output)-1);
+                        if (copy_cli_path(output, sizeof(output), argv[i]) != 0) {
+                            fprintf(stderr, "Error: output path is too long\n"); return 1;
+                        }
                         output_explicit = 1;
                     } else {
                         fprintf(stderr, "Error: Too many positional arguments\n");
@@ -1870,7 +2808,24 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "Error: No input file specified\n");
                 return 1;
             }
+            if (validate_cli_config(twophase) != 0) return 1;
+            if (twophase && mode != mode_compress) {
+                fprintf(stderr, "Error: daemon two-phase currently supports compression only; use standalone mode to decode LZ4TP1\n");
+                return 1;
+            }
+            if (twophase && raw_buffer) {
+                fprintf(stderr, "Error: daemon two-phase does not support raw-buffer transport\n");
+                return 1;
+            }
+            if (twophase && g_cli_fixed_block_bytes != 64 * 1024) {
+                fprintf(stderr, "Error: daemon two-phase currently requires a 64K block size\n");
+                return 1;
+            }
             if (bench_mode) {
+                if (twophase) {
+                    fprintf(stderr, "Error: use standalone --tp-bench for two-phase measurements\n");
+                    return 1;
+                }
                 if (mode != mode_compress) {
                     fprintf(stderr, "Error: --bench only supports compress mode input (it runs compress+decompress internally)\n");
                     return 1;
@@ -1889,8 +2844,10 @@ int main(int argc, char** argv) {
                 return run_lz4_client(mode, NULL, NULL, (int)g_cli_fixed_block_bytes, g_cli_acceleration, (int)g_cli_local_size, g_cli_hash_log, 1, twophase);
             }
             if (!output_explicit) {
-                if (mode == mode_compress) snprintf(output, sizeof(output), "%s%s", input, twophase ? ".lz4tp" : ".lz4");
-                else snprintf(output, sizeof(output), "%s.dec", input);
+                const char* suffix = mode == mode_compress ? (twophase ? ".lz4tp" : ".lz4") : ".dec";
+                if (append_cli_suffix(output, sizeof(output), input, suffix) != 0) {
+                    fprintf(stderr, "Error: derived output path is too long\n"); return 1;
+                }
             }
             if (path_is_dash(input) || path_is_dash(output)) {
                 fprintf(stderr, "Error: '-' stream I/O is only supported in standalone mode\n");

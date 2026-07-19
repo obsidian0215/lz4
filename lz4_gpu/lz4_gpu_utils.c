@@ -27,14 +27,15 @@ static cl_int lz4_try_get_device(cl_platform_id* platforms,
     return CL_DEVICE_NOT_FOUND;
 }
 
-static cl_device_type lz4_preferred_opencl_device_type(void) {
+static cl_device_type lz4_preferred_opencl_device_type(int* strict) {
     const char* pref = getenv("FORCE_OPENCL_DEVICE");
-    if (!pref || !*pref) return CL_DEVICE_TYPE_GPU;
+    *strict = pref && *pref;
+    if (!*strict) return CL_DEVICE_TYPE_GPU;
     if (strcasecmp(pref, "CPU") == 0) return CL_DEVICE_TYPE_CPU;
     if (strcasecmp(pref, "GPU") == 0) return CL_DEVICE_TYPE_GPU;
     if (strcasecmp(pref, "DEFAULT") == 0) return CL_DEVICE_TYPE_DEFAULT;
     if (strcasecmp(pref, "ALL") == 0) return CL_DEVICE_TYPE_ALL;
-    return CL_DEVICE_TYPE_GPU;
+    return 0;
 }
 
 cl_int lz4_select_opencl_platform_device(cl_platform_id* out_pf, cl_device_id* out_dev) {
@@ -42,12 +43,14 @@ cl_int lz4_select_opencl_platform_device(cl_platform_id* out_pf, cl_device_id* o
     cl_platform_id* platforms = NULL;
     cl_int err = clGetPlatformIDs(0, NULL, &num_platforms);
     cl_int r = CL_DEVICE_NOT_FOUND;
-    cl_device_type pref_type = lz4_preferred_opencl_device_type();
+    int strict = 0;
+    cl_device_type pref_type = lz4_preferred_opencl_device_type(&strict);
 
     if (!out_pf || !out_dev) return CL_INVALID_VALUE;
     *out_pf = NULL;
     *out_dev = NULL;
 
+    if (pref_type == 0) return CL_INVALID_VALUE;
     if (err != CL_SUCCESS || num_platforms == 0) return CL_DEVICE_NOT_FOUND;
 
     platforms = (cl_platform_id*)malloc(num_platforms * sizeof(cl_platform_id));
@@ -59,7 +62,9 @@ cl_int lz4_select_opencl_platform_device(cl_platform_id* out_pf, cl_device_id* o
         return err;
     }
 
-    if (pref_type == CL_DEVICE_TYPE_GPU) {
+    if (strict) {
+        r = lz4_try_get_device(platforms, num_platforms, pref_type, out_dev, out_pf);
+    } else if (pref_type == CL_DEVICE_TYPE_GPU) {
         r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_GPU, out_dev, out_pf);
         if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_DEFAULT, out_dev, out_pf);
         if (r != CL_SUCCESS) r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_ALL, out_dev, out_pf);

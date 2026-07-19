@@ -26,6 +26,12 @@ static int do_daemon_op(int mode, const char* input, const char* output, int blo
     response_t resp;
     struct stat st;
 
+    if (!input || !output || strlen(input) >= sizeof(req.input_path) ||
+        strlen(output) >= sizeof(req.output_path)) {
+        fprintf(stderr, "Error: daemon input or output path is too long\n");
+        return -1;
+    }
+
     if (!is_daemon_running()) {
         fprintf(stderr, "Error: Daemon is not running. Start it with --daemon\n");
         return -1;
@@ -53,8 +59,8 @@ static int do_daemon_op(int mode, const char* input, const char* output, int blo
     req.magic = LZ4_DAEMON_REQUEST_MAGIC;
     req.version = LZ4_DAEMON_REQUEST_VERSION;
     req.mode = mode;
-    strncpy(req.input_path, input, sizeof(req.input_path) - 1);
-    strncpy(req.output_path, output, sizeof(req.output_path) - 1);
+    memcpy(req.input_path, input, strlen(input) + 1);
+    memcpy(req.output_path, output, strlen(output) + 1);
     req.block_size = block_size;
     req.acceleration = acceleration;
     req.local_size = local_size;
@@ -83,7 +89,8 @@ static int do_daemon_op(int mode, const char* input, const char* output, int blo
         }
         return 0;
     } else {
-        fprintf(stderr, "Daemon operation failed: %d\n", resp.status);
+        fprintf(stderr, "Daemon operation failed: %d%s%s\n", resp.status,
+                resp.message[0] ? " - " : "", resp.message);
         return -1;
     }
 }
@@ -104,7 +111,7 @@ static int client_write_full(int fd, const void* buf, size_t len)
 {
     const unsigned char* p = (const unsigned char*)buf;
     while (len > 0) {
-        ssize_t n = send(fd, p, len, 0);
+        ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
         if (n <= 0) return -1;
         p += (size_t)n;
         len -= (size_t)n;
@@ -121,6 +128,10 @@ static int read_stdin_all(unsigned char** out, size_t* out_len)
     for (;;) {
         size_t got;
         if (len == cap) {
+            if (cap > SIZE_MAX / 2) {
+                free(buf);
+                return -1;
+            }
             size_t next = cap * 2;
             unsigned char* nb = (unsigned char*)realloc(buf, next);
             if (!nb) {
