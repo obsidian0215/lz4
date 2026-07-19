@@ -133,10 +133,10 @@ def validate_formal_auditor(path: Path) -> Path:
     return ensure_auditor(resolved, CANON_RESULT_AUDITOR_SHA256)
 
 
-def validate_source_registry(path: Path) -> Path:
+def validate_source_registry(path: Path, expected_path: Path | None = DEFAULT_SOURCE_REGISTRY) -> Path:
     resolved = path.resolve()
-    expected = DEFAULT_SOURCE_REGISTRY.resolve()
-    if resolved != expected or not resolved.is_file():
+    expected = expected_path.resolve() if expected_path is not None else None
+    if (expected is not None and resolved != expected) or not resolved.is_file():
         raise ValueError(f"formal result promotion requires the canonical source registry: {expected}")
     return resolved
 
@@ -229,7 +229,8 @@ def promote_local_archive(
         raise ValueError(f"downloaded result archive is missing: {archive_path}")
     auditor = ensure_auditor(auditor_path, expected_auditor_sha256)
     source_registry = validate_source_registry(
-        source_registry_path if source_registry_path is not None else DEFAULT_SOURCE_REGISTRY
+        source_registry_path if source_registry_path is not None else DEFAULT_SOURCE_REGISTRY,
+        DEFAULT_SOURCE_REGISTRY if source_registry_path is None else None,
     )
     local_results_root = local_results_root.resolve()
     local_results_root.mkdir(parents=True, exist_ok=True)
@@ -282,7 +283,7 @@ def main() -> int:
         remote, remote_root = validate_formal_endpoint(args.remote, args.remote_results_root)
         local_results_root = validate_local_results_root(args.local_results_root)
         auditor = validate_formal_auditor(args.auditor)
-        source_registry = validate_source_registry(args.source_registry)
+        source_registry = validate_source_registry(args.source_registry, DEFAULT_SOURCE_REGISTRY)
         auditor_sha256 = sha256_file(auditor)
         final = local_results_root / run_id
         if final.exists():

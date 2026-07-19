@@ -19,6 +19,19 @@ RUN_ID = "heterolz-admission-20260719T120000000000Z"
 
 
 class PromoteFormalResultTest(unittest.TestCase):
+    def make_source_registry(self, root: Path) -> Path:
+        path = root / "formal_source_fingerprint.json"
+        path.write_text(
+            json.dumps({
+                "schema": "heterolz.source-fingerprint.v1",
+                "git_commit": "a" * 40,
+                "source_fingerprint": "b" * 64,
+                "files": [],
+            }) + "\n",
+            encoding="utf-8",
+        )
+        return path
+
     def make_auditor(self, root: Path, status: str = "complete") -> tuple[Path, str]:
         path = root / "auditor.py"
         exit_code = 0 if status == "complete" else 1
@@ -51,16 +64,19 @@ class PromoteFormalResultTest(unittest.TestCase):
             root = Path(temp)
             archive = self.make_archive(root, self.valid_members())
             auditor, digest = self.make_auditor(root)
+            registry = self.make_source_registry(root)
             results = root / "runs"
             final, audit = promote.promote_local_archive(
-                archive, RUN_ID, results, auditor, expected_auditor_sha256=digest
+                archive, RUN_ID, results, auditor, registry,
+                expected_auditor_sha256=digest
             )
             self.assertEqual(audit["status"], "complete")
             self.assertTrue((final / "run_manifest.json").is_file())
             self.assertEqual([path.name for path in results.iterdir()], [RUN_ID])
             with self.assertRaises(FileExistsError):
                 promote.promote_local_archive(
-                    archive, RUN_ID, results, auditor, expected_auditor_sha256=digest
+                    archive, RUN_ID, results, auditor, registry,
+                    expected_auditor_sha256=digest
                 )
 
     def test_rejects_path_traversal_and_cleans_staging(self) -> None:
@@ -70,10 +86,12 @@ class PromoteFormalResultTest(unittest.TestCase):
             info.size = 1
             archive = self.make_archive(root, [(info, b"x")])
             auditor, digest = self.make_auditor(root)
+            registry = self.make_source_registry(root)
             results = root / "runs"
             with self.assertRaises(ValueError):
                 promote.promote_local_archive(
-                    archive, RUN_ID, results, auditor, expected_auditor_sha256=digest
+                    archive, RUN_ID, results, auditor, registry,
+                    expected_auditor_sha256=digest
                 )
             self.assertEqual(list(results.iterdir()), [])
             self.assertFalse((root / "escape").exists())
@@ -88,9 +106,10 @@ class PromoteFormalResultTest(unittest.TestCase):
             link.linkname = "/etc/passwd"
             archive = self.make_archive(root, [(directory, None), (link, None)])
             auditor, digest = self.make_auditor(root)
+            registry = self.make_source_registry(root)
             with self.assertRaises(ValueError):
                 promote.promote_local_archive(
-                    archive, RUN_ID, root / "runs", auditor,
+                    archive, RUN_ID, root / "runs", auditor, registry,
                     expected_auditor_sha256=digest,
                 )
 
@@ -99,10 +118,12 @@ class PromoteFormalResultTest(unittest.TestCase):
             root = Path(temp)
             archive = self.make_archive(root, self.valid_members())
             auditor, digest = self.make_auditor(root, "incomplete")
+            registry = self.make_source_registry(root)
             results = root / "runs"
             with self.assertRaises(RuntimeError):
                 promote.promote_local_archive(
-                    archive, RUN_ID, results, auditor, expected_auditor_sha256=digest
+                    archive, RUN_ID, results, auditor, registry,
+                    expected_auditor_sha256=digest
                 )
             self.assertEqual(list(results.iterdir()), [])
 
