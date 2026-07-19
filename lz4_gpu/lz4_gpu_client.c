@@ -19,7 +19,7 @@ int is_daemon_running(void) {
 static int client_read_full(int fd, void* buf, size_t len);
 static int client_write_full(int fd, const void* buf, size_t len);
 
-static int do_daemon_op(int mode, const char* input, const char* output, int block_size, int acceleration, int local_size, int hash_log) {
+static int do_daemon_op(int mode, const char* input, const char* output, int block_size, int acceleration, int local_size, int hash_log, int twophase) {
     int sock;
     struct sockaddr_un addr;
     request_t req;
@@ -59,6 +59,7 @@ static int do_daemon_op(int mode, const char* input, const char* output, int blo
     req.acceleration = acceleration;
     req.local_size = local_size;
     req.hash_log = hash_log;
+    if (twophase && mode == mode_compress) req.flags |= LZ4_DAEMON_FLAG_TWOPHASE;
 
     if (client_write_full(sock, &req, sizeof(req)) != 0) {
         perror("send request");
@@ -225,9 +226,9 @@ out:
     return rc;
 }
 
-int run_lz4_client(int mode, const char* input_path, const char* output_path, int block_size, int acceleration, int local_size, int hash_log, int raw_buffer) {
+int run_lz4_client(int mode, const char* input_path, const char* output_path, int block_size, int acceleration, int local_size, int hash_log, int raw_buffer, int twophase) {
     if (raw_buffer) {
         return do_daemon_raw_op(mode, block_size, acceleration, local_size, hash_log);
     }
-    return do_daemon_op(mode, input_path, output_path, block_size, acceleration, local_size, hash_log);
+    return do_daemon_op(mode, input_path, output_path, block_size, acceleration, local_size, hash_log, twophase);
 }

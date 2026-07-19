@@ -11,6 +11,7 @@ typedef struct {
     unsigned long buffer_alloc_us;
     unsigned long data_upload_us;
     unsigned long kernel_exec_us;
+    unsigned long kernel_prof_us;   /* pure GPU exec via event profiling (excludes dispatch/wakeup latency) */
     unsigned long download_total_us;
     unsigned long file_write_us;
 

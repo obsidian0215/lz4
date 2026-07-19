@@ -275,6 +275,14 @@ static void lz4_effective_dict_mode_for_block(size_t block_size, int* dict_clear
         entry_bits = 16;
     }
 
+    /* A/B override: force epoch32 (no per-block dict memset) even for <=64K blocks.
+     * epoch32 is correct for <=64K (20-bit position covers 65536) and preserves ratio;
+     * eliminates the clear16 per-block LZ4_clearDictEntries() cost. */
+    if (getenv("LZ4_GPU_EPOCH32")) {
+        clear = 0;
+        entry_bits = 32;
+    }
+
     if (dict_clear) *dict_clear = clear;
     if (dict_entry_bits) *dict_entry_bits = entry_bits;
 }
@@ -976,6 +984,10 @@ int lz4_compress_core(cl_context context, cl_command_queue queue, cl_kernel kern
     cl_event ev;
     err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &g_ws, &l_ws, 0, NULL, &ev);
     clWaitForEvents(1, &ev);
+    { cl_ulong ps = 0, pe = 0;
+      if (clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(ps), &ps, NULL) == CL_SUCCESS &&
+          clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END,   sizeof(pe), &pe, NULL) == CL_SUCCESS && pe > ps)
+          t->kernel_prof_us = (unsigned long)((pe - ps) / 1000ul); }
     clReleaseEvent(ev);
     t->kernel_exec_us = (unsigned long)(get_us() - t1);
     t->algo_config = (unsigned long)hash_log;
@@ -1381,6 +1393,10 @@ int lz4_decompress_core(cl_context context, cl_command_queue queue, cl_kernel ke
     cl_event ev;
     err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &g_ws, &l_ws, 0, NULL, &ev);
     clWaitForEvents(1, &ev);
+    { cl_ulong ps = 0, pe = 0;
+      if (clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(ps), &ps, NULL) == CL_SUCCESS &&
+          clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END,   sizeof(pe), &pe, NULL) == CL_SUCCESS && pe > ps)
+          t->kernel_prof_us = (unsigned long)((pe - ps) / 1000ul); }
     clReleaseEvent(ev);
     t->kernel_exec_us = (unsigned long)(get_us() - t1);
     t->algo_config = 0; // Not applicable for LZ4 decompress

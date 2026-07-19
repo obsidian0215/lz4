@@ -9,6 +9,7 @@
 #define LZ4_DAEMON_REQUEST_MAGIC 0x4c5a3447u
 #define LZ4_DAEMON_REQUEST_VERSION 3u
 #define LZ4_DAEMON_FLAG_RAW_BUFFER 0x1u
+#define LZ4_DAEMON_FLAG_TWOPHASE 0x2u
 
 extern uint64_t g_ocl_init_us;
 extern uint64_t g_kernel_load_us;

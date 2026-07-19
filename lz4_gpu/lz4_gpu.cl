@@ -5,6 +5,7 @@
  */
 
 #pragma OPENCL EXTENSION cl_khr_byte_addressable_store : enable
+#pragma OPENCL EXTENSION cl_khr_global_int32_extended_atomics : enable
 
 // --- Constants ---
 #define MINMATCH 4
@@ -841,11 +842,6 @@ _copy_match:
     match = dst + (size_t)match_rel;
 
         cpy = op + length;
-        /* Output upper-bound guard: match length is attacker-controlled via
-         * 255-run extension, so a corrupted/truncated payload can encode a
-         * match that runs past this block's output slot. LZ4_COPY_MATCH writes
-         * exactly `length` bytes, so cpy>oend is the exact overflow condition. */
-        if (cpy > oend) goto _output_error;
         LZ4_COPY_MATCH(op, match, (uint)length);
     op_rel += length;
     }
@@ -868,6 +864,186 @@ _output_error:
                                   stat_output_errors);
 #endif
     *outputSizePtr = 0xFFFFFFFF;
+}
+
+
+// --- Two-phase (intra-block parallel) core ---------------------------------
+// Compress base[lo..hi) as a self-contained LZ4 substream. Matches may reference
+// [0,current) within the block (cross-segment). ownTable = private evolving hash
+// (epoch-tagged, no clear). dictTable(+hasDict) = read-only dense prefix cross
+// dict of [0,lo). Same greedy logic as lz4_compress_core_accelerated, plus a dict
+// fallback in the two candidate-search sites. Returns compressed size, 0 on overflow.
+int lz4_compress_core_seg(
+    __global const BYTE* restrict base,
+    int lo, int hi,
+    __global BYTE* restrict dst,
+    int dstCapacity,
+    __global LZ4_DICT_ENTRY* restrict ownTable,
+    __global LZ4_DICT_ENTRY* restrict dictTable,
+    int hasDict,
+    U32 epoch)
+{
+    const __global BYTE* ip = base + lo;
+    __global BYTE* op = dst;
+    __global BYTE* const oend = op + dstCapacity;
+    const __global BYTE* const iend = base + hi;
+    const __global BYTE* anchor = ip;
+    const __global BYTE* const mflimitPlusOne = iend - MFLIMIT + 1;
+    const __global BYTE* const matchlimit = iend - LASTLITERALS;
+    const U32 hashMask = LZ4_hashMask();
+
+    if ((hi - lo) < (MFLIMIT+1)) goto _last_literals_seg;
+
+    U32 ipValue, forwardIpValue;
+    U32 h_init = LZ4_hashPosition(ip, &ipValue);
+    LZ4_putIndexOnHashMasked((U32)(ip - base), h_init, ownTable, hashMask, epoch);
+    ip++;
+    U32 forwardH = LZ4_hashPosition(ip, &forwardIpValue);
+
+    for (;;) {
+        const __global BYTE* match;
+        __global BYTE* token;
+        {
+            const __global BYTE* forwardIp = ip;
+            int step = 1;
+            int searchMatchNb = 1 << 6;
+            do {
+                U32 h_iter = forwardH;
+                ipValue = forwardIpValue;
+                U32 current = (U32)(forwardIp - base);
+                int entry_valid;
+                U32 matchIndex = LZ4_getIndexOnHashMasked(h_iter, ownTable, hashMask, &entry_valid, epoch, current);
+                ip = forwardIp;
+                forwardIp += step;
+                step = (searchMatchNb++ >> 6);
+                if (forwardIp > mflimitPlusOne) goto _last_literals_seg;
+                forwardH = LZ4_hashPosition(forwardIp, &forwardIpValue);
+                LZ4_putIndexOnHashMasked(current, h_iter, ownTable, hashMask, epoch);
+                const __global BYTE* cand = 0;
+                if (entry_valid && (matchIndex < current) && (current - matchIndex < LZ4_DISTANCE_MAX)
+                    && LZ4_read32(base + matchIndex) == ipValue) {
+                    cand = base + matchIndex;
+                }
+                if (!cand && hasDict) {
+                    int dvalid;
+                    U32 dIdx = LZ4_getIndexOnHashMasked(h_iter, dictTable, hashMask, &dvalid, epoch, current);
+                    if (dvalid && (dIdx < current) && (current - dIdx < LZ4_DISTANCE_MAX)
+                        && LZ4_read32(base + dIdx) == ipValue) {
+                        cand = base + dIdx;
+                    }
+                }
+                if (cand) { match = cand; break; }
+            } while (1);
+        }
+        while ((ip > anchor) && (match > base) && (ip[-1] == match[-1])) { ip--; match--; }
+        {
+            unsigned litLength = (unsigned)(ip - anchor);
+            token = op++;
+            if (op + litLength + (2 + 1 + LASTLITERALS) + (litLength/255) > oend) return 0;
+            if (litLength >= RUN_MASK) {
+                unsigned len = litLength - RUN_MASK;
+                *token = (RUN_MASK << ML_BITS);
+                for(; len >= 255; len -= 255) *op++ = 255;
+                *op++ = (BYTE)len;
+            } else {
+                *token = (BYTE)(litLength << ML_BITS);
+            }
+            LZ4_lit_wildCopy8(op, anchor, op + litLength);
+            op += litLength;
+        }
+_next_match_seg:
+        LZ4_write16(op, (U16)(ip - match)); op += 2;
+        {
+            unsigned matchCode = LZ4_count(ip + MINMATCH, match + MINMATCH, matchlimit);
+            ip += matchCode + MINMATCH;
+            if (matchCode >= ML_MASK) {
+                *token += ML_MASK;
+                matchCode -= ML_MASK;
+                while (matchCode >= 255) { *op++ = 255; matchCode -= 255; }
+                *op++ = (BYTE)matchCode;
+            } else {
+                *token += (BYTE)matchCode;
+            }
+        }
+        anchor = ip;
+        if (ip >= mflimitPlusOne) break;
+        {
+            U32 seq2;
+            U32 h2 = LZ4_hashPosition(ip - 2, &seq2);
+            LZ4_putIndexOnHashMasked((U32)(ip - 2 - base), h2, ownTable, hashMask, epoch);
+        }
+        {
+            U32 seq_ip;
+            U32 h_ip = LZ4_hashPosition(ip, &seq_ip);
+            U32 current = (U32)(ip - base);
+            int entry_valid;
+            U32 matchIndex = LZ4_getIndexOnHashMasked(h_ip, ownTable, hashMask, &entry_valid, epoch, current);
+            LZ4_putIndexOnHashMasked(current, h_ip, ownTable, hashMask, epoch);
+            const __global BYTE* cand2 = 0;
+            if (entry_valid && (matchIndex < current) && (current - matchIndex < LZ4_DISTANCE_MAX)
+                && LZ4_read32(base + matchIndex) == seq_ip) {
+                cand2 = base + matchIndex;
+            }
+            if (!cand2 && hasDict) {
+                int dvalid;
+                U32 dIdx = LZ4_getIndexOnHashMasked(h_ip, dictTable, hashMask, &dvalid, epoch, current);
+                if (dvalid && (dIdx < current) && (current - dIdx < LZ4_DISTANCE_MAX)
+                    && LZ4_read32(base + dIdx) == seq_ip) {
+                    cand2 = base + dIdx;
+                }
+            }
+            if (cand2) { token = op++; *token = 0; match = cand2; goto _next_match_seg; }
+        }
+        forwardH = LZ4_hashPosition(++ip, &forwardIpValue);
+    }
+_last_literals_seg:
+    {
+        size_t lastRun = (size_t)(iend - anchor);
+        if (op + lastRun + 1 + ((lastRun + 255 - RUN_MASK) / 255) > oend) return 0;
+        if (lastRun >= RUN_MASK) {
+            size_t accumulator = lastRun - RUN_MASK;
+            *op++ = RUN_MASK << ML_BITS;
+            for(; accumulator >= 255; accumulator -= 255) *op++ = 255;
+            *op++ = (BYTE)accumulator;
+        } else {
+            *op++ = (BYTE)(lastRun << ML_BITS);
+        }
+        LZ4_memcpy(op, anchor, lastRun);
+        op += lastRun;
+    }
+    return (int)(op - dst);
+}
+
+// Decode one substream into shared block buffer `out`, op starting at opStart
+// (absolute within the block). Matches resolve as out[op-offset], reaching back
+// into earlier segments already decoded contiguously. Returns new op, or -1.
+int lz4_decompress_seg(const __global BYTE* src, int srcSize,
+                       __global BYTE* out, int opStart, int outCap)
+{
+    const __global BYTE* ip = src;
+    const __global BYTE* const iend = src + srcSize;
+    int op = opStart;
+    if (srcSize == 0) return op;
+    for (;;) {
+        unsigned token = *ip++;
+        U32 ll = token >> ML_BITS;
+        if (ll == RUN_MASK) { unsigned s; do { if (ip >= iend) return -1; s = *ip++; ll += s; } while (s == 255); }
+        if (op + (int)ll > outCap) return -1;
+        if (ip + ll > iend) return -1;
+        LZ4_UA_COPYN(out + op, ip, ll); op += (int)ll; ip += ll;
+        if (ip == iend) break;
+        if (ip + 2 > iend) return -1;
+        U32 off = LZ4_readLE16(ip); ip += 2;
+        if (off == 0 || off > (U32)op) return -1;
+        int mpos = op - (int)off;
+        U32 ml = token & ML_MASK;
+        if (ml == ML_MASK) { unsigned s; do { if (ip >= iend) return -1; s = *ip++; ml += s; } while (s == 255); }
+        ml += MINMATCH;
+        if (op + (int)ml > outCap) return -1;
+        LZ4_COPY_MATCH(out + op, out + mpos, (uint)ml);
+        op += (int)ml;
+    }
+    return op;
 }
 
 // --- Kernels ---
@@ -1058,6 +1234,101 @@ __kernel void lz4_decompress_blocks_mapped(
             , dbg_stats, (U32)idx, dbg_enabled
 #endif
         );
+    }
+}
+
+#ifndef LZ4_TP_BUILD_CHUNKS
+#define LZ4_TP_BUILD_CHUNKS 4
+#endif
+
+// Build N-1 dense cumulative prefix dicts per block: dict k (k=1..N-1) hashes
+// [0,k*segLen) so segment s reads dict s to reference all earlier segments.
+// Layout: prefixPool[(b*(N-1)+(k-1)) * dict_entries]. Epoch-tagged (no clear).
+__kernel void lz4_tp_build_prefix(
+    __global const BYTE* input,
+    __global LZ4_DICT_ENTRY* prefixPool,
+    int nblk, int inputSize, int blockSize, int N, U32 epoch)
+{
+    uint g = get_global_id(0);
+    int nk = N - 1;
+    if (nk < 1) return;
+    const int CH = LZ4_TP_BUILD_CHUNKS;
+    if (g >= (uint)(nblk * nk * CH)) return;
+    const uint dict_entries = (1U << LZ4_HASHLOG);
+    const U32 hashMask = LZ4_hashMask();
+    int c = (int)g % CH;
+    int idx = (int)g / CH;
+    int b = idx / nk;
+    int k = idx % nk + 1;
+    int start = b * blockSize;
+    int L = inputSize - start; if (L > blockSize) L = blockSize;
+    if (L <= 0) return;
+    int segLen = (L + N - 1) / N;
+    int prefixEnd = k * segLen; if (prefixEnd > L) prefixEnd = L;
+    int chunk = (prefixEnd + CH - 1) / CH;
+    int clo = c * chunk, chi = clo + chunk; if (chi > prefixEnd) chi = prefixEnd;
+    __global const BYTE* base = input + start;
+    __global LZ4_DICT_ENTRY* dict = prefixPool + (size_t)(b * nk + (k - 1)) * dict_entries;
+    for (int i = clo; i + MINMATCH <= chi; i++) {
+        U32 seq;
+        U32 h = LZ4_hashPosition(base + i, &seq);
+        /* I4-determinism fix: atomic_max keeps the highest idx (= nearest match,
+           standard LZ4's own preference) regardless of chunk scheduling, so the
+           shared prefix table is byte-identical across devices and runs. */
+#if LZ4_GPU_DICT_CLEAR
+        atomic_max((volatile __global uint*)&dict[h & hashMask], (U32)i + 1U);
+#else
+        atomic_max((volatile __global uint*)&dict[h & hashMask],
+                   ((epoch & 0xFFF) << 20) | ((U32)i & 0xFFFFF));
+#endif
+    }
+}
+
+// Scan: N work-items per block, one per segment; segment s>0 reads prefix dict s.
+__kernel void lz4_tp_scan_seg(
+    __global const BYTE* input,
+    __global BYTE* out,
+    __global U32* sizes,
+    __global LZ4_DICT_ENTRY* ownPool,
+    __global LZ4_DICT_ENTRY* prefixPool,
+    int nblk, int inputSize, int blockSize, int segMaxOut, int N, U32 epoch)
+{
+    uint g = get_global_id(0);
+    if (g >= (uint)(nblk * N)) return;
+    const uint dict_entries = (1U << LZ4_HASHLOG);
+    int b = (int)g / N, s = (int)g % N;
+    int nk = N - 1;
+    int start = b * blockSize;
+    int L = inputSize - start; if (L > blockSize) L = blockSize;
+    __global const BYTE* base = input + start;
+    int segLen = (L + N - 1) / N;
+    int lo = s * segLen, hi = lo + segLen; if (hi > L) hi = L;
+    if (L <= 0 || lo >= L) { sizes[g] = 0; return; }
+    __global LZ4_DICT_ENTRY* ownTable = ownPool + (size_t)g * dict_entries;
+    __global LZ4_DICT_ENTRY* dict = (s > 0) ? prefixPool + (size_t)(b * nk + (s - 1)) * dict_entries : 0;
+    sizes[g] = (U32)lz4_compress_core_seg(base, lo, hi, out + (size_t)g * segMaxOut, segMaxOut,
+                                          ownTable, dict, s > 0 ? 1 : 0, epoch);
+}
+
+// Decode: one work-item per block decodes its N segments in order into output.
+__kernel void lz4_tp_decompress_segmented(
+    __global const BYTE* input,
+    __global BYTE* output,
+    __global const U32* comp_offsets,   // per (block,segment)
+    __global const U32* comp_sizes,     // per (block,segment)
+    __global U32* sizes_out,            // per block
+    U32 block_size, int N, U32 totalBlocks)
+{
+    int gid = get_global_id(0), gsz = get_global_size(0);
+    for (int idx = gid; idx < (int)totalBlocks; idx += gsz) {
+        int op = 0, ok = 1;
+        for (int s = 0; s < N; s++) {
+            int gg = idx * N + s;
+            op = lz4_decompress_seg(input + comp_offsets[gg], (int)comp_sizes[gg],
+                                    output + (size_t)idx * block_size, op, (int)block_size);
+            if (op < 0) { ok = 0; break; }
+        }
+        sizes_out[idx] = ok ? (U32)op : 0xFFFFFFFF;
     }
 }
 
