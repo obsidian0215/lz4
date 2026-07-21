@@ -1,14 +1,58 @@
+#if !defined(_WIN32)
+#define _GNU_SOURCE
+#endif
 #include "lz4_gpu_utils.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <errno.h>
+#include <limits.h>
+#if !defined(_WIN32)
+#include <sched.h>
+#endif
 #include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
 
 uint64_t g_ocl_init_us = 0;
 uint64_t g_kernel_load_us = 0;
+static cl_device_id lz4_owned_subdevice = NULL;
+static cl_uint lz4_owned_parent_compute_units = 0;
+
+#if !defined(_WIN32)
+static int lz4_parse_cpu_set(const char* value, cpu_set_t* set) {
+    const char* cursor = value;
+    char* end = NULL;
+    if (!value || !*value || !set) return -1;
+    CPU_ZERO(set);
+    while (*cursor) {
+        errno = 0;
+        unsigned long cpu = strtoul(cursor, &end, 10);
+        if (errno == ERANGE || end == cursor || cpu >= CPU_SETSIZE) return -1;
+        CPU_SET((int)cpu, set);
+        if (*end == '\0') return 0;
+        if (*end != ',') return -1;
+        cursor = end + 1;
+        if (!*cursor) return -1;
+    }
+    return -1;
+}
+
+static int lz4_set_affinity_from_env(const char* name) {
+    cpu_set_t set;
+    const char* value = getenv(name);
+    if (!value || !*value) return 0;
+    if (lz4_parse_cpu_set(value, &set) != 0) return -1;
+    return sched_setaffinity(0, sizeof(set), &set);
+}
+
+static int lz4_get_affinity_from_env(const char* name, cpu_set_t* set) {
+    const char* value = getenv(name);
+    if (!value || !*value) return 0;
+    return lz4_parse_cpu_set(value, set) == 0 ? 1 : -1;
+}
+#endif
 
 static cl_int lz4_try_get_device(cl_platform_id* platforms,
                                  cl_uint num_platforms,
@@ -16,13 +60,28 @@ static cl_int lz4_try_get_device(cl_platform_id* platforms,
                                  cl_device_id* out_dev,
                                  cl_platform_id* out_pf) {
     for (cl_uint pi = 0; pi < num_platforms; ++pi) {
-        cl_device_id tmp_dev = NULL;
-        cl_int r = clGetDeviceIDs(platforms[pi], dtype, 1, &tmp_dev, NULL);
-        if (r == CL_SUCCESS && tmp_dev != NULL) {
-            *out_dev = tmp_dev;
-            *out_pf = platforms[pi];
-            return CL_SUCCESS;
+        cl_uint count = 0;
+        cl_int r = clGetDeviceIDs(platforms[pi], dtype, 0, NULL, &count);
+        if (r != CL_SUCCESS || count == 0) continue;
+        cl_device_id* devices = (cl_device_id*)calloc(count, sizeof(*devices));
+        if (!devices) return CL_OUT_OF_HOST_MEMORY;
+        r = clGetDeviceIDs(platforms[pi], dtype, count, devices, NULL);
+        if (r == CL_SUCCESS) {
+            for (cl_uint di = 0; di < count; ++di) {
+                cl_device_type actual_type = 0;
+                if (clGetDeviceInfo(devices[di], CL_DEVICE_TYPE,
+                                    sizeof(actual_type), &actual_type, NULL) != CL_SUCCESS) {
+                    continue;
+                }
+                if (dtype == CL_DEVICE_TYPE_ALL || (actual_type & dtype)) {
+                    *out_dev = devices[di];
+                    *out_pf = platforms[pi];
+                    free(devices);
+                    return CL_SUCCESS;
+                }
+            }
         }
+        free(devices);
     }
     return CL_DEVICE_NOT_FOUND;
 }
@@ -38,6 +97,47 @@ static cl_device_type lz4_preferred_opencl_device_type(int* strict) {
     return 0;
 }
 
+static int lz4_cpu_thread_limit(cl_uint* limit) {
+    const char* value = getenv("HETEROLZ_CPU_THREADS");
+    char* end = NULL;
+    unsigned long parsed;
+    if (!value || !*value) return 0;
+    errno = 0;
+    parsed = strtoul(value, &end, 10);
+    if (errno == ERANGE || end == value || *end != '\0' || parsed < 1 || parsed > UINT_MAX) {
+        return -1;
+    }
+    *limit = (cl_uint)parsed;
+    return 1;
+}
+
+static cl_int lz4_partition_cpu_device(cl_device_id root, cl_uint limit,
+                                       cl_device_id* out_device) {
+    cl_uint compute_units = 0;
+    cl_uint count = 0;
+    cl_device_id* devices = NULL;
+    const cl_device_partition_property properties[] = {
+        CL_DEVICE_PARTITION_EQUALLY,
+        (cl_device_partition_property)limit,
+        0,
+    };
+    cl_int err = clGetDeviceInfo(root, CL_DEVICE_MAX_COMPUTE_UNITS,
+                                 sizeof(compute_units), &compute_units, NULL);
+    if (err != CL_SUCCESS) return err;
+    if (compute_units < limit) return CL_INVALID_VALUE;
+    err = clCreateSubDevices(root, properties, 0, NULL, &count);
+    if (err != CL_SUCCESS || count == 0) return err != CL_SUCCESS ? err : CL_DEVICE_PARTITION_FAILED;
+    devices = (cl_device_id*)calloc(count, sizeof(*devices));
+    if (!devices) return CL_OUT_OF_HOST_MEMORY;
+    err = clCreateSubDevices(root, properties, count, devices, NULL);
+    if (err == CL_SUCCESS) {
+        *out_device = devices[0];
+        for (cl_uint index = 1; index < count; ++index) clReleaseDevice(devices[index]);
+    }
+    free(devices);
+    return err;
+}
+
 cl_int lz4_select_opencl_platform_device(cl_platform_id* out_pf, cl_device_id* out_dev) {
     cl_uint num_platforms = 0;
     cl_platform_id* platforms = NULL;
@@ -45,6 +145,11 @@ cl_int lz4_select_opencl_platform_device(cl_platform_id* out_pf, cl_device_id* o
     cl_int r = CL_DEVICE_NOT_FOUND;
     int strict = 0;
     cl_device_type pref_type = lz4_preferred_opencl_device_type(&strict);
+#if !defined(_WIN32)
+    cpu_set_t original_affinity;
+    cpu_set_t discovery_affinity;
+    int affinity_expanded = 0;
+#endif
 
     if (!out_pf || !out_dev) return CL_INVALID_VALUE;
     *out_pf = NULL;
@@ -53,12 +158,35 @@ cl_int lz4_select_opencl_platform_device(cl_platform_id* out_pf, cl_device_id* o
     if (pref_type == 0) return CL_INVALID_VALUE;
     if (err != CL_SUCCESS || num_platforms == 0) return CL_DEVICE_NOT_FOUND;
 
+#if !defined(_WIN32)
+    if (pref_type == CL_DEVICE_TYPE_CPU) {
+        int discovery_status = lz4_get_affinity_from_env(
+            "HETEROLZ_CPU_DISCOVERY_SET", &discovery_affinity);
+        if (discovery_status < 0) return CL_INVALID_VALUE;
+        if (discovery_status > 0) {
+            if (sched_getaffinity(0, sizeof(original_affinity), &original_affinity) != 0 ||
+                    sched_setaffinity(0, sizeof(discovery_affinity), &discovery_affinity) != 0) {
+                return CL_INVALID_OPERATION;
+            }
+            affinity_expanded = 1;
+        }
+    }
+#endif
+
     platforms = (cl_platform_id*)malloc(num_platforms * sizeof(cl_platform_id));
-    if (!platforms) return CL_OUT_OF_HOST_MEMORY;
+    if (!platforms) {
+#if !defined(_WIN32)
+        if (affinity_expanded) (void)sched_setaffinity(0, sizeof(original_affinity), &original_affinity);
+#endif
+        return CL_OUT_OF_HOST_MEMORY;
+    }
 
     err = clGetPlatformIDs(num_platforms, platforms, NULL);
     if (err != CL_SUCCESS) {
         free(platforms);
+#if !defined(_WIN32)
+        if (affinity_expanded) (void)sched_setaffinity(0, sizeof(original_affinity), &original_affinity);
+#endif
         return err;
     }
 
@@ -83,8 +211,75 @@ cl_int lz4_select_opencl_platform_device(cl_platform_id* out_pf, cl_device_id* o
         r = lz4_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_ALL, out_dev, out_pf);
     }
 
+    if (r == CL_SUCCESS && *out_dev != NULL) {
+        cl_device_type selected_type = 0;
+        cl_uint cpu_limit = 0;
+        cl_uint parent_compute_units = 0;
+        int limit_status = lz4_cpu_thread_limit(&cpu_limit);
+        if (limit_status < 0) {
+            *out_dev = NULL;
+            *out_pf = NULL;
+            r = CL_INVALID_VALUE;
+        } else if (limit_status > 0 &&
+                   clGetDeviceInfo(*out_dev, CL_DEVICE_TYPE, sizeof(selected_type),
+                                   &selected_type, NULL) == CL_SUCCESS &&
+                   (selected_type & CL_DEVICE_TYPE_CPU)) {
+            cl_device_id partitioned = NULL;
+            (void)clGetDeviceInfo(*out_dev, CL_DEVICE_MAX_COMPUTE_UNITS,
+                                  sizeof(parent_compute_units), &parent_compute_units, NULL);
+            r = lz4_partition_cpu_device(*out_dev, cpu_limit, &partitioned);
+            if (r == CL_SUCCESS) {
+                *out_dev = partitioned;
+                lz4_owned_subdevice = partitioned;
+                lz4_owned_parent_compute_units = parent_compute_units;
+            }
+            else {
+                *out_dev = NULL;
+                *out_pf = NULL;
+            }
+        }
+    }
+
+#if !defined(_WIN32)
+    if (r == CL_SUCCESS && *out_dev != NULL &&
+            lz4_set_affinity_from_env("HETEROLZ_CPU_SET") != 0) {
+        lz4_release_opencl_device(out_dev);
+        *out_pf = NULL;
+        r = CL_INVALID_OPERATION;
+    }
+#endif
+
     free(platforms);
     return r;
+}
+
+void lz4_release_opencl_device(cl_device_id* device) {
+    if (!device || !*device) return;
+    if (*device == lz4_owned_subdevice) {
+        clReleaseDevice(*device);
+        lz4_owned_subdevice = NULL;
+        lz4_owned_parent_compute_units = 0;
+    }
+    *device = NULL;
+}
+
+int lz4_opencl_device_partition_info(cl_device_id device, cl_uint* parent_compute_units) {
+    if (!device || device != lz4_owned_subdevice) return 0;
+    if (parent_compute_units) *parent_compute_units = lz4_owned_parent_compute_units;
+    return 1;
+}
+
+void lz4_device_profile_key(cl_device_id device, char* buffer, size_t buffer_size) {
+    char name[256] = {0};
+    cl_uint compute_units = 0;
+    if (!buffer || buffer_size == 0) return;
+    buffer[0] = '\0';
+    if (!device || clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(name), name, NULL) != CL_SUCCESS) return;
+    (void)clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS,
+                          sizeof(compute_units), &compute_units, NULL);
+    if (lz4_opencl_device_partition_info(device, NULL))
+        snprintf(buffer, buffer_size, "%s|cpu-cu=%u", name, compute_units);
+    else snprintf(buffer, buffer_size, "%s", name);
 }
 
 uint64_t get_us(void) {

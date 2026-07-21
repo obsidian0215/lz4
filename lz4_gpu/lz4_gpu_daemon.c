@@ -447,8 +447,7 @@ static int tp_write_empty_frame(const char* output_path, int block_size, int has
 }
 
 static void tp_device_name(char* buf, size_t n) {
-    buf[0] = 0;
-    if (g_state.device) clGetDeviceInfo(g_state.device, CL_DEVICE_NAME, n, buf, NULL);
+    lz4_device_profile_key(g_state.device, buf, n);
 }
 
 /* EXPLOIT rule: apply the calibrated occupancy threshold to the chunk that the
@@ -1022,6 +1021,7 @@ static void cleanup_resources(void) {
         clReleaseContext(g_state.context);
         g_state.context = NULL;
     }
+    lz4_release_opencl_device(&g_state.device);
 }
 
 int init_resources(void) {

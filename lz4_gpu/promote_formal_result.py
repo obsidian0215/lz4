@@ -26,7 +26,7 @@ DEFAULT_AUDITOR = Path(
 DEFAULT_SOURCE_REGISTRY = Path(
     r"C:\Users\obsid\Desktop\博士毕设\heterolz\阶段文档\交接工具\formal_source_fingerprint.json"
 )
-CANON_RESULT_AUDITOR_SHA256 = "f5ef9cb1568ee79795e4703adba4cc29113105e23e26147919901d09d6c7ed22"
+CANON_RESULT_AUDITOR_SHA256 = "6e657a9600738f81164b705ad387ec8c62d437a829b2179971dae5a782c0975d"
 RUN_ID_RE = re.compile(r"heterolz-(?:admission|performance)-\d{8}T\d{12}Z")
 REMOTE_RE = re.compile(r"(?:[A-Za-z0-9_][A-Za-z0-9_.-]*@)?[A-Za-z0-9_][A-Za-z0-9_.-]*")
 SAFE_POSIX_RE = re.compile(r"/[A-Za-z0-9_./-]+")

@@ -82,6 +82,13 @@ static cl_command_queue queue;
 static cl_device_id dev;
 static cl_platform_id platform;
 
+static void ocl_release_runtime(void) {
+    if (queue) { clReleaseCommandQueue(queue); queue = NULL; }
+    if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+    lz4_release_opencl_device(&dev);
+    platform = NULL;
+}
+
 static void ocl_init() {
     cl_int err;
     cl_platform_id selected_pf = NULL;
@@ -118,6 +125,7 @@ static void ocl_init() {
     ctx = clCreateContext(NULL, 1, &dev, NULL, NULL, &err);
     if (err != CL_SUCCESS || ctx == NULL) {
         fprintf(stderr, "OpenCL init failed: clCreateContext err=%d\n", err);
+        lz4_release_opencl_device(&dev);
         ctx = NULL;
         return;
     }
@@ -137,6 +145,7 @@ static void ocl_init() {
     if (err != CL_SUCCESS || queue == NULL) {
         fprintf(stderr, "OpenCL init failed: command queue creation err=%d\n", err);
         if (ctx) clReleaseContext(ctx);
+        lz4_release_opencl_device(&dev);
         ctx = NULL;
         queue = NULL;
         return;
@@ -170,7 +179,9 @@ static int lz4_print_device_info(void) {
     char device_version[256] = {0}, opencl_c_version[256] = {0};
     cl_device_type device_type = 0;
     cl_ulong global_mem = 0, max_alloc = 0;
-    cl_uint compute_units = 0;
+    cl_uint compute_units = 0, parent_compute_units = 0, requested_cpu_threads = 0;
+    int partitioned = 0;
+    char profile_key[320] = {0};
     clGetPlatformInfo(platform, CL_PLATFORM_NAME, sizeof(platform_name), platform_name, NULL);
     clGetPlatformInfo(platform, CL_PLATFORM_VENDOR, sizeof(platform_vendor), platform_vendor, NULL);
     clGetPlatformInfo(platform, CL_PLATFORM_VERSION, sizeof(platform_version), platform_version, NULL);
@@ -183,6 +194,13 @@ static int lz4_print_device_info(void) {
     clGetDeviceInfo(dev, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(global_mem), &global_mem, NULL);
     clGetDeviceInfo(dev, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc), &max_alloc, NULL);
     clGetDeviceInfo(dev, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(compute_units), &compute_units, NULL);
+    partitioned = lz4_opencl_device_partition_info(dev, &parent_compute_units);
+    if (!partitioned) parent_compute_units = compute_units;
+    if (device_type & CL_DEVICE_TYPE_CPU) {
+        const char* limit = getenv("HETEROLZ_CPU_THREADS");
+        if (limit && *limit) requested_cpu_threads = (cl_uint)strtoul(limit, NULL, 10);
+    }
+    lz4_device_profile_key(dev, profile_key, sizeof(profile_key));
     const char* type_name = (device_type & CL_DEVICE_TYPE_GPU) ? "GPU" :
                             (device_type & CL_DEVICE_TYPE_CPU) ? "CPU" :
                             (device_type & CL_DEVICE_TYPE_ACCELERATOR) ? "ACCELERATOR" :
@@ -197,11 +215,16 @@ static int lz4_print_device_info(void) {
     fputs(",\n  \"driver_version\": ", stdout); lz4_print_json_string(stdout, driver);
     fputs(",\n  \"device_version\": ", stdout); lz4_print_json_string(stdout, device_version);
     fputs(",\n  \"opencl_c_version\": ", stdout); lz4_print_json_string(stdout, opencl_c_version);
-    fprintf(stdout, ",\n  \"compute_units\": %u,\n  \"global_mem_bytes\": %llu,\n"
+    fputs(",\n  \"profile_key\": ", stdout); lz4_print_json_string(stdout, profile_key);
+    fprintf(stdout, ",\n  \"compute_units\": %u,\n  \"parent_compute_units\": %u,\n"
+                    "  \"requested_cpu_threads\": %u,\n  \"partitioned\": %s,\n"
+                    "  \"global_mem_bytes\": %llu,\n"
                     "  \"max_alloc_bytes\": %llu\n}\n",
-            compute_units, (unsigned long long)global_mem, (unsigned long long)max_alloc);
-    clReleaseCommandQueue(queue); queue = NULL;
-    clReleaseContext(ctx); ctx = NULL;
+            compute_units, parent_compute_units, requested_cpu_threads,
+            partitioned ? "true" : "false",
+            (unsigned long long)global_mem, (unsigned long long)max_alloc);
+    fflush(stdout);
+    ocl_release_runtime();
     return 0;
 }
 
@@ -539,8 +562,7 @@ static int run_lz4_bench(const char* input_path,
     cl_program prog = lz4_load_program(ctx, dev, g_cli_hash_log, (size_t)block_size);
     if (!prog) {
         fprintf(stderr, "bench error: kernel program load failed\n");
-        clReleaseCommandQueue(queue);
-        clReleaseContext(ctx);
+        ocl_release_runtime();
         free(input_ref);
         return 1;
     }
@@ -550,8 +572,7 @@ static int run_lz4_bench(const char* input_path,
     if (err != CL_SUCCESS || !kcomp) {
         fprintf(stderr, "bench error: create compress kernel failed (%d)\n", err);
         clReleaseProgram(prog);
-        clReleaseCommandQueue(queue);
-        clReleaseContext(ctx);
+        ocl_release_runtime();
         free(input_ref);
         return 1;
     }
@@ -560,8 +581,7 @@ static int run_lz4_bench(const char* input_path,
         fprintf(stderr, "bench error: create decompress kernel failed (%d)\n", err);
         clReleaseKernel(kcomp);
         clReleaseProgram(prog);
-        clReleaseCommandQueue(queue);
-        clReleaseContext(ctx);
+        ocl_release_runtime();
         free(input_ref);
         return 1;
     }
@@ -964,8 +984,7 @@ static int run_lz4_bench(const char* input_path,
     clReleaseKernel(kdec);
     clReleaseKernel(kcomp);
     clReleaseProgram(prog);
-    clReleaseCommandQueue(queue);
-    clReleaseContext(ctx);
+    ocl_release_runtime();
     return verify_ok ? 0 : 1;
 }
 
@@ -1242,8 +1261,7 @@ static int run_lz4_tp_bench(const char* input_path, int block_size) {
     clReleaseMemObject(d_input);
     lz4_unset_env("LZ4_GPU_EPOCH32");
     free(input_ref);
-    if (queue) clReleaseCommandQueue(queue);
-    if (ctx) clReleaseContext(ctx);
+    ocl_release_runtime();
     return 0;
 }
 
@@ -1843,8 +1861,7 @@ done:
     if (kscan) clReleaseKernel(kscan);
     if (prog) clReleaseProgram(prog);
     if (env_set) lz4_unset_env("LZ4_GPU_EPOCH32");
-    if (queue) { clReleaseCommandQueue(queue); queue = NULL; }
-    if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+    ocl_release_runtime();
     return status;
 }
 
@@ -2051,8 +2068,7 @@ done:
     if (kdec) clReleaseKernel(kdec);
     if (prog) clReleaseProgram(prog);
     if (env_set) lz4_unset_env("LZ4_GPU_EPOCH32");
-    if (queue) { clReleaseCommandQueue(queue); queue = NULL; }
-    if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+    ocl_release_runtime();
     return status;
 }
 /* ============================================================================
@@ -2194,8 +2210,7 @@ static int lz4_tp_pick_N_chunked(size_t total_blocks, int W_sat,
 }
 
 static void lz4_device_name(char* buf, size_t n) {
-    buf[0] = 0;
-    if (dev) clGetDeviceInfo(dev, CL_DEVICE_NAME, n, buf, NULL);
+    lz4_device_profile_key(dev, buf, n);
 }
 
 static const char* lz4_profile_path(void) {
@@ -2234,8 +2249,7 @@ static int lz4_calibrate_device(const char* cal_file, int block_size) {
     if (safe_nblk < 4) {
         fprintf(stderr, "calibrate: device and input must support at least four complete blocks\n");
         lz4_unset_env("LZ4_GPU_EPOCH32");
-        if (queue) { clReleaseCommandQueue(queue); queue = NULL; }
-        if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+        ocl_release_runtime();
         return 1;
     }
     size_t calibration_bytes = safe_nblk * (size_t)block_size;
@@ -2244,8 +2258,7 @@ static int lz4_calibrate_device(const char* cal_file, int block_size) {
     if (!input_ref || lz4_read_file_to_buf(cal_file, input_ref, calibration_bytes, &rd) != 0) {
         free(input_ref);
         lz4_unset_env("LZ4_GPU_EPOCH32");
-        if (queue) { clReleaseCommandQueue(queue); queue = NULL; }
-        if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+        ocl_release_runtime();
         fprintf(stderr, "calibrate: read failed\n"); return 1;
     }
     cl_int err = CL_SUCCESS;
@@ -2259,8 +2272,7 @@ static int lz4_calibrate_device(const char* cal_file, int block_size) {
         if (kscan) clReleaseKernel(kscan);
         if (prog) clReleaseProgram(prog);
         lz4_unset_env("LZ4_GPU_EPOCH32");
-        if (queue) { clReleaseCommandQueue(queue); queue = NULL; }
-        if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+        ocl_release_runtime();
         return 1;
     }
 
@@ -2287,8 +2299,7 @@ static int lz4_calibrate_device(const char* cal_file, int block_size) {
         free(input_ref);
         clReleaseKernel(kbuild); clReleaseKernel(kscan); clReleaseProgram(prog);
         lz4_unset_env("LZ4_GPU_EPOCH32");
-        if (queue) { clReleaseCommandQueue(queue); queue = NULL; }
-        if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+        ocl_release_runtime();
         return 1;
     }
 
@@ -2318,8 +2329,7 @@ static int lz4_calibrate_device(const char* cal_file, int block_size) {
         free(input_ref);
         clReleaseKernel(kbuild); clReleaseKernel(kscan); clReleaseProgram(prog);
         lz4_unset_env("LZ4_GPU_EPOCH32");
-        if (queue) { clReleaseCommandQueue(queue); queue = NULL; }
-        if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+        ocl_release_runtime();
         return 1;
     }
     fprintf(stderr, "[calibrate] stored to %s\n", lz4_profile_path());
@@ -2327,8 +2337,7 @@ static int lz4_calibrate_device(const char* cal_file, int block_size) {
     free(input_ref);
     clReleaseKernel(kbuild); clReleaseKernel(kscan); clReleaseProgram(prog);
     lz4_unset_env("LZ4_GPU_EPOCH32");
-    if (queue) { clReleaseCommandQueue(queue); queue = NULL; }
-    if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+    ocl_release_runtime();
     return 0;
 }
 
@@ -2367,8 +2376,7 @@ static int lz4_tp_compress_auto(const char* input_path, const char* output_path,
         fprintf(stderr, "[auto] device=%s W_sat=%d nblk=%zu chunk=%zu -> N=%d\n",
                 devname, W_sat, nblk, selected_chunk, N);
     }
-    if (queue) { clReleaseCommandQueue(queue); queue = NULL; }
-    if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+    ocl_release_runtime();
     if (selected_chunk == 0) {
         fprintf(stderr, "auto: no safe OpenCL chunk size\n"); return 1;
     }
@@ -2715,8 +2723,7 @@ cleanup:
     if (ws_inited) lz4_gpu_workspace_free(&ws);
     if (kernel) clReleaseKernel(kernel);
     if (prog) clReleaseProgram(prog);
-    if (queue) { clReleaseCommandQueue(queue); queue = NULL; }
-    if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+    ocl_release_runtime();
     if (have_temp_input) unlink(temp_input_path);
     if (have_temp_output) unlink(temp_output_path);
     return ret;

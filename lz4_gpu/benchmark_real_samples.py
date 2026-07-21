@@ -18,14 +18,21 @@ import tempfile
 import time
 from pathlib import Path
 
+from formal_resource_probe import SCHEMA as RESOURCE_SCHEMA, run_measured
+
 
 FORMAL_N = (1, 2, 4, 8)
+FORMAL_CPU_THREADS = 4
 CANON_SELECTOR_MANIFEST_SHA256 = "3447f8ff3a04eb1f92285f472eb700efccdc1560ee4c5bc58fc050d739697fa1"
 CANON_CALIBRATION_MANIFEST_SHA256 = "c63be7e92c94cab029beed414f58c4034407a5001e95397523dba74bd385aba9"
 RAW_FIELDS = (
     "sample",
     "policy",
+    "engine",
+    "venue",
+    "workers",
     "operation",
+    "original_bytes",
     "n",
     "chunk_blocks",
     "repetition",
@@ -35,6 +42,15 @@ RAW_FIELDS = (
     "ratio_pct",
     "roundtrip_ok",
     "reference_ok",
+    "process_elapsed_us",
+    "cpu_user_us",
+    "cpu_system_us",
+    "peak_rss_bytes",
+    "cpu_package_energy_j",
+    "gpu_energy_j",
+    "resource_scope",
+    "cpu_energy_source",
+    "gpu_energy_source",
     "derived",
 )
 
@@ -100,33 +116,56 @@ def validate_sample(root: Path, record: dict[str, object]) -> Path:
 
 
 class Runner:
-    def __init__(self, commands_log: Path, raw_stdout: Path, venue: str, profile: Path) -> None:
+    def __init__(self, commands_log: Path, raw_stdout: Path, resources: Path,
+                 venue: str, profile: Path) -> None:
         self.commands_log = commands_log
         self.raw_stdout = raw_stdout
+        self.resources = resources
         self.venue = venue
         self.profile = profile
         commands_log.parent.mkdir(parents=True, exist_ok=True)
         raw_stdout.parent.mkdir(parents=True, exist_ok=True)
+        resources.parent.mkdir(parents=True, exist_ok=True)
         commands_log.write_text("", encoding="utf-8")
         raw_stdout.write_text("", encoding="utf-8")
+        resources.write_text("", encoding="utf-8")
 
-    def run(self, argv: list[str], use_profile: bool = False) -> subprocess.CompletedProcess[str]:
+    def run(self, argv: list[str], use_profile: bool = False,
+            native: bool = False,
+            resource_identity: dict[str, object] | None = None) -> dict[str, object] | None:
         env = os.environ.copy()
-        env["FORCE_OPENCL_DEVICE"] = self.venue
+        env["HETEROLZ_CPU_THREADS"] = str(FORMAL_CPU_THREADS)
+        prefix = f"HETEROLZ_CPU_THREADS={FORMAL_CPU_THREADS} "
+        if not native:
+            env["FORCE_OPENCL_DEVICE"] = self.venue
+            prefix = f"FORCE_OPENCL_DEVICE={self.venue} " + prefix
         if use_profile:
             env["LZ4TP_PROFILE"] = str(self.profile)
-        prefix = f"FORCE_OPENCL_DEVICE={self.venue} "
         if use_profile:
             prefix += f"LZ4TP_PROFILE={shlex.quote(str(self.profile))} "
         command_text = prefix + shlex.join(argv)
         with self.commands_log.open("a", encoding="utf-8") as handle:
             handle.write(command_text + "\n")
-        completed = subprocess.run(argv, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if resource_identity is None:
+            completed = subprocess.run(
+                argv, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            measurement = None
+        else:
+            completed, measurement = run_measured(argv, env=env)
+            record = {
+                "schema": "heterolz.resource-record.v1",
+                **resource_identity,
+                "argv": list(argv),
+                "measurement": measurement,
+            }
+            with self.resources.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
         with self.raw_stdout.open("a", encoding="utf-8") as handle:
             handle.write(f"$ {command_text}\n{completed.stdout}{completed.stderr}[exit={completed.returncode}]\n")
         if completed.returncode != 0:
             raise RuntimeError(f"command failed: {command_text}")
-        return completed
+        return measurement
 
 
 def load_metric(path: Path, operation: str) -> dict[str, object]:
@@ -148,14 +187,28 @@ def load_metric(path: Path, operation: str) -> dict[str, object]:
     return data
 
 
-def metric_row(sample: str, policy: str, operation: str, repetition: int,
+def metric_row(sample: str, policy: str, engine: str, venue: str, workers: int,
+               operation: str, repetition: int,
                metric: dict[str, object], roundtrip_ok: bool, reference_ok: bool,
+               resource_measurement: dict[str, object],
                derived: bool = False) -> dict[str, object]:
     original_bytes = int(metric["input_bytes"] if operation == "compress" else metric["output_bytes"])
+    sources = resource_measurement.get("sources")
+    if resource_measurement.get("schema") != RESOURCE_SCHEMA or not isinstance(sources, dict):
+        raise RuntimeError("invalid process resource measurement")
+
+    def optional_number(field: str) -> int | float | str:
+        value = resource_measurement.get(field)
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) else ""
+
     return {
         "sample": sample,
         "policy": policy,
+        "engine": engine,
+        "venue": venue,
+        "workers": workers,
         "operation": operation,
+        "original_bytes": original_bytes,
         "n": int(metric["n"]),
         "chunk_blocks": int(metric["chunk_blocks"]),
         "repetition": repetition,
@@ -165,6 +218,15 @@ def metric_row(sample: str, policy: str, operation: str, repetition: int,
         "ratio_pct": float(metric["ratio_pct"]),
         "roundtrip_ok": str(roundtrip_ok).lower(),
         "reference_ok": str(reference_ok).lower(),
+        "process_elapsed_us": optional_number("process_elapsed_us"),
+        "cpu_user_us": optional_number("cpu_user_us"),
+        "cpu_system_us": optional_number("cpu_system_us"),
+        "peak_rss_bytes": optional_number("peak_rss_bytes"),
+        "cpu_package_energy_j": optional_number("cpu_package_energy_j"),
+        "gpu_energy_j": optional_number("gpu_energy_j"),
+        "resource_scope": str(resource_measurement.get("scope", "")),
+        "cpu_energy_source": str(sources.get("cpu_package", "")),
+        "gpu_energy_source": str(sources.get("gpu", "")),
         "derived": str(derived).lower(),
     }
 
@@ -174,14 +236,21 @@ def median_row(rows: list[dict[str, object]]) -> dict[str, object]:
     result = dict(first)
     result["repetition"] = 0
     result["derived"] = "true"
-    for field in ("kernel_mbs", "no_ocl_mbs", "total_mbs", "ratio_pct"):
+    for field in ("kernel_mbs", "no_ocl_mbs", "total_mbs", "ratio_pct",
+                  "process_elapsed_us", "cpu_user_us", "cpu_system_us", "peak_rss_bytes"):
         result[field] = statistics.median(float(row[field]) for row in rows)
+    for field in ("cpu_package_energy_j", "gpu_energy_j"):
+        values = [row[field] for row in rows if row[field] != ""]
+        result[field] = (
+            statistics.median(float(value) for value in values)
+            if len(values) == len(rows) else ""
+        )
     return result
 
 
-def rotated_policy_specs(policy_specs: list[tuple[str, int | None, bool]],
+def rotated_policy_specs(policy_specs: list[tuple[str, int | None, bool, str, str, int]],
                          sample_index: int,
-                         repetition: int) -> list[tuple[str, int | None, bool]]:
+                         repetition: int) -> list[tuple[str, int | None, bool, str, str, int]]:
     if not policy_specs:
         return []
     offset = (sample_index + repetition - 1) % len(policy_specs)
@@ -257,8 +326,10 @@ def main() -> int:
     parser.add_argument("--verification", type=Path, required=True)
     parser.add_argument("--sample-root", type=Path, default=Path("/root/samples"))
     parser.add_argument("--binary", type=Path, default=Path("./lz4_gpu"))
+    parser.add_argument("--native", type=Path, default=Path("./native_lz4_blocks"))
     parser.add_argument("--reference-decoder", type=Path, default=Path("./tp_ref_decode"))
     parser.add_argument("--raw-results", type=Path, required=True)
+    parser.add_argument("--resources", type=Path, required=True)
     parser.add_argument("--summary", type=Path, required=True)
     parser.add_argument("--commands-log", type=Path, required=True)
     parser.add_argument("--raw-stdout", type=Path, required=True)
@@ -288,24 +359,30 @@ def main() -> int:
             if args.block_size != 65536 or args.hash_log != 14:
                 raise ValueError("formal mode requires block_size=65536 and hash_log=14")
             if not isinstance(checks, dict) or any(checks.get(name) != "passed" for name in
-                                                   ("roundtrip", "reference_decode", "bridge_interop", "determinism", "cross_venue")):
+                                                   ("roundtrip", "reference_decode", "bridge_interop",
+                                                    "determinism", "cross_venue", "native_roundtrip",
+                                                    "native_determinism", "native_interop")):
                 raise ValueError("formal mode requires the complete correctness gate")
         if args.repetitions < 1:
             raise ValueError("repetitions must be positive")
 
         output_paths = {
             args.raw_results.resolve(),
+            args.resources.resolve(),
             args.summary.resolve(),
             args.commands_log.resolve(),
             args.raw_stdout.resolve(),
         }
-        if len(output_paths) != 4:
-            raise ValueError("raw results, summary, commands log, and raw stdout must use distinct paths")
+        if len(output_paths) != 5:
+            raise ValueError(
+                "raw results, resources, summary, commands log, and raw stdout must use distinct paths"
+            )
         protected_paths = {
             args.manifest.resolve(),
             args.calibration_manifest.resolve(),
             args.verification.resolve(),
             args.binary.resolve(),
+            args.native.resolve(),
             args.reference_decoder.resolve(),
         }
         if output_paths & protected_paths:
@@ -364,6 +441,7 @@ def main() -> int:
             raise ValueError("correctness verification does not cover the requested N values")
 
         binary = require_executable(args.binary, "binary")
+        native_binary = require_executable(args.native, "native baseline")
         reference_decoder = require_executable(args.reference_decoder, "reference decoder")
         args.work_root.mkdir(parents=True, exist_ok=True)
         calibration_sample = validate_sample(args.sample_root, calibration_records[0])
@@ -372,7 +450,7 @@ def main() -> int:
         with tempfile.TemporaryDirectory(prefix="heterolz-real-benchmark-", dir=args.work_root) as temp_root:
             root = Path(temp_root)
             profile = root / "lz4tp.profile"
-            runner = Runner(args.commands_log, args.raw_stdout, args.venue, profile)
+            runner = Runner(args.commands_log, args.raw_stdout, args.resources, args.venue, profile)
             calibration_start = time.perf_counter_ns()
             runner.run(
                 [str(binary), "--calibrate", "-B", str(args.block_size), "--d-bits", str(args.hash_log),
@@ -392,33 +470,72 @@ def main() -> int:
                 sample_dir = root / f"{Path(relative_path).name}.{key}"
                 sample_dir.mkdir()
                 try:
-                    policy_specs = [(f"fixed_n{n}", n, False) for n in n_values]
+                    policy_specs = [
+                        (f"fixed_n{n}", n, False, "heterolz", args.venue, FORMAL_CPU_THREADS)
+                        for n in n_values
+                    ]
                     if not args.skip_adaptive:
-                        policy_specs.append(("adaptive", None, True))
-                    reference_ok_by_policy = {policy: False for policy, _, _ in policy_specs}
+                        policy_specs.append(
+                            ("adaptive", None, True, "heterolz", args.venue, FORMAL_CPU_THREADS)
+                        )
+                    policy_specs.append(
+                        ("native_4w", 1, False, "native_lz4", "CPU", FORMAL_CPU_THREADS)
+                    )
+                    reference_ok_by_policy = {policy: False for policy, *_ in policy_specs}
                     for repetition in range(1, args.repetitions + 1):
-                        for policy, fixed_n, adaptive in rotated_policy_specs(
+                        for policy, fixed_n, adaptive, engine, venue, workers in rotated_policy_specs(
                                 policy_specs, sample_index, repetition):
+                            resource_base = {
+                                "sample": relative_path,
+                                "policy": policy,
+                                "engine": engine,
+                                "venue": venue,
+                                "workers": workers,
+                                "repetition": repetition,
+                            }
                             frame = sample_dir / f"{policy}.r{repetition}.lz4tp"
                             restored = sample_dir / f"{policy}.r{repetition}.restored"
                             comp_metric_path = sample_dir / f"{policy}.r{repetition}.compress.json"
                             dec_metric_path = sample_dir / f"{policy}.r{repetition}.decompress.json"
                             common = ["-B", str(args.block_size), "--d-bits", str(args.hash_log)]
-                            if adaptive:
-                                runner.run(
+                            if engine == "native_lz4":
+                                comp_resource = runner.run(
+                                    [str(native_binary), "-c", "--workers", str(workers), *common,
+                                     "--metrics-json", str(comp_metric_path), str(sample),
+                                     "-o", str(frame)],
+                                    native=True,
+                                    resource_identity={**resource_base, "operation": "compress"},
+                                )
+                            elif adaptive:
+                                comp_resource = runner.run(
                                     [str(binary), "--auto", *common, "--metrics-json", str(comp_metric_path),
                                      str(sample), "-o", str(frame)],
                                     use_profile=True,
+                                    resource_identity={**resource_base, "operation": "compress"},
                                 )
                             else:
-                                runner.run(
+                                comp_resource = runner.run(
                                     [str(binary), "--twophase", "-N", str(fixed_n), *common,
-                                     "--metrics-json", str(comp_metric_path), str(sample), "-o", str(frame)]
+                                     "--metrics-json", str(comp_metric_path), str(sample), "-o", str(frame)],
+                                    resource_identity={**resource_base, "operation": "compress"},
                                 )
-                            runner.run(
-                                [str(binary), "--twophase", "-d", *common, "--metrics-json", str(dec_metric_path),
-                                 str(frame), "-o", str(restored)]
-                            )
+                            if engine == "native_lz4":
+                                dec_resource = runner.run(
+                                    [str(native_binary), "-d", "--workers", str(workers), *common,
+                                     "--metrics-json", str(dec_metric_path), str(frame),
+                                     "-o", str(restored)],
+                                    native=True,
+                                    resource_identity={**resource_base, "operation": "decompress"},
+                                )
+                            else:
+                                dec_resource = runner.run(
+                                    [str(binary), "--twophase", "-d", *common,
+                                     "--metrics-json", str(dec_metric_path), str(frame),
+                                     "-o", str(restored)],
+                                    resource_identity={**resource_base, "operation": "decompress"},
+                                )
+                            if comp_resource is None or dec_resource is None:
+                                raise RuntimeError("resource measurement was not recorded")
                             roundtrip_ok = restored.stat().st_size == sample.stat().st_size and sha256_file(restored) == expected_sha256
                             if not roundtrip_ok:
                                 raise RuntimeError(f"benchmark roundtrip failed: {relative_path} {policy} rep={repetition}")
@@ -427,6 +544,11 @@ def main() -> int:
                                 reference_ok_by_policy[policy] = True
                             comp_metric = load_metric(comp_metric_path, "compress")
                             dec_metric = load_metric(dec_metric_path, "decompress")
+                            if engine == "native_lz4" and any(
+                                    metric.get("engine") != "native_lz4" or
+                                    metric.get("workers") != FORMAL_CPU_THREADS
+                                    for metric in (comp_metric, dec_metric)):
+                                raise RuntimeError(f"native metric identity mismatch: {relative_path}")
                             if comp_metric["n"] != dec_metric["n"]:
                                 raise RuntimeError(f"metric N mismatch: {relative_path} {policy}")
                             if fixed_n is not None and comp_metric["n"] != fixed_n:
@@ -439,12 +561,14 @@ def main() -> int:
                                     dec_metric["input_bytes"] != frame.stat().st_size or
                                     dec_metric["output_bytes"] != sample.stat().st_size):
                                 raise RuntimeError(f"metric byte counts mismatch: {relative_path} {policy}")
-                            rows.append(metric_row(relative_path, policy, "compress", repetition,
+                            rows.append(metric_row(relative_path, policy, engine, venue, workers,
+                                                   "compress", repetition,
                                                    comp_metric, roundtrip_ok,
-                                                   reference_ok_by_policy[policy]))
-                            rows.append(metric_row(relative_path, policy, "decompress", repetition,
+                                                   reference_ok_by_policy[policy], comp_resource))
+                            rows.append(metric_row(relative_path, policy, engine, venue, workers,
+                                                   "decompress", repetition,
                                                    dec_metric, roundtrip_ok,
-                                                   reference_ok_by_policy[policy]))
+                                                   reference_ok_by_policy[policy], dec_resource))
                             for path in (frame, restored, comp_metric_path, dec_metric_path):
                                 path.unlink(missing_ok=True)
                 finally:

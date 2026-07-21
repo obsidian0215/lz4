@@ -8,6 +8,9 @@ endif
 
 CC ?= cc
 HOSTCC ?= cc
+NVCC ?= nvcc
+NVCOMP_ROOT ?=
+NVCOMP_CUDA_ARCH ?= sm_89
 
 ifeq ($(OS),Windows_NT)
 EXEEXT ?= .exe
@@ -46,10 +49,19 @@ endif
 SRCS = $(COMMON_SRCS) $(DAEMON_SRCS)
 OBJS = $(SRCS:.c=.o)
 
-all: lz4_gpu
+all: lz4_gpu native_lz4_blocks
 
 lz4_gpu: $(SRCS)
 	$(CC) $(CFLAGS) -o $@$(EXEEXT) $^ $(LDFLAGS)
+
+native_lz4_blocks: native_lz4_blocks.c ../programs/threadpool.c ../programs/timefn.c ../lib/lz4.c
+	$(CC) $(CFLAGS) -DLZ4IO_MULTITHREAD=1 -I../programs -I../lib -o $@$(EXEEXT) $^ $(PTHREAD_LIB)
+
+nvcomp-baseline: nvcomp_lz4_batched.cu
+	test -n "$(NVCOMP_ROOT)"
+	$(NVCC) -std=c++17 -O3 -arch=$(NVCOMP_CUDA_ARCH) -I$(NVCOMP_ROOT)/include \
+		$< -L$(NVCOMP_ROOT)/lib -Wl,-rpath,$(NVCOMP_ROOT)/lib -lnvcomp \
+		-o nvcomp_lz4_batched
 
 build_clbin: build_clbin.c
 	$(CC) $(CFLAGS) -o $@$(EXEEXT) $^ $(LDFLAGS)
@@ -78,7 +90,7 @@ formal-run-help:
 	python3 ./run_formal_acceptance.py --help
 
 test-formal-tools:
-	python3 -m unittest ./test_formal_run_controls.py ./test_promote_formal_result.py
+	python3 -m unittest ./test_formal_run_controls.py ./test_formal_resource_probe.py ./test_promote_formal_result.py ./test_gpulz_external_adapter.py ./test_baseline_evidence.py ./test_nvcomp_external_adapter.py
 
 precompile: $(PRECOMPILE_HELPER)
 	@echo "Precompiling LZ4 GPU kernels for various hash sizes..."
@@ -88,6 +100,6 @@ precompile: $(PRECOMPILE_HELPER)
 	done
 
 clean:
-	rm -f lz4_gpu lz4_gpu.exe build_clbin build_clbin.exe build_clbin_host tp_ref_decode tp_ref_decode.exe tp_to_lz4 tp_to_lz4.exe *.o *.clbin
+	rm -f lz4_gpu lz4_gpu.exe native_lz4_blocks native_lz4_blocks.exe nvcomp_lz4_batched nvcomp_lz4_batched.exe build_clbin build_clbin.exe build_clbin_host tp_ref_decode tp_ref_decode.exe tp_to_lz4 tp_to_lz4.exe *.o *.clbin
 
-.PHONY: all clean precompile interop-tools verify-twophase verify-daemon-twophase verify-linux-early formal-run-help test-formal-tools
+.PHONY: all clean nvcomp-baseline precompile interop-tools verify-twophase verify-daemon-twophase verify-linux-early formal-run-help test-formal-tools

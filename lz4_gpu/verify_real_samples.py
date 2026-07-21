@@ -16,6 +16,7 @@ from pathlib import Path
 
 
 FORMAL_N = (1, 2, 4, 8)
+FORMAL_CPU_THREADS = 4
 CANON_CORRECTNESS_MANIFEST_SHA256 = "56d52716825c68bade8e032237fa9787a05606d177f733bfc2a14334ac837153"
 
 
@@ -57,7 +58,8 @@ class CommandRunner:
         prefix = ""
         if venue:
             env["FORCE_OPENCL_DEVICE"] = venue
-            prefix = f"FORCE_OPENCL_DEVICE={venue} "
+            env["HETEROLZ_CPU_THREADS"] = str(FORMAL_CPU_THREADS)
+            prefix = f"FORCE_OPENCL_DEVICE={venue} HETEROLZ_CPU_THREADS={FORMAL_CPU_THREADS} "
         command_text = prefix + shlex.join(argv)
         self.append(self.commands_log, command_text + "\n")
         completed = subprocess.run(argv, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -117,6 +119,7 @@ def main() -> int:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--sample-root", type=Path, default=Path("/root/samples"))
     parser.add_argument("--binary", type=Path, default=Path("./lz4_gpu"))
+    parser.add_argument("--native", type=Path, default=Path("./native_lz4_blocks"))
     parser.add_argument("--reference-decoder", type=Path, default=Path("./tp_ref_decode"))
     parser.add_argument("--bridge", type=Path, default=Path("./tp_to_lz4"))
     parser.add_argument("--fingerprint", type=Path)
@@ -146,6 +149,9 @@ def main() -> int:
             "bridge_interop": "skipped" if args.skip_bridge else "failed",
             "determinism": "skipped" if args.skip_determinism else "failed",
             "cross_venue": "skipped" if args.skip_cross_venue else "failed",
+            "native_roundtrip": "failed",
+            "native_determinism": "skipped" if args.skip_determinism else "failed",
+            "native_interop": "failed",
         },
         "failures": [],
         "inputs": [],
@@ -175,6 +181,7 @@ def main() -> int:
         protected_paths = {
             args.manifest.resolve(),
             args.binary.resolve(),
+            args.native.resolve(),
             args.reference_decoder.resolve(),
             args.bridge.resolve(),
         }
@@ -215,6 +222,7 @@ def main() -> int:
         result["inputs"] = normalized_inputs
         result["venues"] = ["GPU", "CPU"] if not args.skip_cross_venue else ["GPU"]
         binary = require_executable(args.binary, "binary")
+        native = require_executable(args.native, "native baseline")
         reference_decoder = require_executable(args.reference_decoder, "reference decoder")
         bridge = require_executable(args.bridge, "bridge") if not args.skip_bridge else None
         stock_lz4 = shutil.which(args.stock_lz4)
@@ -243,10 +251,16 @@ def main() -> int:
                         raise ValueError(f"device-info evidence is missing {venue}.{field}")
                 if record["device_type"] != venue:
                     raise ValueError(f"device-info evidence has the wrong type for {venue}")
+            cpu_record = venue_devices["CPU"]
+            if (cpu_record.get("compute_units") != FORMAL_CPU_THREADS or
+                    cpu_record.get("requested_cpu_threads") != FORMAL_CPU_THREADS or
+                    cpu_record.get("partitioned") is not True):
+                raise ValueError("formal OpenCL CPU evidence must identify a four-compute-unit sub-device")
             result["source_identity"] = {
                 "git_commit": git_commit,
                 "source_fingerprint": source_fingerprint,
                 "binary_sha256": sha256_file(binary),
+                "native_binary_sha256": sha256_file(native),
                 "device_info_sha256": sha256_file(args.device_info),
                 "venue_devices": venue_devices,
             }
@@ -281,10 +295,55 @@ def main() -> int:
                     "sha256": expected_sha256,
                     "n": {},
                 }
+                common = ["-B", str(args.block_size), "--d-bits", str(args.hash_log)]
+                native_frame = sample_dir / "native.lz4tp"
+                native_restored = sample_dir / "native.restored"
+                runner.run(
+                    [str(native), "-c", "--workers", str(FORMAL_CPU_THREADS), *common,
+                     str(sample), "-o", str(native_frame)]
+                )
+                runner.run(
+                    [str(native), "-d", "--workers", str(FORMAL_CPU_THREADS), *common,
+                     str(native_frame), "-o", str(native_restored)]
+                )
+                verify_equal(sample, native_restored, expected_sha256)
+                runner.run([str(reference_decoder), str(native_frame), str(sample)])
+                native_result: dict[str, object] = {
+                    "frame_sha256": sha256_file(native_frame),
+                    "roundtrip": "passed",
+                    "reference_decode": "passed",
+                    "workers": FORMAL_CPU_THREADS,
+                }
+                if not args.skip_determinism:
+                    native_repeat = sample_dir / "native.repeat.lz4tp"
+                    runner.run(
+                        [str(native), "-c", "--workers", str(FORMAL_CPU_THREADS), *common,
+                         str(sample), "-o", str(native_repeat)]
+                    )
+                    if sha256_file(native_repeat) != native_result["frame_sha256"]:
+                        raise RuntimeError(f"native determinism failed: {relative_path}")
+                    native_result["determinism"] = "passed"
+                for venue in (("GPU", "CPU") if not args.skip_cross_venue else ("GPU",)):
+                    native_cross = sample_dir / f"native-to-{venue.lower()}.restored"
+                    runner.run(
+                        [str(binary), "--twophase", "-d", *common, str(native_frame),
+                         "-o", str(native_cross)], venue
+                    )
+                    verify_equal(sample, native_cross, expected_sha256)
+                if not args.skip_bridge:
+                    native_standard = sample_dir / "native.standard.lz4"
+                    native_stock_restored = sample_dir / "native.stock.restored"
+                    runner.run([str(bridge), str(native_frame), str(native_standard)])
+                    runner.run(
+                        [str(stock_lz4), "-q", "-d", "-f", str(native_standard),
+                         str(native_stock_restored)]
+                    )
+                    verify_equal(sample, native_stock_restored, expected_sha256)
+                    native_result["bridge_interop"] = "passed"
+                sample_result["native"] = native_result
                 for n in n_values:
                     frame_gpu = sample_dir / f"n{n}.gpu.lz4tp"
                     restored_gpu = sample_dir / f"n{n}.gpu.restored"
-                    common = ["-B", str(args.block_size), "--d-bits", str(args.hash_log)]
                     runner.run([str(binary), "--twophase", "-N", str(n), *common, str(sample), "-o", str(frame_gpu)], "GPU")
                     runner.run([str(binary), "--twophase", "-d", *common, str(frame_gpu), "-o", str(restored_gpu)], "GPU")
                     verify_equal(sample, restored_gpu, expected_sha256)
@@ -325,6 +384,21 @@ def main() -> int:
                         runner.run([str(stock_lz4), "-q", "-d", "-f", str(standard_frame), str(stock_restored)])
                         verify_equal(sample, stock_restored, expected_sha256)
                         n_result["bridge_interop"] = "passed"
+                    if n == 1:
+                        native_from_gpu = sample_dir / "n1.gpu-to-native.restored"
+                        runner.run(
+                            [str(native), "-d", "--workers", str(FORMAL_CPU_THREADS), *common,
+                             str(frame_gpu), "-o", str(native_from_gpu)]
+                        )
+                        verify_equal(sample, native_from_gpu, expected_sha256)
+                        if not args.skip_cross_venue:
+                            native_from_cpu = sample_dir / "n1.cpu-to-native.restored"
+                            runner.run(
+                                [str(native), "-d", "--workers", str(FORMAL_CPU_THREADS),
+                                 *common, str(frame_cpu), "-o", str(native_from_cpu)]
+                            )
+                            verify_equal(sample, native_from_cpu, expected_sha256)
+                        n_result["native_interop"] = "passed"
                     sample_result["n"][str(n)] = n_result
                 result["samples"].append(sample_result)
                 shutil.rmtree(sample_dir)
@@ -333,10 +407,13 @@ def main() -> int:
         result["all_inputs_passed"] = True
         result["checks"]["roundtrip"] = "passed"
         result["checks"]["reference_decode"] = "passed"
+        result["checks"]["native_roundtrip"] = "passed"
+        result["checks"]["native_interop"] = "passed"
         if not args.skip_bridge:
             result["checks"]["bridge_interop"] = "passed"
         if not args.skip_determinism:
             result["checks"]["determinism"] = "passed"
+            result["checks"]["native_determinism"] = "passed"
         if not args.skip_cross_venue:
             result["checks"]["cross_venue"] = "passed"
         if args.gate_log:

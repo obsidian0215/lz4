@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import os
 import re
 import shutil
@@ -15,6 +14,19 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+
+from formal_cpu_budget import (
+    FORMAL_CPU_THREADS,
+    PERFORMANCE_MEAN_BUSY_LIMIT_PCT,
+    PERFORMANCE_PEAK_BUSY_LIMIT_PCT,
+    apply_cpu_environment,
+    apply_process_affinity,
+    apply_thread_environment,
+    collect_resource_evidence,
+    discover_cpu_set,
+    parse_cpu_set,
+    validate_performance_idle,
+)
 
 try:
     import fcntl
@@ -44,20 +56,24 @@ PERFORMANCE_ARTIFACTS = tuple(sorted({
     *ADMISSION_ARTIFACTS,
     "admission_audit.json",
     "admission_manifest.json",
+    "baseline_coverage.json",
+    "baseline_registry.json",
+    "paper_manifest.json",
     "raw.stdout",
     "raw_results.csv",
+    "resource_measurements.jsonl",
     "summary.csv",
 }))
 
 CANON_SELECTOR_MANIFEST_SHA256 = "3447f8ff3a04eb1f92285f472eb700efccdc1560ee4c5bc58fc050d739697fa1"
 CANON_CALIBRATION_MANIFEST_SHA256 = "c63be7e92c94cab029beed414f58c4034407a5001e95397523dba74bd385aba9"
 CANON_CORRECTNESS_MANIFEST_SHA256 = "56d52716825c68bade8e032237fa9787a05606d177f733bfc2a14334ac837153"
+CANON_PAPER_MANIFEST_SHA256 = "82bb8fe07ed49660b9df30cfe2f9c6b1256fecf18754a5e34187d5857dc51d0e"
 CANON_RESULTS_ROOT = Path("/root/heterolz-formal-results")
 CANON_REPO_ROOT = Path("/root/heterolz-formal")
 CANON_SOURCE_REGISTRY = Path("/root/heterolz-formal-control/formal_source_fingerprint.json")
 CANON_RESULT_AUDITOR = Path("/root/heterolz-formal-control/heterolz_result_audit.py")
-CANON_RESULT_AUDITOR_SHA256 = "f5ef9cb1568ee79795e4703adba4cc29113105e23e26147919901d09d6c7ed22"
-MAX_FORMAL_LOAD_ONE = 0.5
+CANON_RESULT_AUDITOR_SHA256 = "6e657a9600738f81164b705ad387ec8c62d437a829b2179971dae5a782c0975d"
 RUN_ID_RE = re.compile(r"heterolz-(?:admission|performance)-\d{8}T\d{12}Z")
 
 
@@ -124,7 +140,27 @@ def query_device_info(binary: Path, cwd: Path, venue: str) -> dict[str, object]:
             raise RuntimeError(f"{venue} device identity is missing {field}")
     if data["device_type"] != venue:
         raise RuntimeError(f"{venue} device identity returned device_type={data['device_type']}")
+    if venue == "CPU":
+        if (data.get("compute_units") != FORMAL_CPU_THREADS or
+                data.get("requested_cpu_threads") != FORMAL_CPU_THREADS or
+                data.get("partitioned") is not True):
+            raise RuntimeError(
+                f"formal OpenCL CPU must be a {FORMAL_CPU_THREADS}-compute-unit sub-device"
+            )
     return data
+
+
+def query_device_matrix(binary: Path, cwd: Path, cpu_set: tuple[int, ...],
+                        discovery_affinity: tuple[int, ...]) -> dict[str, dict[str, object]]:
+    if len(discovery_affinity) < FORMAL_CPU_THREADS:
+        raise RuntimeError("formal device discovery requires at least four online CPUs")
+    try:
+        os.environ["HETEROLZ_CPU_SET"] = ",".join(str(cpu) for cpu in discovery_affinity)
+        apply_process_affinity(discovery_affinity)
+        return {venue: query_device_info(binary, cwd, venue) for venue in ("GPU", "CPU")}
+    finally:
+        os.environ["HETEROLZ_CPU_SET"] = ",".join(str(cpu) for cpu in cpu_set)
+        apply_process_affinity(cpu_set)
 
 
 def release_lock(handle: object | None, path: Path | None) -> None:
@@ -159,16 +195,6 @@ def validate_registered_source(generated: dict[str, object], registry_path: Path
         raise ValueError("formal source does not match the registered commit and fingerprint")
 
 
-def validate_formal_load(load_one: float | None = None) -> float:
-    current = os.getloadavg()[0] if load_one is None else load_one
-    if (not isinstance(current, (int, float)) or not math.isfinite(float(current)) or
-            current < 0 or current >= MAX_FORMAL_LOAD_ONE):
-        raise RuntimeError(
-            f"formal run requires one-minute load below {MAX_FORMAL_LOAD_ONE:.1f}; current={current}"
-        )
-    return float(current)
-
-
 def validate_admission_directory(path: Path, results_root: Path) -> Path:
     if path.is_symlink():
         raise ValueError("formal performance admission directory must not be a symlink")
@@ -180,6 +206,34 @@ def validate_admission_directory(path: Path, results_root: Path) -> Path:
     return resolved
 
 
+def validate_baseline_inputs(paper_manifest: Path, registry_path: Path,
+                             coverage_path: Path, repetitions: int) -> None:
+    manifest_sha = sha256_file(paper_manifest)
+    if manifest_sha != CANON_PAPER_MANIFEST_SHA256:
+        raise ValueError("formal baselines require the registered paper16 manifest")
+    paper = json.loads(paper_manifest.read_text(encoding="utf-8"))
+    if (paper.get("schema") != "heterolz.samples.v1" or
+            paper.get("selection_name") != "paper16" or
+            not isinstance(paper.get("files"), list) or len(paper["files"]) != 16):
+        raise ValueError("formal baseline paper manifest is invalid")
+    expected = {
+        registry_path: "heterolz.baseline-registry.v1",
+        coverage_path: "heterolz.baseline-coverage.v1",
+    }
+    for path, schema in expected.items():
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if (not isinstance(data, dict) or data.get("schema") != schema or
+                data.get("sample_manifest_sha256") != manifest_sha or
+                data.get("selection_name") != "paper16" or
+                data.get("repetitions") != repetitions):
+            raise ValueError(f"formal baseline contract mismatch: {path.name}")
+        baselines = data.get("baselines")
+        if (not isinstance(baselines, list) or
+                [item.get("name") for item in baselines if isinstance(item, dict)] !=
+                ["GPULZ", "nvCOMP"]):
+            raise ValueError(f"formal GPULZ/nvCOMP evidence is missing: {path.name}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parent.parent)
@@ -187,11 +241,18 @@ def main() -> int:
     parser.add_argument("--selector-manifest", type=Path, required=True)
     parser.add_argument("--calibration-manifest", type=Path, required=True)
     parser.add_argument("--correctness-manifest", type=Path, required=True)
+    parser.add_argument("--paper-manifest", type=Path)
+    parser.add_argument("--baseline-registry", type=Path)
+    parser.add_argument("--baseline-coverage", type=Path)
     parser.add_argument("--auditor", type=Path, required=True)
     parser.add_argument("--source-registry", type=Path, default=CANON_SOURCE_REGISTRY)
     parser.add_argument("--results-root", type=Path, default=CANON_RESULTS_ROOT)
     parser.add_argument("--venue", choices=("GPU", "CPU"), default="GPU")
     parser.add_argument("--repetitions", type=int, default=9)
+    parser.add_argument(
+        "--cpu-set",
+        help="comma/range CPU list; defaults to four distinct physical cores",
+    )
     parser.add_argument("--performance", action="store_true")
     parser.add_argument("--admission-dir", type=Path)
     args = parser.parse_args()
@@ -202,7 +263,7 @@ def main() -> int:
     lz4_gpu: Path | None = None
     lock_handle: object | None = None
     lock_path: Path | None = None
-    preflight_load_one: float | None = None
+    resource_evidence: dict[str, object] | None = None
     try:
         if args.performance and args.repetitions < 9:
             raise ValueError("formal performance requires at least nine repetitions")
@@ -210,6 +271,20 @@ def main() -> int:
             raise ValueError("--admission-dir is only valid with --performance")
         if args.performance and not args.admission_dir:
             raise ValueError("formal performance requires an audited admission directory")
+        baseline_args = (args.paper_manifest, args.baseline_registry, args.baseline_coverage)
+        if args.performance and any(path is None for path in baseline_args):
+            raise ValueError("formal performance requires paper16 and external baseline evidence")
+        if not args.performance and any(path is not None for path in baseline_args):
+            raise ValueError("external baseline evidence is only valid with --performance")
+        discovery_affinity = tuple(sorted(os.sched_getaffinity(0)))
+        cpu_set = (parse_cpu_set(args.cpu_set) if args.cpu_set
+                   else discover_cpu_set(FORMAL_CPU_THREADS,
+                                         allowed_cpus=discovery_affinity))
+        if len(cpu_set) != FORMAL_CPU_THREADS:
+            raise ValueError(f"formal runs require exactly {FORMAL_CPU_THREADS} logical CPUs")
+        apply_thread_environment(FORMAL_CPU_THREADS)
+        apply_cpu_environment(cpu_set, discovery_affinity)
+        apply_process_affinity(cpu_set)
         repo = validate_formal_repo(args.repo)
         lz4_gpu = repo / "lz4_gpu"
         if fcntl is None:
@@ -218,6 +293,15 @@ def main() -> int:
                      args.correctness_manifest, args.auditor, args.source_registry):
             if not path.resolve().is_file():
                 raise ValueError(f"required input is missing: {path}")
+        if args.performance:
+            assert all(path is not None for path in baseline_args)
+            for path in baseline_args:
+                if not path.resolve().is_file():
+                    raise ValueError(f"required baseline input is missing: {path}")
+            validate_baseline_inputs(
+                args.paper_manifest.resolve(), args.baseline_registry.resolve(),
+                args.baseline_coverage.resolve(), args.repetitions,
+            )
         if (sha256_file(args.selector_manifest.resolve()) != CANON_SELECTOR_MANIFEST_SHA256 or
                 sha256_file(args.calibration_manifest.resolve()) != CANON_CALIBRATION_MANIFEST_SHA256 or
                 sha256_file(args.correctness_manifest.resolve()) != CANON_CORRECTNESS_MANIFEST_SHA256):
@@ -250,7 +334,9 @@ def main() -> int:
             lock_handle = None
             lock_path = None
             raise RuntimeError("another formal run is using the canonical result root") from exc
-        preflight_load_one = validate_formal_load()
+        resource_evidence = collect_resource_evidence(cpu_set, FORMAL_CPU_THREADS)
+        if args.performance:
+            validate_performance_idle(resource_evidence)
         run_kind = "performance" if args.performance else "admission"
         run_id = f"heterolz-{run_kind}-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         final = results_root / run_id
@@ -285,15 +371,17 @@ def main() -> int:
             handle.write("BUILD-OK\n")
 
         binary = lz4_gpu / "lz4_gpu"
+        native_binary = lz4_gpu / "native_lz4_blocks"
         reference_decoder = lz4_gpu / "tp_ref_decode"
         bridge = lz4_gpu / "tp_to_lz4"
         binary_sha = sha256_file(binary)
-        write_text_atomic(staging / "binary.sha256", f"{binary_sha}  lz4_gpu\n")
+        native_binary_sha = sha256_file(native_binary)
+        write_text_atomic(
+            staging / "binary.sha256",
+            f"{binary_sha}  lz4_gpu\n{native_binary_sha}  native_lz4_blocks\n",
+        )
 
-        venue_devices = {
-            venue: query_device_info(binary, lz4_gpu, venue)
-            for venue in ("GPU", "CPU")
-        }
+        venue_devices = query_device_matrix(binary, lz4_gpu, cpu_set, discovery_affinity)
         write_json_atomic(
             staging / "device_info.json",
             {"schema": "heterolz.device-matrix.v1", "venues": venue_devices},
@@ -311,6 +399,9 @@ def main() -> int:
         gate_log = staging / "gate.log"
         admission_provenance: dict[str, object] | None = None
         if args.performance:
+            shutil.copyfile(args.paper_manifest.resolve(), staging / "paper_manifest.json")
+            shutil.copyfile(args.baseline_registry.resolve(), staging / "baseline_registry.json")
+            shutil.copyfile(args.baseline_coverage.resolve(), staging / "baseline_coverage.json")
             admission_dir = validate_admission_directory(args.admission_dir, results_root)
             admission_auditor = admission_dir / "result_audit.py"
             admission_manifest = admission_dir / "run_manifest.json"
@@ -346,6 +437,7 @@ def main() -> int:
                     identity.get("git_commit") != commit or
                     identity.get("source_fingerprint") != fingerprint["source_fingerprint"] or
                     identity.get("binary_sha256") != binary_sha or
+                    identity.get("native_binary_sha256") != native_binary_sha or
                     identity.get("device_info_sha256") != sha256_file(staging / "device_info.json")):
                 raise ValueError("admission verification identity does not match this formal build")
             admission_provenance = {
@@ -362,8 +454,10 @@ def main() -> int:
                  "--calibration-manifest", str(staging / "calibration_manifest.json"),
                  "--verification", str(staging / "verification.json"),
                  "--sample-root", str(args.sample_root), "--binary", str(binary),
+                 "--native", str(native_binary),
                  "--reference-decoder", str(reference_decoder),
                  "--raw-results", str(staging / "raw_results.csv"),
+                 "--resources", str(staging / "resource_measurements.jsonl"),
                  "--summary", str(staging / "summary.csv"),
                  "--commands-log", str(staging / "benchmark_commands.log"),
                  "--raw-stdout", str(staging / "raw.stdout"),
@@ -383,6 +477,7 @@ def main() -> int:
                 [sys.executable, str(lz4_gpu / "verify_real_samples.py"),
                  "--manifest", str(correctness_copy), "--sample-root", str(args.sample_root),
                  "--binary", str(binary), "--reference-decoder", str(reference_decoder),
+                 "--native", str(native_binary),
                  "--bridge", str(bridge), "--fingerprint", str(fingerprint_path),
                  "--device-info", str(staging / "device_info.json"),
                  "--output", str(staging / "verification.json"),
@@ -402,7 +497,8 @@ def main() -> int:
         write_text_atomic(
             staging / "run_meta.txt",
             f"run_id={run_id}\nhost={os.uname().nodename}\nvenue={args.venue}\n"
-            f"git_commit={commit}\nrepetitions={args.repetitions if args.performance else 0}\n",
+            f"git_commit={commit}\nrepetitions={args.repetitions if args.performance else 0}\n"
+            f"cpu_threads={FORMAL_CPU_THREADS}\ncpu_set={','.join(str(cpu) for cpu in cpu_set)}\n",
         )
         manifest = {
             "schema": "heterolz.run.v1",
@@ -413,11 +509,24 @@ def main() -> int:
             "source_fingerprint": fingerprint["source_fingerprint"],
             "source_registry_sha256": sha256_file(source_registry_copy),
             "binary_sha256": binary_sha,
+            "native_binary_sha256": native_binary_sha,
             "device_info_sha256": sha256_file(staging / "device_info.json"),
             "auditor_sha256": sha256_file(staging / "result_audit.py"),
             "samples_manifest_sha256": sha256_file(staging / "samples_manifest.json"),
             "calibration_manifest_sha256": sha256_file(staging / "calibration_manifest.json"),
             "correctness_manifest_sha256": sha256_file(correctness_copy),
+            "paper_manifest_sha256": (
+                sha256_file(staging / "paper_manifest.json") if args.performance else None
+            ),
+            "baseline_registry_sha256": (
+                sha256_file(staging / "baseline_registry.json") if args.performance else None
+            ),
+            "baseline_coverage_sha256": (
+                sha256_file(staging / "baseline_coverage.json") if args.performance else None
+            ),
+            "resource_measurements_sha256": (
+                sha256_file(staging / "resource_measurements.jsonl") if args.performance else None
+            ),
             "input_source": "registered_real_samples",
             "host": os.uname().nodename,
             "device": device_info["device_name"],
@@ -430,10 +539,24 @@ def main() -> int:
             "admission": admission_provenance,
             "parameters": {"block_size": 65536, "hash_log": 14, "n": [1, 2, 4, 8],
                            "venue": args.venue,
+                           "cpu_threads": FORMAL_CPU_THREADS,
+                           "cpu_set": list(cpu_set),
                            "schedule": "deterministic_rotating_policy_order"},
-            "timing": {"kernel": True, "no_ocl": True, "total": True},
-            "preflight": {"load_one": preflight_load_one,
-                          "max_load_one": MAX_FORMAL_LOAD_ONE},
+            "timing": {
+                "kernel": True,
+                "no_ocl": True,
+                "total": True,
+                "resource_scope": (
+                    "process_wall_with_machine_energy" if args.performance else None
+                ),
+            },
+            "preflight": {
+                **(resource_evidence or {}),
+                "policy": "fixed_cpu_budget",
+                "performance_mean_busy_limit_pct": PERFORMANCE_MEAN_BUSY_LIMIT_PCT,
+                "performance_peak_busy_limit_pct": PERFORMANCE_PEAK_BUSY_LIMIT_PCT,
+                "idle_required": bool(args.performance),
+            },
             "repetitions": args.repetitions if args.performance else 0,
             "expected_artifacts": list(expected_artifacts),
             "actual_artifacts": list(expected_artifacts),

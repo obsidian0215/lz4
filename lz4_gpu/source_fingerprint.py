@@ -14,7 +14,11 @@ from pathlib import Path
 
 CONTROLLED_LZ4_GPU_FILES = {
     "Makefile",
+    "baseline_evidence.py",
     "benchmark_real_samples.py",
+    "formal_cpu_budget.py",
+    "formal_resource_probe.py",
+    "gpulz_external_adapter.py",
     "lz4_gpu.c",
     "lz4_gpu.cl",
     "lz4_gpu_client.c",
@@ -22,6 +26,9 @@ CONTROLLED_LZ4_GPU_FILES = {
     "lz4_gpu_core.h",
     "lz4_gpu_daemon.c",
     "lz4_gpu_debug.h",
+    "native_lz4_blocks.c",
+    "nvcomp_external_adapter.py",
+    "nvcomp_lz4_batched.cu",
     "lz4_gpu_protocol.h",
     "lz4_gpu_utils.c",
     "lz4_gpu_utils.h",
@@ -31,7 +38,11 @@ CONTROLLED_LZ4_GPU_FILES = {
     "run_formal_acceptance.py",
     "source_fingerprint.py",
     "test_promote_formal_result.py",
+    "test_baseline_evidence.py",
     "test_formal_run_controls.py",
+    "test_formal_resource_probe.py",
+    "test_gpulz_external_adapter.py",
+    "test_nvcomp_external_adapter.py",
     "timing.h",
     "tp_ref_decode.c",
     "tp_to_lz4.c",
@@ -47,6 +58,13 @@ LIB_FILES = {
     "lib/lz4hc.h",
     "lib/xxhash.c",
     "lib/xxhash.h",
+}
+PROGRAM_FILES = {
+    "programs/lz4conf.h",
+    "programs/threadpool.c",
+    "programs/threadpool.h",
+    "programs/timefn.c",
+    "programs/timefn.h",
 }
 
 
@@ -82,7 +100,7 @@ def controlled_files(repo: Path) -> list[str]:
         if not value:
             continue
         path = Path(value)
-        if value in LIB_FILES:
+        if value in LIB_FILES or value in PROGRAM_FILES:
             selected.append(path.as_posix())
         elif len(path.parts) == 2 and path.parts[0] == "lz4_gpu":
             if path.name in CONTROLLED_LZ4_GPU_FILES:
@@ -91,7 +109,9 @@ def controlled_files(repo: Path) -> list[str]:
 
 
 def validate_contract(paths: list[str]) -> None:
-    expected = set(LIB_FILES) | {f"lz4_gpu/{name}" for name in CONTROLLED_LZ4_GPU_FILES}
+    expected = set(LIB_FILES) | set(PROGRAM_FILES) | {
+        f"lz4_gpu/{name}" for name in CONTROLLED_LZ4_GPU_FILES
+    }
     actual = set(paths)
     if actual != expected:
         missing = sorted(expected - actual)
